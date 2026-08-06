@@ -32,7 +32,13 @@ IMG_HDR_SIZE = 0x800
 
 
 def _fourcc(raw):
-    return raw[::-1].decode("latin1")
+    """Decode a reversed four-character code, showing junk as dots."""
+    return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in raw[::-1])
+
+
+def _is_fourcc(raw):
+    """True if all four bytes are printable, i.e. this looks like a real tag."""
+    return all(0x20 <= b < 0x7F for b in raw)
 
 
 class DirEntry:
@@ -107,19 +113,40 @@ class ImageHeader:
         return problems
 
 
+def _looks_like_dirent(data, off):
+    """Cheap validity test for a directory entry at a given offset."""
+    raw = data[off:off + DIRENT_SIZE]
+    if len(raw) < DIRENT_SIZE:
+        return False
+    if not (_is_fourcc(raw[0:4]) and _is_fourcc(raw[4:8])):
+        return False
+    dev_offset, length = struct.unpack("<2I", raw[0x0c:0x14])
+    return 0 < dev_offset < len(data) and 0 < length <= len(data)
+
+
 def read_directory(data):
     if data[FW_MAGIC_OFF:FW_MAGIC_OFF + 4] != FW_MAGIC:
         raise ValueError("no ]ih[ magic at 0x%x" % FW_MAGIC_OFF)
     dir_offset, = struct.unpack("<I", data[FW_MAGIC_OFF + 4:FW_MAGIC_OFF + 8])
 
-    # The offset stored in the header is relative to the start of the firmware
-    # area, which itself sits 0x1000 into the payload on S5L870x devices.
-    for fw_base in (0x1000, 0x0):
-        base = fw_base + dir_offset
-        if base + DIRENT_SIZE <= len(data) and data[base:base + 4] != b"\0\0\0\0":
+    # The offset in the header is not relative to the start of this buffer, and
+    # what it *is* relative to varies: a Firmware-XX payload pulled out of an
+    # .ipsw puts the directory 0x1000 further along, while the firmware
+    # partition read off an iPod Video has it 0x200 further along. Rather than
+    # keep a table of fudge factors, try the known ones and then fall back to
+    # scanning for the first thing that parses as a directory entry.
+    candidates = [dir_offset + delta for delta in (0x1000, 0x200, 0x0)]
+    for base in candidates:
+        if _looks_like_dirent(data, base):
             break
     else:
-        raise ValueError("could not locate image directory")
+        base = None
+        for off in range(0x1000, min(len(data), 0x20000), 4):
+            if _looks_like_dirent(data, off):
+                base = off
+                break
+        if base is None:
+            raise ValueError("could not locate image directory")
 
     entries = []
     off = base
@@ -127,7 +154,16 @@ def read_directory(data):
         raw = data[off:off + DIRENT_SIZE]
         if raw[:4] == b"\0\0\0\0" or raw[:4] == b"\xff\xff\xff\xff":
             break
-        entries.append(DirEntry(raw, len(entries)))
+        # The directory is not length-prefixed and is followed by whatever
+        # happened to be on the disk, so stop as soon as an entry stops looking
+        # like one. Both four-character codes must be printable and the image
+        # has to start inside the file.
+        if not (_is_fourcc(raw[0:4]) and _is_fourcc(raw[4:8])):
+            break
+        entry = DirEntry(raw, len(entries))
+        if entry.dev_offset >= len(data):
+            break
+        entries.append(entry)
         off += DIRENT_SIZE
     return base, entries
 
