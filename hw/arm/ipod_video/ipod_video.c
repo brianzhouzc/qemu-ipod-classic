@@ -471,19 +471,6 @@ static void ipod_video_machine_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(sysmem, FLASH_ROM_MEM_BASE, rom);
 
-    /*
-     * Diagnostic: the firmware appears to expect DRAM aliased into low
-     * addresses through the remap unit at 0xf000f000, which is not modelled.
-     * Alias it above the flash window at the matching offset and see whether
-     * the run that was spinning at 0x100000 gets further.
-     */
-    MemoryRegion *dram_low = g_new(MemoryRegion, 1);
-    memory_region_init_alias(dram_low, NULL, "dram-low",
-                             memory_region_find(sysmem, DRAM_MEM_BASE, 4).mr,
-                             FLASH_ROM_MEM_SIZE,
-                             0x02000000 - FLASH_ROM_MEM_SIZE);
-    memory_region_add_subregion(sysmem, FLASH_ROM_MEM_SIZE, dram_low);
-
     MemoryRegion *rom_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
                              FLASH_ROM_MEM_SIZE);
