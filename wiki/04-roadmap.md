@@ -42,17 +42,72 @@ $ ./qemu-system-arm -M iPod-Classic -kernel hello.bin \
 S5L8702 alive
 ```
 
-### H2 — Consola serie
-- [x] VIC0/VIC1 (PL192) en `0x38E00000` / `0x38E01000` — instancian sin petar,
-      falta ejercitarlos con interrupciones reales
+### H2 — Consola serie e interrupciones ✅
+- [x] VIC0/VIC1 (PL192) en `0x38E00000` / `0x38E01000`
 - [x] Reloj/PLL en `0x3C500000` (modelo reutilizado del iPod Touch)
-- [x] UART0 en `0x3CC00000` (exynos4210_uart, IRQ 24) — **transmite**
-- [ ] Timers en `0x3C700000` (rehacer el decode: el modelo del Touch solo emula
-      un timer y con otro layout)
-- [ ] Verificar la ruta de interrupción de verdad (timer → VIC → CPU)
+- [x] UART0 en `0x3CC00000` (exynos4210_uart, IRQ 24)
+- [x] Timers en `0x3C700000` — bloque completo escrito de cero
+      (`hw/arm/ipod_classic/ipod_classic_timer.c`)
+- [x] Alias de IRAM0 en la dirección `0x0`, que es de donde el ARM926 coge las
+      excepciones
+- [x] Ruta de interrupción verificada de extremo a extremo
 
-**Criterio de éxito:** compilar el bootloader de Rockbox para ipod6g y ver su
-salida de depuración por `-serial mon:stdio`.
+**Resultado:** el test `tools/ipod_classic/tests/timer_irq.c` configura el timer
+B a 10 kHz exactamente como Rockbox, instala una tabla de vectores en `0x0`,
+desenmascara la IRQ 8 en VIC0 y cuenta interrupciones:
+
+```
+S5L8702 timer test
+counter runs: yes 0x00000001 0x00000002
+waiting for interrupts...
+got 0x00000005 timer interrupts
+TIMER IRQ OK
+```
+
+El log de `-d unimp,guest_errors` sale vacío: ningún acceso a periférico no
+modelado, ninguna dirección fuera de sitio.
+
+#### El bloque de timers
+
+Reconstruido a partir de `timer-s5l8702.c`, `kernel-s5l8702.c` y el comentario
+sobre `TSTAT` en `s5l87xx.h`:
+
+- 8 canales. **A–D de 16 bits comparten la IRQ 8**; **E–H de 32 bits comparten
+  la IRQ 7**.
+- El estado de interrupción de A–D vive **dentro de `CON[18:16]`**, con los
+  habilitadores en `CON[14:12]` — por eso Rockbox escribe `TBCON = TBCON` para
+  acusar recibo, y por eso comprueba `TACON & (TACON >> 4) & 0x7000`.
+- El de E–H vive en `TSTAT` (`0x118`), tres bits por canal: E en 24, F en 16,
+  G en 8, H en 0. Se limpia escribiendo unos.
+- Selector de reloj en `CON[10:8]`: /2, /4, /16, /64, o directo para E–H.
+  `CON[6]` elige ECLK (12 MHz, el cristal) frente a PCLK.
+- **PCLK no está modelado**: el bloque de reloj es un fichero de registros sin
+  lógica, así que no sabemos qué PLL pidió el guest. Los dos timers que usa
+  Rockbox eligen ECLK, así que de momento se trata PCLK como ECLK y se avisa
+  por `-d unimp` si algún guest lo selecciona de verdad.
+- Solo se emula el modo intervalo, que es el único que usa Rockbox. Los demás
+  se reportan como no implementados en vez de hacer algo incorrecto en silencio.
+
+#### IRAM0 en la dirección 0
+
+El `crt0.S` de Rockbox lo dice sin ambigüedad:
+
+> *we do not want to execute from 0x0 as iram will be mapped there*
+> *copy vector section to start of IRAM0 (it will be mapped to 0x0)*
+
+Así que IRAM0 aparece también en `0x0`, que es de donde el ARM926 toma las
+excepciones. Está modelado como alias. **Lo que aún no sabemos** es si la
+bootrom ocupa esa dirección primero y el alias solo aparece tras un remap, como
+en el S5L8720. Hasta que haya un volcado de bootrom que lo aclare, si se pasa
+una bootrom esta se queda con la dirección.
+
+### H2b — Arrancar Rockbox
+- [ ] Toolchain: `apt install gcc-arm-none-eabi` sirve para nuestros tests, pero
+      Rockbox quiere `arm-elf-eabi-gcc` de `tools/rockboxdev.sh`
+- [ ] Compilar el bootloader de Rockbox para ipod6g
+- [ ] Lanzarlo con `-kernel` y seguir `-d unimp` como lista de tareas
+
+**Criterio de éxito:** ver la salida de depuración de Rockbox por serie.
 
 ### H3 — Pantalla
 - [ ] Controlador LCD en `0x38300000` + ventanas en `0x39200000` (IRQ 14)

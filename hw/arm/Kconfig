@@ -689,6 +689,7 @@ config IPOD_CLASSIC_6G
      bool
      select PL192
      select UNIMP
+     select PTIMER
      # The S5L8702 shares its clock, GPIO, I2C, SPI, SHA1 and USB blocks with
      # the S5L8720, so we borrow those device models rather than duplicating
      # them. This pulls in the iPod Touch 2G sources that define them.

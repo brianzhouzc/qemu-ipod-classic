@@ -16,6 +16,7 @@
 #include "ui/console.h"
 #include "cpu.h"
 #include "hw/arm/ipod_touch_clock.h"
+#include "hw/arm/ipod_classic/ipod_classic_timer.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 
@@ -118,6 +119,7 @@ typedef struct {
     PL192State *vic0;
     PL192State *vic1;
     IPodTouchClockState *clock0;
+    IPodClassicTimerState *timer;
     Clock *sysclk;
     /*
      * Where the CPU starts executing after reset. Either BOOTROM_MEM_BASE when

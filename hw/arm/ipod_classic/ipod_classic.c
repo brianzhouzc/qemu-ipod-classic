@@ -23,15 +23,18 @@
 #include "hw/qdev-clock.h"
 #include "hw/arm/exynos4210.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
+#include "hw/arm/ipod_classic/ipod_classic_timer.h"
+#include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
 
-static void allocate_ram(MemoryRegion *top, const char *name, uint32_t addr,
-                         uint32_t size)
+static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
+                                  uint32_t addr, uint32_t size)
 {
     MemoryRegion *sec = g_new(MemoryRegion, 1);
     memory_region_init_ram(sec, NULL, name, size, &error_fatal);
     memory_region_add_subregion(top, addr, sec);
+    return sec;
 }
 
 static void ipod_classic_cpu_setup(MachineState *machine, MemoryRegion **sysmem,
@@ -65,11 +68,30 @@ static void ipod_classic_memory_setup(MachineState *machine,
 {
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(machine);
 
+    MemoryRegion *iram0;
+
     allocate_ram(sysmem, "sdram", SDRAM_MEM_BASE, SDRAM_MEM_SIZE);
-    allocate_ram(sysmem, "iram0", IRAM0_MEM_BASE, IRAM0_MEM_SIZE);
+    iram0 = allocate_ram(sysmem, "iram0", IRAM0_MEM_BASE, IRAM0_MEM_SIZE);
     allocate_ram(sysmem, "iram1", IRAM1_MEM_BASE, IRAM1_MEM_SIZE);
 
     nms->reset_pc = SDRAM_MEM_BASE;
+
+    /*
+     * IRAM0 also appears at address 0, which is where the ARM926 takes its
+     * exceptions from. Rockbox's crt0.S is explicit about it -- "copy vector
+     * section to start of IRAM0 (it will be mapped to 0x0)" and "we do not
+     * want to execute from 0x0 as iram will be mapped there".
+     *
+     * What we do not know yet is whether the bootrom sits there first and the
+     * alias only appears after a remap, the way the S5L8720 works. Until a
+     * bootrom dump settles it, a supplied bootrom takes the address instead.
+     */
+    if (nms->bootrom_path[0] == '\0') {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+        memory_region_init_alias(alias, NULL, "iram0-alias", iram0, 0,
+                                 IRAM0_MEM_SIZE);
+        memory_region_add_subregion(sysmem, 0, alias);
+    }
 
     if (nms->bootrom_path[0] != '\0') {
         uint8_t *data = NULL;
@@ -174,7 +196,6 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.wheel",    WHEEL_MEM_BASE,    0x100000 },
     { "s5l8702.usb-phy",  USBPHYS_MEM_BASE,  0x100000 },
     { "s5l8702.i2c0",     I2C0_MEM_BASE,     0x100000 },
-    { "s5l8702.timer",    TIMER_MEM_BASE,    0x100000 },
     { "s5l8702.wdt",      WDT_MEM_BASE,      0x100000 },
     { "s5l8702.i2s",      I2S_MEM_BASE,      0x100000 },
     { "s5l8702.spdif",    SPDIF_MEM_BASE,    0x100000 },
@@ -230,6 +251,19 @@ static void ipod_classic_machine_init(MachineState *machine)
     dev = qdev_new("ipodtouch.clock");
     nms->clock0 = IPOD_TOUCH_CLOCK(dev);
     memory_region_add_subregion(sysmem, CLOCK0_MEM_BASE, &nms->clock0->iomem);
+
+    /*
+     * Timers. Channels A..D share IRQ 8 and E..H share IRQ 7; Rockbox drives
+     * B for the 10 kHz kernel tick and F for the user timer.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_TIMER);
+    nms->timer = IPOD_CLASSIC_TIMER(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, TIMER_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_TIMER_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                       s5l8702_get_irq(nms, S5L8702_TIMER32_IRQ));
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

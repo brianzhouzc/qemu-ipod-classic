@@ -378,7 +378,7 @@ static const MemoryRegionOps pl192_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-DeviceState *pl192_manual_init(char *mem_name, ...)
+DeviceState *pl192_manual_init(const char *mem_name, ...)
 {
     DeviceState *dev = qdev_new(TYPE_PL192);
     PL192State *s = PL192(dev);
