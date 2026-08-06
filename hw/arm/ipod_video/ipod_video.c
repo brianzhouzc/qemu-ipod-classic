@@ -36,6 +36,7 @@
 #include "qemu/timer.h"
 #include "hw/arm/ipod_video/ipod_video.h"
 #include "hw/arm/ipod_video/ipod_video_bcm.h"
+#include "hw/arm/ipod_video/ipod_video_intc.h"
 #include "hw/sysbus.h"
 #include "hw/ide/mmio.h"
 #include "sysemu/blockdev.h"
@@ -139,20 +140,62 @@ static const MemoryRegionOps pp502x_proc_ctl_ops = {
 };
 
 /*
- * The timer block. Only USEC_TIMER is modelled so far, which is the one the
- * firmware cannot get past: it is a free-running microsecond counter and every
- * busy-wait in Rockbox is written against it, so a register stuck at zero
- * turns the first delay loop into an infinite one.
+ * The timer block.
  *
- * TIMER1 and TIMER2 are the programmable ones that raise IRQ 0 and IRQ 1.
- * They are read and written here but do not count or interrupt yet; there is
- * no interrupt controller to raise anything through.
+ * USEC_TIMER is a free-running microsecond counter that every busy-wait in
+ * Rockbox is written against. TIMER1 and TIMER2 are programmable and raise
+ * IRQ 0 and IRQ 1; TIMER1 is what drives current_tick, which the cooperative
+ * scheduler and every timeout in the firmware depend on. From kernel-pp.c:
+ *
+ *     TIMER1_CFG = 0xc0000000 | (interval_in_ms*1000 - 1);
+ *     TIMER1_VAL;   -- read to acknowledge
+ *
+ * So bit 31 enables the timer, bit 30 enables its interrupt, the low bits are
+ * the period in microseconds minus one, and reading VAL acknowledges.
  */
+#define PP_TIMER_CFG_ENABLE     0x80000000
+#define PP_TIMER_CFG_IRQ_ENABLE 0x40000000
+#define PP_TIMER_CFG_PERIOD     0x0fffffff
 #define PP_TIMER1_CFG   0x00
 #define PP_TIMER1_VAL   0x04
 #define PP_TIMER2_CFG   0x08
 #define PP_TIMER2_VAL   0x0c
 #define PP_USEC_TIMER   0x10
+
+static void pp502x_timer_rearm(IPodVideoMachineState *nms, int n)
+{
+    uint32_t cfg = n ? nms->timer2_cfg : nms->timer1_cfg;
+    QEMUTimer *t = n ? nms->timer2 : nms->timer1;
+
+    if (!(cfg & PP_TIMER_CFG_ENABLE)) {
+        timer_del(t);
+        return;
+    }
+    /* The period is stored one less than it is, and counts microseconds. */
+    timer_mod(t, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) +
+                 (cfg & PP_TIMER_CFG_PERIOD) + 1);
+}
+
+static void pp502x_timer_expired(IPodVideoMachineState *nms, int n)
+{
+    uint32_t cfg = n ? nms->timer2_cfg : nms->timer1_cfg;
+
+    if (cfg & PP_TIMER_CFG_IRQ_ENABLE) {
+        nms->timer_pending[n] = true;
+        qemu_set_irq(qdev_get_gpio_in(nms->intc, n), 1);
+    }
+    pp502x_timer_rearm(nms, n);
+}
+
+static void pp502x_timer1_expired(void *opaque)
+{
+    pp502x_timer_expired(opaque, 0);
+}
+
+static void pp502x_timer2_expired(void *opaque)
+{
+    pp502x_timer_expired(opaque, 1);
+}
 
 static uint64_t pp502x_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -167,10 +210,14 @@ static uint64_t pp502x_timer_read(void *opaque, hwaddr offset, unsigned size)
     case PP_TIMER2_CFG:
         return nms->timer2_cfg;
     case PP_TIMER1_VAL:
-    case PP_TIMER2_VAL:
-        qemu_log_mask(LOG_UNIMP, "%s: TIMER%d_VAL is not counting yet\n",
-                      __func__, offset == PP_TIMER1_VAL ? 1 : 2);
+    case PP_TIMER2_VAL: {
+        /* Reading the value is how the firmware acknowledges the interrupt. */
+        int n = (offset == PP_TIMER1_VAL) ? 0 : 1;
+
+        nms->timer_pending[n] = false;
+        qemu_set_irq(qdev_get_gpio_in(nms->intc, n), 0);
         return 0;
+    }
     default:
         qemu_log_mask(LOG_UNIMP, "%s: unknown register +0x%" HWADDR_PRIx "\n",
                       __func__, offset);
@@ -186,9 +233,11 @@ static void pp502x_timer_write(void *opaque, hwaddr offset, uint64_t value,
     switch (offset) {
     case PP_TIMER1_CFG:
         nms->timer1_cfg = value;
+        pp502x_timer_rearm(nms, 0);
         break;
     case PP_TIMER2_CFG:
         nms->timer2_cfg = value;
+        pp502x_timer_rearm(nms, 1);
         break;
     case PP_USEC_TIMER:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: USEC_TIMER is read-only\n",
@@ -271,6 +320,7 @@ static void pp502x_ide_irq(void *opaque, int n, int level)
     IPodVideoMachineState *nms = opaque;
 
     nms->ide_intrq = level;
+    qemu_set_irq(qdev_get_gpio_in(nms->intc, PP_IDE_IRQ), level);
 }
 
 static void allocate_ram(MemoryRegion *top, const char *name, uint32_t addr,
@@ -377,7 +427,6 @@ static void ipod_video_instance_init(Object *obj)
  */
 static const struct { const char *name; hwaddr base; hwaddr size; }
 ipod_video_unimplemented[] = {
-    { "pp502x.intc",      INTC_MEM_BASE,      0x1000 },
     { "pp502x.clock",     CLOCK_MEM_BASE,     0x1000 },
     { "pp502x.dev-ctl",   DEV_CTL_MEM_BASE,   0x1000 },
     { "pp502x.dma",       DMA_MEM_BASE,       0x1000 },
@@ -422,6 +471,19 @@ static void ipod_video_machine_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(sysmem, FLASH_ROM_MEM_BASE, rom);
 
+    /*
+     * Diagnostic: the firmware appears to expect DRAM aliased into low
+     * addresses through the remap unit at 0xf000f000, which is not modelled.
+     * Alias it above the flash window at the matching offset and see whether
+     * the run that was spinning at 0x100000 gets further.
+     */
+    MemoryRegion *dram_low = g_new(MemoryRegion, 1);
+    memory_region_init_alias(dram_low, NULL, "dram-low",
+                             memory_region_find(sysmem, DRAM_MEM_BASE, 4).mr,
+                             FLASH_ROM_MEM_SIZE,
+                             0x02000000 - FLASH_ROM_MEM_SIZE);
+    memory_region_add_subregion(sysmem, FLASH_ROM_MEM_SIZE, dram_low);
+
     MemoryRegion *rom_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
                              FLASH_ROM_MEM_SIZE);
@@ -440,6 +502,20 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_io(proc_ctl, NULL, &pp502x_proc_ctl_ops, nms,
                           "pp502x.proc-ctl", 0x1000);
     memory_region_add_subregion(sysmem, PROC_CTL_MEM_BASE, proc_ctl);
+
+    /*
+     * The interrupt controller, which everything below hangs off: without a
+     * tick from TIMER1 the firmware's scheduler never runs and no timeout ever
+     * expires.
+     */
+    nms->intc = qdev_new(TYPE_IPOD_VIDEO_INTC);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(nms->intc), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(nms->intc), 0, INTC_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 0,
+                       qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
+
+    nms->timer1 = timer_new_us(QEMU_CLOCK_VIRTUAL, pp502x_timer1_expired, nms);
+    nms->timer2 = timer_new_us(QEMU_CLOCK_VIRTUAL, pp502x_timer2_expired, nms);
 
     MemoryRegion *timer = g_new(MemoryRegion, 1);
     memory_region_init_io(timer, NULL, &pp502x_timer_ops, nms,

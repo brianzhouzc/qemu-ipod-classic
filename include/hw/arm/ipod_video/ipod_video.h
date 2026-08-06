@@ -13,6 +13,8 @@
 #include "hw/boards.h"
 #include "hw/arm/boot.h"
 #include "cpu.h"
+#include "qemu/timer.h"
+#include "hw/qdev-core.h"
 
 #define TYPE_IPOD_VIDEO "iPod-Video"
 
@@ -122,6 +124,10 @@ typedef struct {
     uint32_t ide_cfg;
     uint32_t ide_timing[8];
     bool ide_intrq;
+    DeviceState *intc;
+    QEMUTimer *timer1;
+    QEMUTimer *timer2;
+    bool timer_pending[2];
 } IPodVideoMachineState;
 
 #endif
