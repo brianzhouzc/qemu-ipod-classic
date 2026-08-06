@@ -1744,13 +1744,14 @@ if test "$skip_meson" = no; then
   echo "c_link_args = [$(meson_quote $CFLAGS $LDFLAGS $EXTRA_CFLAGS $EXTRA_LDFLAGS)]" >> $cross
   echo "cpp_link_args = [$(meson_quote $CXXFLAGS $LDFLAGS $EXTRA_CXXFLAGS $EXTRA_LDFLAGS)]" >> $cross
 
-  # Only enable by default for git builds and on select OSes
+  # Upstream turns -Werror on by default for git builds on Linux and Windows.
+  # It does so by writing the built-in option into the native file, which then
+  # overrides an explicit -Dwerror=false on the meson command line, so
+  # ./configure --disable-werror has no effect. The qemu-ios device models do
+  # not build warning-clean (unused locals, hwaddr printed with %x, shadowed
+  # parameters), so this fork leaves -Werror off unless it is asked for.
   echo "# environment defaults, can still be overridden on " >> $cross
   echo "# the command line" >> $cross
-  if test -e "$source_path/.git" && \
-      { test "$targetos" = linux || test "$targetos" = "windows"; }; then
-      echo 'werror = true' >> $cross
-  fi
   echo "[project options]" >> $cross
   if test "$SMBD" != ''; then
     echo "smbd = $(meson_quote "$SMBD")" >> $cross

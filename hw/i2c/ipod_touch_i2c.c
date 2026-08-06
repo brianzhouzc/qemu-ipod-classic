@@ -24,13 +24,13 @@
 
 static void s5l8900_i2c_update(IPodTouchI2CState *s)
 {
-    uint16_t level;
-    level = (s->status & S5L8900_IICSTAT_START) &&
-            (s->control & S5L8900_IICCON_IRQEN);
-
-    if (s->control & S5L8900_IICCON_IRQPEND)
-        level = 0;
-
+    /*
+     * The interrupt level implied by the registers -- START set together with
+     * IRQEN, and forced low by IRQPEND -- is computed and then thrown away
+     * here: the line is raised unconditionally. Left as-is so the iPod Touch
+     * machines keep behaving exactly as before; the dead computation itself is
+     * gone because it breaks -Werror builds.
+     */
     qemu_irq_raise(s->irq);
 }
 

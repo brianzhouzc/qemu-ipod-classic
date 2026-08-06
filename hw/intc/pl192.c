@@ -248,6 +248,12 @@ static uint64_t pl192_read(void *opaque, hwaddr offset, unsigned size)
         case PL192_SOFTINTCLEAR:
             fprintf(stderr, "pl192: attempt to read write-only register (offset = "
                      HWADDR_FMT_plx ")\n", offset);
+            /*
+             * Falling into PL192_VECTADDR means reading this write-only
+             * register also acknowledges an interrupt, which looks accidental.
+             * Kept as-is rather than risk changing iPod Touch behaviour.
+             */
+            /* fall through */
         case PL192_VECTADDR:
             return pl192_irq_ack(s);
         /* Workaround for kernel code using PL190 */
@@ -403,9 +409,14 @@ DeviceState *pl192_manual_init(char *mem_name, ...)
 
 static void pl192_init(Object *obj)
 {
-    DeviceState *dev = DEVICE(obj);
-    PL192State *s = PL192(obj);
-    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+    /*
+     * Nothing to do here: the iPod machines build their VICs through
+     * pl192_manual_init() instead, which is why the usual instance_init body
+     * below is commented out.
+     */
+    //DeviceState *dev = DEVICE(obj);
+    //PL192State *s = PL192(obj);
+    //SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     //memory_region_init_io(&s->iomem, obj, &pl192_ops, s, "pl192", 0x1000);
     //sysbus_init_mmio(sbd, &s->iomem);
