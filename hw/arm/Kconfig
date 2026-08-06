@@ -688,6 +688,8 @@ config IPOD_TOUCH_2G
 config IPOD_VIDEO_5G
      bool
      select UNIMP
+     # The disk is a plain ATA task file four bytes apart at 0xc30001e0.
+     select IDE_MMIO
      # SER0 on the PP502x is a plain 16550 with a four-byte register stride.
      select SERIAL
 

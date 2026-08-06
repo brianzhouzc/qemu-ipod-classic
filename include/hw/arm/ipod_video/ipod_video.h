@@ -66,6 +66,13 @@
 #define GPIO_MEM_BASE       0x6000d000
 #define DMA_MEM_BASE        0x6000a000
 #define IDE_MEM_BASE        0xc3000000   /* the disk, IDE_IRQ 23 */
+/*
+ * ATA_DATA..ATA_COMMAND live at IDE_BASE + 0x1e0 four bytes apart and
+ * ATA_CONTROL at +0x3f8, per Rockbox's ata-target.h. Everything below the
+ * task file is PP-specific timing and configuration.
+ */
+#define IDE_TASKFILE_OFF    0x1e0
+#define IDE_CONTROL_OFF     0x3f8
 #define DEV_CTL_MEM_BASE    0x70000000   /* DEV_INIT1/2, GPO32_VAL, GPO32_ENABLE */
 #define I2C_MEM_BASE        0x7000c000
 #define I2S_MEM_BASE        0x70002800
@@ -112,6 +119,9 @@ typedef struct {
     uint32_t timer1_cfg;
     uint32_t timer2_cfg;
     uint32_t hw_revision;
+    uint32_t ide_cfg;
+    uint32_t ide_timing[8];
+    bool ide_intrq;
 } IPodVideoMachineState;
 
 #endif

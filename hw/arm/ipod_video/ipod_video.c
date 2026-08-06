@@ -37,6 +37,9 @@
 #include "hw/arm/ipod_video/ipod_video.h"
 #include "hw/arm/ipod_video/ipod_video_bcm.h"
 #include "hw/sysbus.h"
+#include "hw/ide/mmio.h"
+#include "sysemu/blockdev.h"
+#include "hw/qdev-properties.h"
 
 /*
  * PROCESSOR_ID, the very first thing the firmware touches. Both cores run the
@@ -206,6 +209,70 @@ static const MemoryRegionOps pp502x_timer_ops = {
     .impl.max_access_size = 4,
 };
 
+/*
+ * The PP-specific half of the IDE controller: bus timings, and IDE0_CFG.
+ *
+ * Only one bit of it matters for getting the disk read. Rockbox does not take
+ * the ATA interrupt; it polls for it, from ata-pp5020.c:
+ *
+ *     static int ata_wait_intrq(void)
+ *     {
+ *         do {
+ *             if (IDE0_CFG & IDE_CFG_INTRQ)
+ *                 return 1;
+ *             yield();
+ *         } while (TIME_BEFORE(current_tick, timeout));
+ *         return 0;
+ *     }
+ *
+ * So IDE0_CFG bit 3 has to follow the controller's interrupt line, otherwise
+ * every transfer waits forever. The timing registers are stored and handed
+ * back unchanged: they set up PIO and DMA cycle lengths, which cannot change
+ * what a read returns here.
+ */
+#define PP_IDE0_CFG         0x28
+#define PP_IDE_CFG_INTRQ    (1 << 3)
+
+static uint64_t pp502x_ide_cfg_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset == PP_IDE0_CFG) {
+        return nms->ide_cfg | (nms->ide_intrq ? PP_IDE_CFG_INTRQ : 0);
+    }
+    if (offset < sizeof(nms->ide_timing)) {
+        return nms->ide_timing[offset / 4];
+    }
+    return 0;
+}
+
+static void pp502x_ide_cfg_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset == PP_IDE0_CFG) {
+        nms->ide_cfg = value & ~PP_IDE_CFG_INTRQ;
+    } else if (offset < sizeof(nms->ide_timing)) {
+        nms->ide_timing[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps pp502x_ide_cfg_ops = {
+    .read = pp502x_ide_cfg_read,
+    .write = pp502x_ide_cfg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+static void pp502x_ide_irq(void *opaque, int n, int level)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    nms->ide_intrq = level;
+}
+
 static void allocate_ram(MemoryRegion *top, const char *name, uint32_t addr,
                          uint32_t size)
 {
@@ -319,7 +386,6 @@ ipod_video_unimplemented[] = {
     { "pp502x.i2s",       I2S_MEM_BASE,       0x0400 },
     { "pp502x.lcd",       LCD_MEM_BASE,       0x1000 },
     { "pp502x.i2c",       I2C_MEM_BASE,       0x1000 },
-    { "pp502x.ide",       IDE_MEM_BASE,       0x1000 },
     { "pp502x.usb",       USB_MEM_BASE,       0x1000 },
     { "pp502x.mmap",      MMAP_MEM_BASE,      0x0040 },
 };
@@ -401,6 +467,28 @@ static void ipod_video_machine_init(MachineState *machine)
     DeviceState *bcm = qdev_new(TYPE_IPOD_VIDEO_BCM);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bcm), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bcm), 0, BCM_MEM_BASE);
+
+    /*
+     * The disk. The task file is a standard ATA one with the registers four
+     * bytes apart at IDE_BASE + 0x1e0, and the control register at +0x3f8, so
+     * QEMU's memory-mapped IDE covers it with shift 2. What is PP-specific is
+     * the block of timing and configuration registers below 0x1e0, which is
+     * left as an unimplemented stub: the firmware programs PIO and DMA
+     * timings there, and none of that changes what a read returns.
+     */
+    MemoryRegion *ide_cfg = g_new(MemoryRegion, 1);
+    memory_region_init_io(ide_cfg, NULL, &pp502x_ide_cfg_ops, nms,
+                          "pp502x.ide-cfg", IDE_TASKFILE_OFF);
+    memory_region_add_subregion(sysmem, IDE_MEM_BASE, ide_cfg);
+
+    DeviceState *ide = qdev_new(TYPE_MMIO_IDE);
+    qdev_prop_set_uint32(ide, "shift", 2);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ide), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(ide), 0,
+                       qemu_allocate_irq(pp502x_ide_irq, nms, 0));
+    sysbus_mmio_map(SYS_BUS_DEVICE(ide), 0, IDE_MEM_BASE + IDE_TASKFILE_OFF);
+    sysbus_mmio_map(SYS_BUS_DEVICE(ide), 1, IDE_MEM_BASE + IDE_CONTROL_OFF);
+    mmio_ide_init_drives(ide, drive_get(IF_IDE, 0, 0), NULL);
 
     ipod_video_load_image(machine, nms);
 
