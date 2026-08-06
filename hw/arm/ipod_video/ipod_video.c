@@ -323,12 +323,69 @@ static void pp502x_ide_irq(void *opaque, int n, int level)
     qemu_set_irq(qdev_get_gpio_in(nms->intc, PP_IDE_IRQ), level);
 }
 
-static void allocate_ram(MemoryRegion *top, const char *name, uint32_t addr,
-                         uint32_t size)
+/*
+ * The cache controller, which is also where the vector table lives or does
+ * not. From pp5020.h:
+ *
+ *     #define CACHE_CTL_ENABLE     0x0001
+ *     #define CACHE_CTL_RUN        0x0002
+ *     #define CACHE_CTL_INIT       0x0004
+ *     #define CACHE_CTL_VECT_REMAP 0x0010
+ *     #define CACHE_CTL_READY      0x4000
+ *
+ * VECT_REMAP is the one that matters. The ARM takes its exceptions from
+ * address 0, and on this SoC that address is the flash ROM until the firmware
+ * asks for the vectors to be remapped into IRAM, where it has installed its
+ * own. Leave the bit unimplemented and every exception vectors into blank
+ * space -- which is exactly what was happening: the CPU walked forward through
+ * a window of zeroes, one NOP at a time, until it fell out of the map.
+ *
+ * The cache itself is not modelled. There is nothing to make coherent here,
+ * so enabling it only has to be acknowledged.
+ */
+#define PP_CACHE_CTL            0x00
+#define PP_CACHE_CTL_VECT_REMAP 0x0010
+#define PP_CACHE_CTL_READY      0x4000
+
+static uint64_t pp502x_cache_ctl_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset == PP_CACHE_CTL) {
+        /* Always ready, never busy: there is no cache to wait for. */
+        return nms->cache_ctl | PP_CACHE_CTL_READY;
+    }
+    return 0;
+}
+
+static void pp502x_cache_ctl_write(void *opaque, hwaddr offset, uint64_t value,
+                                   unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset != PP_CACHE_CTL) {
+        return;
+    }
+    nms->cache_ctl = value;
+    memory_region_set_enabled(nms->vect_remap,
+                              !!(value & PP_CACHE_CTL_VECT_REMAP));
+}
+
+static const MemoryRegionOps pp502x_cache_ctl_ops = {
+    .read = pp502x_cache_ctl_read,
+    .write = pp502x_cache_ctl_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
+                                  uint32_t addr, uint32_t size)
 {
     MemoryRegion *sec = g_new(MemoryRegion, 1);
     memory_region_init_ram(sec, NULL, name, size, &error_fatal);
     memory_region_add_subregion(top, addr, sec);
+    return sec;
 }
 
 static void ipod_video_cpu_reset(void *opaque)
@@ -430,7 +487,6 @@ ipod_video_unimplemented[] = {
     { "pp502x.clock",     CLOCK_MEM_BASE,     0x1000 },
     { "pp502x.dev-ctl",   DEV_CTL_MEM_BASE,   0x1000 },
     { "pp502x.dma",       DMA_MEM_BASE,       0x1000 },
-    { "pp502x.cache-ctl", CACHE_CTL_MEM_BASE, 0x1000 },
     { "pp502x.gpio",      GPIO_MEM_BASE,      0x1000 },
     { "pp502x.i2s",       I2S_MEM_BASE,       0x0400 },
     { "pp502x.lcd",       LCD_MEM_BASE,       0x1000 },
@@ -453,7 +509,8 @@ static void ipod_video_machine_init(MachineState *machine)
     object_unref(cpuobj);
 
     allocate_ram(sysmem, "dram", DRAM_MEM_BASE, DRAM_MEM_SIZE);
-    allocate_ram(sysmem, "iram", IRAM_MEM_BASE, IRAM_MEM_SIZE);
+    MemoryRegion *iram = allocate_ram(sysmem, "iram", IRAM_MEM_BASE,
+                                      IRAM_MEM_SIZE);
 
     /*
      * The PP's NOR flash sits at address 0 while the bootloader runs and is
@@ -470,6 +527,16 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_ram(rom, NULL, "flash-rom", FLASH_ROM_MEM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, FLASH_ROM_MEM_BASE, rom);
+
+    /*
+     * IRAM over the top of the flash window, for when the firmware asks for
+     * the vectors to be remapped. Disabled until it does.
+     */
+    nms->vect_remap = g_new(MemoryRegion, 1);
+    memory_region_init_alias(nms->vect_remap, NULL, "vector-remap",
+                             iram, 0, IRAM_MEM_SIZE);
+    memory_region_add_subregion_overlap(sysmem, 0, nms->vect_remap, 1);
+    memory_region_set_enabled(nms->vect_remap, false);
 
     MemoryRegion *rom_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
@@ -500,6 +567,11 @@ static void ipod_video_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(nms->intc), 0, INTC_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 0,
                        qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
+
+    MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
+    memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
+                          "pp502x.cache-ctl", 0x1000);
+    memory_region_add_subregion(sysmem, CACHE_CTL_MEM_BASE, cache_ctl);
 
     nms->timer1 = timer_new_us(QEMU_CLOCK_VIRTUAL, pp502x_timer1_expired, nms);
     nms->timer2 = timer_new_us(QEMU_CLOCK_VIRTUAL, pp502x_timer2_expired, nms);

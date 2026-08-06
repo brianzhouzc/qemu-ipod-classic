@@ -15,6 +15,7 @@
 #include "cpu.h"
 #include "qemu/timer.h"
 #include "hw/qdev-core.h"
+#include "exec/memory.h"
 
 #define TYPE_IPOD_VIDEO "iPod-Video"
 
@@ -128,6 +129,8 @@ typedef struct {
     QEMUTimer *timer1;
     QEMUTimer *timer2;
     bool timer_pending[2];
+    uint32_t cache_ctl;
+    MemoryRegion *vect_remap;
 } IPodVideoMachineState;
 
 #endif
