@@ -13,6 +13,7 @@ de 6ª generación. Rama de trabajo: `ipod_classic_6g`, partiendo de
 | [03-reuse-qemu-ios.md](03-reuse-qemu-ios.md) | Qué modelos de dispositivo de la rama `ipod_touch_2g` se pueden reaprovechar y cuáles hay que escribir de cero. |
 | [04-roadmap.md](04-roadmap.md) | Plan por hitos y estado actual. |
 | [05-build-notes.md](05-build-notes.md) | Cómo compilar y ejecutar en este equipo (WSL). Problemas conocidos. |
+| [07-pp502x-hardware.md](07-pp502x-hardware.md) | El SoC PortalPlayer PP5020/PP5022: mapa de memoria, doble nucleo y el modelo de arranque del iPod 5G. |
 | [06-ipod-video-5g.md](06-ipod-video-5g.md) | El iPod Video (PP5022C) que sí tenemos físicamente: identificación, layout del disco y su firmware **sin cifrar**. |
 
 ## Fuentes

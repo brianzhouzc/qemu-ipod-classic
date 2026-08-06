@@ -42,13 +42,19 @@ def _is_fourcc(raw):
 
 
 class DirEntry:
-    def __init__(self, raw, index):
-        (dev, typ, self.id, self.dev_offset, self.length, self.addr,
+    def __init__(self, raw, index, base=0):
+        (dev, typ, self.id, dev_offset, self.length, self.addr,
          self.entry_offset, self.checksum, self.version,
          self.load_addr) = struct.unpack(DIRENT_FMT, raw)
         self.index = index
         self.dev = _fourcc(dev)
         self.type = _fourcc(typ)
+        # Offsets in the directory are counted from the image base, not from
+        # the start of the buffer. On a firmware partition read off the disk
+        # that base is the second sector: the first one holds the ]ih[ header
+        # and everything it points at is numbered from after it.
+        self.raw_dev_offset = dev_offset
+        self.dev_offset = dev_offset + base
 
     def __str__(self):
         return ("[%d] %-4s dev=%-4s off=0x%08x len=0x%08x (%d) addr=0x%08x "
@@ -135,18 +141,19 @@ def read_directory(data):
     # partition read off an iPod Video has it 0x200 further along. Rather than
     # keep a table of fudge factors, try the known ones and then fall back to
     # scanning for the first thing that parses as a directory entry.
-    candidates = [dir_offset + delta for delta in (0x1000, 0x200, 0x0)]
-    for base in candidates:
-        if _looks_like_dirent(data, base):
+    image_base = None
+    for delta in (0x1000, 0x200, 0x0):
+        if _looks_like_dirent(data, dir_offset + delta):
+            image_base = delta
             break
-    else:
-        base = None
+    if image_base is None:
         for off in range(0x1000, min(len(data), 0x20000), 4):
             if _looks_like_dirent(data, off):
-                base = off
+                image_base = off - dir_offset
                 break
-        if base is None:
+        if image_base is None:
             raise ValueError("could not locate image directory")
+    base = dir_offset + image_base
 
     entries = []
     off = base
@@ -160,12 +167,12 @@ def read_directory(data):
         # has to start inside the file.
         if not (_is_fourcc(raw[0:4]) and _is_fourcc(raw[4:8])):
             break
-        entry = DirEntry(raw, len(entries))
+        entry = DirEntry(raw, len(entries), image_base)
         if entry.dev_offset >= len(data):
             break
         entries.append(entry)
         off += DIRENT_SIZE
-    return base, entries
+    return base, image_base, entries
 
 
 def entropy(buf):
@@ -181,9 +188,10 @@ def entropy(buf):
 
 def cmd_list(path):
     data = open(path, "rb").read()
-    dir_base, entries = read_directory(data)
+    dir_base, image_base, entries = read_directory(data)
     print("file       : %s (0x%x bytes)" % (path, len(data)))
-    print("directory  : 0x%x, %d entries" % (dir_base, len(entries)))
+    print("directory  : 0x%x, %d entries (image base +0x%x)"
+          % (dir_base, len(entries), image_base))
     for e in entries:
         print(e)
         if data[e.dev_offset:e.dev_offset + 4] == b"8702":
@@ -208,7 +216,7 @@ def cmd_list(path):
 
 def cmd_extract(path, outdir):
     data = open(path, "rb").read()
-    _, entries = read_directory(data)
+    _, _, entries = read_directory(data)
     os.makedirs(outdir, exist_ok=True)
     for e in entries:
         size = e.length
