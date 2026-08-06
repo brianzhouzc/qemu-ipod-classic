@@ -539,9 +539,17 @@ static void ipod_video_machine_init(MachineState *machine)
      * left as an unimplemented stub: the firmware programs PIO and DMA
      * timings there, and none of that changes what a read returns.
      */
+    /*
+     * Cover the whole IDE window, not just the registers below the task file.
+     * The controller has more in it than the parts we model -- DMA control,
+     * more status -- and leaving those addresses unmapped turns every stray
+     * access into a data abort, which with no vector table installed takes the
+     * CPU somewhere it never comes back from. This sits underneath and the
+     * task file is layered on top.
+     */
     MemoryRegion *ide_cfg = g_new(MemoryRegion, 1);
     memory_region_init_io(ide_cfg, NULL, &pp502x_ide_cfg_ops, nms,
-                          "pp502x.ide-cfg", IDE_TASKFILE_OFF);
+                          "pp502x.ide-cfg", 0x1000);
     memory_region_add_subregion(sysmem, IDE_MEM_BASE, ide_cfg);
 
     DeviceState *ide = qdev_new(TYPE_MMIO_IDE);
@@ -549,8 +557,10 @@ static void ipod_video_machine_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ide), &error_fatal);
     sysbus_connect_irq(SYS_BUS_DEVICE(ide), 0,
                        qemu_allocate_irq(pp502x_ide_irq, nms, 0));
-    sysbus_mmio_map(SYS_BUS_DEVICE(ide), 0, IDE_MEM_BASE + IDE_TASKFILE_OFF);
-    sysbus_mmio_map(SYS_BUS_DEVICE(ide), 1, IDE_MEM_BASE + IDE_CONTROL_OFF);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(ide), 0,
+                            IDE_MEM_BASE + IDE_TASKFILE_OFF, 1);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(ide), 1,
+                            IDE_MEM_BASE + IDE_CONTROL_OFF, 1);
     mmio_ide_init_drives(ide, drive_get(IF_IDE, 0, 0), NULL);
 
     ipod_video_load_image(machine, nms);
