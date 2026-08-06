@@ -1,6 +1,42 @@
 # Roadmap
 
-## Estrategia
+## Dos objetivos, dos máquinas
+
+El proyecto arrancó apuntando al **iPod classic 6G** (S5L8702) y se topó con que
+su firmware está cifrado con una clave que vive en el silicio. Al aparecer un
+**iPod Video 5G** físico, cuyo firmware está en claro, el objetivo de arrancar
+el sistema original de Apple se movió allí.
+
+| Máquina | SoC | Estado |
+|---|---|---|
+| `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
+| `iPod-Video` | PP5022C | **ejecuta el firmware real hasta el acceso a disco** |
+
+El trabajo del Classic sigue intacto y es reaprovechable si algún día
+conseguimos un `osos` descifrado.
+
+## iPod Video (PP502x) — estado
+
+Con `-M iPod-Video,entry=0x735a00 -kernel osos_full.bin`, el bootloader de
+Rockbox extraído del aparato real recorre esta secuencia:
+
+1. Lee `PROCESSOR_ID` (`0x60000000`) y se reconoce como CPU
+2. Espera a que el COP declare que duerme (`COP_CTL`, bit 31)
+3. Se copia a sí mismo a IRAM (`0x40000000`)
+4. Configura GPIO — seis escrituras de dirección de pines
+5. Consulta la revisión de hardware en `0x405c`
+6. Hace **transacciones I²C** contra el PMU y el códec (`0x7000c100`/`0x104`/`0x120`)
+7. Llega al **controlador IDE** (`+0x1fc`), buscando `rockbox.ipod` en la FAT32
+
+Modelado hasta ahora: DRAM, IRAM, ventana de flash NOR con la revisión de
+hardware, `PROCESSOR_ID`, `CPU_CTL`/`COP_CTL`, `USEC_TIMER` y el UART 16550.
+Todo lo demás son stubs que reportan por `-d unimp`.
+
+Lo siguiente, en el orden que lo pide el firmware: controlador **IDE** (para
+que encuentre el disco), **I²C** de verdad, controlador de **interrupciones** y
+**LCD**.
+
+## Estrategia (iPod classic 6G)
 
 El `osos` de Apple está cifrado con la clave GID del SoC
 (ver [01-firmware-ipsw.md](01-firmware-ipsw.md)), así que no es un objetivo

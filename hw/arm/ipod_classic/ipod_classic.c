@@ -15,6 +15,7 @@
 #include "qapi/error.h"
 #include "hw/arm/boot.h"
 #include "hw/loader.h"
+#include "elf.h"
 #include "exec/address-spaces.h"
 #include "hw/misc/unimp.h"
 #include "hw/irq.h"
@@ -73,6 +74,7 @@ static void ipod_classic_memory_setup(MachineState *machine,
     allocate_ram(sysmem, "sdram", SDRAM_MEM_BASE, SDRAM_MEM_SIZE);
     iram0 = allocate_ram(sysmem, "iram0", IRAM0_MEM_BASE, IRAM0_MEM_SIZE);
     allocate_ram(sysmem, "iram1", IRAM1_MEM_BASE, IRAM1_MEM_SIZE);
+    allocate_ram(sysmem, "edgeic", EDGEIC_MEM_BASE, EDGEIC_MEM_SIZE);
 
     nms->reset_pc = SDRAM_MEM_BASE;
 
@@ -116,23 +118,41 @@ static void ipod_classic_memory_setup(MachineState *machine,
     }
 
     /*
-     * -kernel takes a raw binary, not an ELF or a uImage: this is where the
-     * osos payload lands on real hardware (addr = 0x08000000 in the firmware
-     * directory, see wiki/01-firmware-ipsw.md). It wins over the bootrom so
-     * that you can boot an image directly while still supplying a bootrom for
+     * -kernel takes either an ELF or a raw binary, and wins over the bootrom
+     * so an image can be booted directly while a bootrom is still supplied for
      * whatever it may map.
+     *
+     * An ELF carries its own load addresses and entry point, which matters
+     * because the two things we want to boot land in different places: a
+     * Rockbox bootloader runs from IRAM1 at 0x22020800, while the osos image
+     * of a retail firmware loads at 0x08000000 (addr in the firmware
+     * directory, see wiki/01-firmware-ipsw.md). A raw binary has no such
+     * information, so it goes to SDRAM.
      */
     if (machine->kernel_filename) {
-        ssize_t size = load_image_targphys(machine->kernel_filename,
-                                           SDRAM_MEM_BASE, SDRAM_MEM_SIZE);
-        if (size < 0) {
-            error_report("could not load \"%s\" at 0x%x",
-                         machine->kernel_filename, (unsigned)SDRAM_MEM_BASE);
-            exit(1);
+        uint64_t entry = 0, lowaddr = 0, highaddr = 0;
+        ssize_t size;
+
+        size = load_elf(machine->kernel_filename, NULL, NULL, NULL, &entry,
+                        &lowaddr, &highaddr, NULL, 0, EM_ARM, 1, 0);
+        if (size > 0) {
+            info_report("loaded ELF \"%s\": 0x%" PRIx64 "-0x%" PRIx64
+                        ", entry 0x%" PRIx64, machine->kernel_filename,
+                        lowaddr, highaddr, entry);
+            nms->reset_pc = entry;
+        } else {
+            size = load_image_targphys(machine->kernel_filename,
+                                       SDRAM_MEM_BASE, SDRAM_MEM_SIZE);
+            if (size < 0) {
+                error_report("could not load \"%s\" at 0x%x",
+                             machine->kernel_filename,
+                             (unsigned)SDRAM_MEM_BASE);
+                exit(1);
+            }
+            info_report("loaded 0x%zx raw bytes at 0x%x", (size_t)size,
+                        (unsigned)SDRAM_MEM_BASE);
+            nms->reset_pc = SDRAM_MEM_BASE;
         }
-        info_report("loaded 0x%zx bytes at 0x%x", (size_t)size,
-                    (unsigned)SDRAM_MEM_BASE);
-        nms->reset_pc = SDRAM_MEM_BASE;
     }
 }
 

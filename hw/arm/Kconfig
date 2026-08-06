@@ -685,6 +685,12 @@ config IPOD_TOUCH_2G
      select IPOD_TOUCH_2G
      select PL192
 
+config IPOD_VIDEO_5G
+     bool
+     select UNIMP
+     # SER0 on the PP502x is a plain 16550 with a four-byte register stride.
+     select SERIAL
+
 config IPOD_CLASSIC_6G
      bool
      select PL192

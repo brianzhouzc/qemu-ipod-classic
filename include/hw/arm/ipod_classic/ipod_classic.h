@@ -58,6 +58,13 @@
 #define AES_MEM_BASE      0x38C00000   /* AES_BASE */
 #define VIC0_MEM_BASE     0x38E00000   /* VIC_BASE */
 #define VIC1_MEM_BASE     0x38E01000
+/*
+ * Sits right behind the two VICs. The iPod Touch machines call it "edgeic"
+ * and back it with plain RAM rather than modelling it; Rockbox's bootloader
+ * writes to +0x08 early on, so we need at least that much.
+ */
+#define EDGEIC_MEM_BASE   0x38E02000
+#define EDGEIC_MEM_SIZE   0x1000
 #define ADM_SFR_MEM_BASE  0x39000000   /* ADM_SFR_BASE, CalmADM2E audio DSP */
 #define LCD_WIN_MEM_BASE  0x39200000   /* LCDBASE, framebuffer windows */
 #define FMC_MEM_BASE      0x39400000   /* FMC_BASE, NAND controller */
