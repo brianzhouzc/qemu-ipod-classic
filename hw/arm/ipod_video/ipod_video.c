@@ -35,6 +35,8 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/arm/ipod_video/ipod_video.h"
+#include "hw/arm/ipod_video/ipod_video_bcm.h"
+#include "hw/sysbus.h"
 
 /*
  * PROCESSOR_ID, the very first thing the firmware touches. Both cores run the
@@ -391,6 +393,14 @@ static void ipod_video_machine_init(MachineState *machine)
      */
     serial_mm_init(sysmem, SER0_MEM_BASE, 2, NULL, 115200, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
+
+    /*
+     * The panel hangs off a Broadcom companion chip rather than off the SoC,
+     * so this is what actually puts pixels on screen.
+     */
+    DeviceState *bcm = qdev_new(TYPE_IPOD_VIDEO_BCM);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(bcm), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(bcm), 0, BCM_MEM_BASE);
 
     ipod_video_load_image(machine, nms);
 

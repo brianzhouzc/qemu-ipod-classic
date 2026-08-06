@@ -53,6 +53,9 @@
  */
 #define IPOD_VIDEO_HW_REVISION  0x000b0005
 
+/* The Broadcom BCM2722 that owns the framebuffer and drives the panel. */
+#define BCM_MEM_BASE        0x30000000
+
 /* Peripherals. */
 #define PROC_ID_MEM_BASE    0x60000000   /* PROCESSOR_ID: 0x55 = CPU, 0xaa = COP */
 #define INTC_MEM_BASE       0x60004000   /* CPU_INT_EN at +0x24, hi bank +0x120 */
