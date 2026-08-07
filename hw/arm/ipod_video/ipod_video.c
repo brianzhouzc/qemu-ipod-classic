@@ -379,6 +379,54 @@ static const MemoryRegionOps pp502x_cache_ctl_ops = {
     .impl.max_access_size = 4,
 };
 
+/*
+ * The remap unit, MMAP0..7 at 0xf000f000.
+ *
+ * This is how low addresses stop being the flash ROM and become real memory.
+ * Apple's firmware is linked to run from 0: tracing the boot shows the Rockbox
+ * bootloader hand control to it at DRAM_START, its reset path run through
+ * 0x100001f0..0x10000234, and then jump straight to 0x23c -- an absolute low
+ * address that only makes sense once DRAM is mapped there. Without the remap
+ * that jump lands in the blank flash window and the CPU NOP-sleds upward until
+ * it falls out of the map.
+ *
+ * Modelled coarsely: programming MMAP0 at all switches DRAM in at address 0.
+ * The registers encode a logical base, a physical base and masks, none of
+ * which is decoded here, so a guest asking for anything other than the usual
+ * whole-of-DRAM-at-zero mapping will not get what it asked for.
+ */
+static uint64_t pp502x_mmap_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    return offset < sizeof(nms->mmap_regs) ? nms->mmap_regs[offset / 4] : 0;
+}
+
+static void pp502x_mmap_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset >= sizeof(nms->mmap_regs)) {
+        return;
+    }
+    nms->mmap_regs[offset / 4] = value;
+
+    /* MMAP0 is the pair at +0x00 and +0x04. */
+    if (offset <= 0x04 && value != 0 && !nms->dram_remapped) {
+        nms->dram_remapped = true;
+        memory_region_set_enabled(nms->dram_remap, true);
+    }
+}
+
+static const MemoryRegionOps pp502x_mmap_ops = {
+    .read = pp502x_mmap_read,
+    .write = pp502x_mmap_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
 {
@@ -492,7 +540,6 @@ ipod_video_unimplemented[] = {
     { "pp502x.lcd",       LCD_MEM_BASE,       0x1000 },
     { "pp502x.i2c",       I2C_MEM_BASE,       0x1000 },
     { "pp502x.usb",       USB_MEM_BASE,       0x1000 },
-    { "pp502x.mmap",      MMAP_MEM_BASE,      0x0040 },
 };
 
 static void ipod_video_machine_init(MachineState *machine)
@@ -508,7 +555,8 @@ static void ipod_video_machine_init(MachineState *machine)
     nms->nsas = cpu_get_address_space(CPU(nms->cpu), ARMASIdx_NS);
     object_unref(cpuobj);
 
-    allocate_ram(sysmem, "dram", DRAM_MEM_BASE, DRAM_MEM_SIZE);
+    MemoryRegion *dram = allocate_ram(sysmem, "dram", DRAM_MEM_BASE,
+                                      DRAM_MEM_SIZE);
     MemoryRegion *iram = allocate_ram(sysmem, "iram", IRAM_MEM_BASE,
                                       IRAM_MEM_SIZE);
 
@@ -537,6 +585,13 @@ static void ipod_video_machine_init(MachineState *machine)
                              iram, 0, IRAM_MEM_SIZE);
     memory_region_add_subregion_overlap(sysmem, 0, nms->vect_remap, 1);
     memory_region_set_enabled(nms->vect_remap, false);
+
+    /* DRAM at address 0, switched in when the firmware programs MMAP0. */
+    nms->dram_remap = g_new(MemoryRegion, 1);
+    memory_region_init_alias(nms->dram_remap, NULL, "dram-remap", dram, 0,
+                             DRAM_MEM_SIZE);
+    memory_region_add_subregion_overlap(sysmem, 0, nms->dram_remap, 2);
+    memory_region_set_enabled(nms->dram_remap, false);
 
     MemoryRegion *rom_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
@@ -567,6 +622,11 @@ static void ipod_video_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(nms->intc), 0, INTC_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 0,
                        qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
+
+    MemoryRegion *mmap = g_new(MemoryRegion, 1);
+    memory_region_init_io(mmap, NULL, &pp502x_mmap_ops, nms,
+                          "pp502x.mmap", 0x40);
+    memory_region_add_subregion(sysmem, MMAP_MEM_BASE, mmap);
 
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,

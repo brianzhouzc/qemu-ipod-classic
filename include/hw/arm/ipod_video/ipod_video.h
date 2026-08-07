@@ -131,6 +131,9 @@ typedef struct {
     bool timer_pending[2];
     uint32_t cache_ctl;
     MemoryRegion *vect_remap;
+    MemoryRegion *dram_remap;
+    bool dram_remapped;
+    uint32_t mmap_regs[16];
 } IPodVideoMachineState;
 
 #endif
