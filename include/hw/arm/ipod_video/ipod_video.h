@@ -77,7 +77,14 @@
 #define IDE_TASKFILE_OFF    0x1e0
 #define IDE_CONTROL_OFF     0x3f8
 #define DEV_CTL_MEM_BASE    0x70000000   /* DEV_INIT1/2, GPO32_VAL, GPO32_ENABLE */
-#define I2C_MEM_BASE        0x7000c000
+/*
+ * The click wheel, not I2C as this was first labelled. Rockbox reads
+ * CLICKWHEEL_DATA from 0x7000c140 in button-clickwheel.c, and the trace shows
+ * the firmware reading exactly that offset. This is both why the firmware may
+ * believe buttons are held and the device needed to navigate anything.
+ */
+#define CLICKWHEEL_MEM_BASE 0x7000c000
+#define CLICKWHEEL_DATA_OFF 0x140
 #define I2S_MEM_BASE        0x70002800
 #define LCD_MEM_BASE        0x70003000
 #define SER0_MEM_BASE       0x70006000   /* 16550-compatible, stride 4 */
