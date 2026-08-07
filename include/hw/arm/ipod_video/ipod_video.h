@@ -134,6 +134,7 @@ typedef struct {
     MemoryRegion *dram_remap;
     bool dram_remapped;
     uint32_t mmap_regs[16];
+    uint32_t gpio_regs[1024];
 } IPodVideoMachineState;
 
 #endif

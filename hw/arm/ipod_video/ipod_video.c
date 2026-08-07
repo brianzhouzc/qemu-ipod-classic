@@ -427,6 +427,52 @@ static const MemoryRegionOps pp502x_mmap_ops = {
     .impl.max_access_size = 4,
 };
 
+/*
+ * GPIO, enough of it to answer the buttons.
+ *
+ * The registers go four ports to a group: ENABLE at +0x00, OUTPUT_EN at +0x10,
+ * OUTPUT_VAL at +0x20 and INPUT_VAL at +0x30. Only the input values matter
+ * here, and they are active low -- from Rockbox's button-clickwheel.c:
+ *
+ *     bool button_hold(void) { return (GPIOA_INPUT_VAL & 0x20) ? false : true; }
+ *
+ * Reading back zero therefore means every button is held, including hold,
+ * which is why the Rockbox bootloader was taking its "boot Apple's firmware"
+ * path instead of loading rockbox.ipod. Inputs read as all ones: nothing
+ * pressed.
+ */
+#define PP_GPIO_INPUT_VAL   0x30
+#define PP_GPIO_GROUP_SIZE  0x40
+
+static uint64_t pp502x_gpio_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+    hwaddr reg = offset % PP_GPIO_GROUP_SIZE;
+
+    if (reg >= PP_GPIO_INPUT_VAL && reg < PP_GPIO_INPUT_VAL + 0x10) {
+        return 0xffffffff;
+    }
+    return offset < sizeof(nms->gpio_regs) ? nms->gpio_regs[offset / 4] : 0;
+}
+
+static void pp502x_gpio_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset < sizeof(nms->gpio_regs)) {
+        nms->gpio_regs[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps pp502x_gpio_ops = {
+    .read = pp502x_gpio_read,
+    .write = pp502x_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
 {
@@ -620,6 +666,11 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_io(mmap, NULL, &pp502x_mmap_ops, nms,
                           "pp502x.mmap", 0x40);
     memory_region_add_subregion(sysmem, MMAP_MEM_BASE, mmap);
+
+    MemoryRegion *gpio = g_new(MemoryRegion, 1);
+    memory_region_init_io(gpio, NULL, &pp502x_gpio_ops, nms,
+                          "pp502x.gpio", 0x1000);
+    memory_region_add_subregion_overlap(sysmem, GPIO_MEM_BASE, gpio, 1);
 
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
