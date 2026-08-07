@@ -128,3 +128,30 @@ localizando el directorio y luego se lo aplica a todos los `devOffset`.
 
 Cómo se detectó: `bootloader/ipod.c` dice que `"portalplayer"` está en
 `DRAM_START+0x20`, y con los offsets sin corregir aparecía en `+0x220`.
+
+
+## Dónde se queda el arranque (2026-08-06)
+
+Con el remapeo MMAP y el suelo de registros, el firmware de Apple ejecuta
+código real y extenso por todo su espacio: `0x82694`, `0x7d080`,
+`0x144cc8`, `0x10c360`, `0x25f77c`, `0x90494`, `0xf23bc`, `0xe9b98`.
+
+Se detiene en la instrucción de `0xe9b98`:
+
+```
+0x000e9b98:  ef123456      svc 0x123456
+```
+
+Una llamada al sistema. QEMU la vectoriza bien a `0x08`, donde el
+`ldr pc,[pc,#0xdc]` de la tabla de vectores del propio firmware lleva a su
+manejador. El manejador arranca y **hace push a una pila de modo supervisor
+que nunca se inicializó**: la falta resultante es una escritura en
+`0xffffffc8`, o sea SP envuelto desde cero.
+
+Eso ya no es un hueco en el mapa de memoria. Es que el firmware llega a esa
+ruta sin haber pasado por el código que configura las pilas de cada modo, o
+bien las configura en algo que todavía no modelamos correctamente.
+
+Siguiente paso: trazar hacia atrás desde `0xe9b98` para ver qué camino lleva
+ahí, y comparar con la ruta de inicialización que el firmware debería haber
+recorrido antes.
