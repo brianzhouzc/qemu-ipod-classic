@@ -532,13 +532,6 @@ static void ipod_video_instance_init(Object *obj)
  */
 static const struct { const char *name; hwaddr base; hwaddr size; }
 ipod_video_unimplemented[] = {
-    { "pp502x.clock",     CLOCK_MEM_BASE,     0x1000 },
-    { "pp502x.dev-ctl",   DEV_CTL_MEM_BASE,   0x1000 },
-    { "pp502x.dma",       DMA_MEM_BASE,       0x1000 },
-    { "pp502x.gpio",      GPIO_MEM_BASE,      0x1000 },
-    { "pp502x.i2s",       I2S_MEM_BASE,       0x0400 },
-    { "pp502x.lcd",       LCD_MEM_BASE,       0x1000 },
-    { "pp502x.i2c",       I2C_MEM_BASE,       0x1000 },
     { "pp502x.usb",       USB_MEM_BASE,       0x1000 },
 };
 
@@ -605,12 +598,12 @@ static void ipod_video_machine_init(MachineState *machine)
     MemoryRegion *proc_id = g_new(MemoryRegion, 1);
     memory_region_init_io(proc_id, NULL, &pp502x_proc_id_ops, nms,
                           "pp502x.proc-id", 0x1000);
-    memory_region_add_subregion(sysmem, PROC_ID_MEM_BASE, proc_id);
+    memory_region_add_subregion_overlap(sysmem, PROC_ID_MEM_BASE, proc_id, 1);
 
     MemoryRegion *proc_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(proc_ctl, NULL, &pp502x_proc_ctl_ops, nms,
                           "pp502x.proc-ctl", 0x1000);
-    memory_region_add_subregion(sysmem, PROC_CTL_MEM_BASE, proc_ctl);
+    memory_region_add_subregion_overlap(sysmem, PROC_CTL_MEM_BASE, proc_ctl, 1);
 
     /*
      * The interrupt controller, which everything below hangs off: without a
@@ -619,7 +612,7 @@ static void ipod_video_machine_init(MachineState *machine)
      */
     nms->intc = qdev_new(TYPE_IPOD_VIDEO_INTC);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(nms->intc), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(nms->intc), 0, INTC_MEM_BASE);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(nms->intc), 0, INTC_MEM_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 0,
                        qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
 
@@ -631,7 +624,7 @@ static void ipod_video_machine_init(MachineState *machine)
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
                           "pp502x.cache-ctl", 0x1000);
-    memory_region_add_subregion(sysmem, CACHE_CTL_MEM_BASE, cache_ctl);
+    memory_region_add_subregion_overlap(sysmem, CACHE_CTL_MEM_BASE, cache_ctl, 1);
 
     nms->timer1 = timer_new_us(QEMU_CLOCK_VIRTUAL, pp502x_timer1_expired, nms);
     nms->timer2 = timer_new_us(QEMU_CLOCK_VIRTUAL, pp502x_timer2_expired, nms);
@@ -639,7 +632,19 @@ static void ipod_video_machine_init(MachineState *machine)
     MemoryRegion *timer = g_new(MemoryRegion, 1);
     memory_region_init_io(timer, NULL, &pp502x_timer_ops, nms,
                           "pp502x.timer", 0x1000);
-    memory_region_add_subregion(sysmem, TIMER_MEM_BASE, timer);
+    memory_region_add_subregion_overlap(sysmem, TIMER_MEM_BASE, timer, 1);
+
+    /*
+     * A floor under the whole SoC register window. Rockbox's header documents
+     * the blocks Rockbox uses, but Apple's firmware reaches for others -- the
+     * first fault after the remap went in was a read of 0x60009000, which
+     * appears nowhere in pp5020.h. An unknown register reading back zero is
+     * survivable; an unmapped one is a data abort, and the handler it vectors
+     * to faults in turn and never returns. The modelled blocks sit on top of
+     * this at a higher priority.
+     */
+    create_unimplemented_device("pp502x.soc-regs", 0x60000000, 0x10000);
+    create_unimplemented_device("pp502x.dev-regs", 0x70000000, 0x10000);
 
     for (size_t i = 0; i < ARRAY_SIZE(ipod_video_unimplemented); i++) {
         create_unimplemented_device(ipod_video_unimplemented[i].name,
