@@ -41,6 +41,7 @@
 #include "hw/ide/mmio.h"
 #include "sysemu/blockdev.h"
 #include "hw/qdev-properties.h"
+#include "ui/console.h"
 
 /*
  * PROCESSOR_ID, the very first thing the firmware touches. Both cores run the
@@ -473,6 +474,86 @@ static const MemoryRegionOps pp502x_gpio_ops = {
     .impl.max_access_size = 4,
 };
 
+/*
+ * The click wheel.
+ *
+ * Rockbox decodes it in button-clickwheel.c, which pins the format down
+ * exactly:
+ *
+ *     unsigned status = CLICKWHEEL_DATA;
+ *     if ((status & 0x800000ff) == 0x8000001a) {
+ *         if (status & 0x00000100) btn |= BUTTON_SELECT;
+ *         if (status & 0x00000200) btn |= BUTTON_RIGHT;
+ *         if (status & 0x00000400) btn |= BUTTON_LEFT;
+ *         if (status & 0x00000800) btn |= BUTTON_PLAY;
+ *         if (status & 0x00001000) btn |= BUTTON_MENU;
+ *
+ * So a valid packet is 0x8000001a and the buttons are single bits on top of
+ * it. Reading back zero is not "no buttons", it is "no packet at all", which
+ * is not the same thing and is part of why the firmware would not proceed.
+ *
+ * The wheel itself -- bit 30 with a position in bits 16..22 -- is not
+ * generated yet; only the five buttons are, from the keyboard.
+ */
+#define PP_CLICKWHEEL_PACKET    0x8000001a
+#define PP_WHEEL_SELECT         0x00000100
+#define PP_WHEEL_RIGHT          0x00000200
+#define PP_WHEEL_LEFT           0x00000400
+#define PP_WHEEL_PLAY           0x00000800
+#define PP_WHEEL_MENU           0x00001000
+
+static uint64_t pp502x_clickwheel_read(void *opaque, hwaddr offset,
+                                       unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset == CLICKWHEEL_DATA_OFF) {
+        return PP_CLICKWHEEL_PACKET | nms->wheel_buttons;
+    }
+    return offset < sizeof(nms->wheel_regs) ? nms->wheel_regs[offset / 4] : 0;
+}
+
+static void pp502x_clickwheel_write(void *opaque, hwaddr offset,
+                                    uint64_t value, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset < sizeof(nms->wheel_regs)) {
+        nms->wheel_regs[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps pp502x_clickwheel_ops = {
+    .read = pp502x_clickwheel_read,
+    .write = pp502x_clickwheel_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+/* w/a/s/d around the wheel, enter for select. */
+static void ipod_video_key_event(void *opaque, int keycode)
+{
+    IPodVideoMachineState *nms = opaque;
+    bool released = keycode & 0x80;
+    uint32_t bit;
+
+    switch (keycode & 0x7f) {
+    case 0x11: bit = PP_WHEEL_MENU;   break;   /* w */
+    case 0x1e: bit = PP_WHEEL_LEFT;   break;   /* a */
+    case 0x1f: bit = PP_WHEEL_PLAY;   break;   /* s */
+    case 0x20: bit = PP_WHEEL_RIGHT;  break;   /* d */
+    case 0x1c: bit = PP_WHEEL_SELECT; break;   /* enter */
+    default: return;
+    }
+
+    if (released) {
+        nms->wheel_buttons &= ~bit;
+    } else {
+        nms->wheel_buttons |= bit;
+    }
+}
+
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
 {
@@ -671,6 +752,12 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_io(gpio, NULL, &pp502x_gpio_ops, nms,
                           "pp502x.gpio", 0x1000);
     memory_region_add_subregion_overlap(sysmem, GPIO_MEM_BASE, gpio, 1);
+
+    MemoryRegion *wheel = g_new(MemoryRegion, 1);
+    memory_region_init_io(wheel, NULL, &pp502x_clickwheel_ops, nms,
+                          "pp502x.clickwheel", 0x1000);
+    memory_region_add_subregion_overlap(sysmem, CLICKWHEEL_MEM_BASE, wheel, 1);
+    qemu_add_kbd_event_handler(ipod_video_key_event, nms);
 
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
