@@ -15,6 +15,7 @@ de 6ª generación. Rama de trabajo: `ipod_classic_6g`, partiendo de
 | [05-build-notes.md](05-build-notes.md) | Cómo compilar y ejecutar en este equipo (WSL). Problemas conocidos. |
 | [07-pp502x-hardware.md](07-pp502x-hardware.md) | El SoC PortalPlayer PP5020/PP5022: mapa de memoria, doble nucleo y el modelo de arranque del iPod 5G. |
 | [06-ipod-video-5g.md](06-ipod-video-5g.md) | El iPod Video (PP5022C) que sí tenemos físicamente: identificación, layout del disco y su firmware **sin cifrar**. |
+| [08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md) | Correcciones al mapa de memoria, bootrom, cadena de arranque, click wheel, y el **modelo QEMU del S5L8702 que ya existe** en `freemyipod/qemu`. |
 
 ## Fuentes
 

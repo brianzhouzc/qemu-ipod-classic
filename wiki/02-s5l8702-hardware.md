@@ -23,7 +23,8 @@ Todo lo de este documento sale de ahí salvo donde se indique otra cosa.
 | Códec de audio | Cirrus Logic **CS42L55** (I²C) | freemyipod + `cscodec-6g.c` |
 | PMU | NXP **PCF50635** (I²C) | freemyipod + `pmu-6g.c` |
 | Carga USB | LTC4066 | freemyipod |
-| Click wheel | controlador **"Mikey"** (CD3272-like), por SPI | `ipod6g/mikey-6g.c` |
+| Click wheel | controlador **dedicado dentro del SoC** en `0x3C200000`, IRQ 23 | `ipod/button-clickwheel.c` |
+| Mic del jack + mando de auriculares | **"Mikey"**, I²C0 dir. `0x72` (no es el click wheel) | `ipod6g/mikey-target.h` |
 | Pantalla | 320×240, RGB565 (`LCD_DEPTH 16`), 160 dpi | `config/ipod6g.h` |
 | Almacenamiento | **HDD ATA + CE-ATA sobre SDCI** | `ipod6g/storage_ata-6g.c` |
 
@@ -147,9 +148,21 @@ Lo que **cambia y hay que rehacer**:
 
 ## Pendiente de confirmar
 
-- Dirección base y tamaño de la **bootrom** del S5L8702, y si el reset arranca en
-  `0x0` (como el S5L8720) o en otra dirección.
-- Si existe un volcado público de la bootrom.
-- Número de UARTs y sus bases.
-- Layout exacto de registros del bloque `WHEEL` — hay que leer `mikey-6g.c`.
-- Cómo está mapeada la NOR SPI (SST25VF080B) y qué contiene.
+> ⚠️ **Este documento tiene errores corregidos en
+> [08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md)**, que además
+> resuelve casi todo lo de esta sección. Léelo antes de usar la tabla de bases:
+> varias entradas de arriba (`SPI0 0x3CD00000`, `ADC 0x3CE00000`, `RTC
+> 0x3D200000`, `FMC 0x39400000`, `USB_HC/USB_FC`, `INT_BASE`, `MS_BASE`) son
+> bases **legacy del S5L8700/8701** que no aplican al S5L8702.
+
+Resuelto en el doc 08:
+
+- **Bootrom**: `0x20000000`, con alias en `0x0`. Tamaño 50 KiB (wiki) o 64 KiB
+  (modelo de freemyipod), sin reconciliar. El remap posterior a IRAM0 existe pero
+  no se conoce el registro que lo controla.
+- **Volcado público de la bootrom**: no confirmado; hay que volcarla del hierro.
+- **UARTs**: 1 controlador, **4 puertos**, stride `0x4000`. Consola en el puerto 0.
+- **Bloque `WHEEL`**: registros y secuencia de init documentados (y `mikey-6g.c`
+  no tiene nada que ver — es el mando de los auriculares por I²C).
+- **NOR SPI**: en SPI0 (`0x3C300000`), 1 MiB, layout SysCfg / NOR boot IM3 /
+  ficheros "flsh" documentado.
