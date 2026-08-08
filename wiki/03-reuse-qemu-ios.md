@@ -1,5 +1,22 @@
 # Qué se reaprovecha de qemu-ios
 
+> **Aviso: ya existe un modelo del S5L8702 en QEMU.**
+>
+> `github.com/freemyipod/qemu`, rama **`s5l8702-dev`**, contiene un modelo
+> completo (WIP) del SoC S5L8702 y una máquina `ipod-classic` — 64 MiB, arm926,
+> NOR por SPI0, disco IDE, PCF5063x en I2C0. Últimos commits de mayo de 2026.
+> Ficheros: `hw/arm/s5l8702.c`, `hw/arm/ipod-classic.c`,
+> `include/hw/arm/s5l8702.h`, más ~19 modelos de dispositivo bajo
+> `hw/{misc,gpio,i2c,ide,ssi,timer,watchdog}/s5l8702-*.c`.
+>
+> Ese fork desciende del mismo `devos50/qemu-ios` del que partimos aquí. **Si
+> se retoma el Classic 6G, hay que partir de ahí en vez de desde cero**, y usar
+> `devos50/qemu-ios@ipod_touch_2g` solo como contraste de direcciones base.
+>
+> Lo descubrimos tarde: este documento se escribió antes de saberlo.
+
+
+
 La rama `ipod_touch_2g` modela el S5L8720. El S5L8702 es de la misma familia, así
 que buena parte de los modelos de dispositivo sirven.
 
