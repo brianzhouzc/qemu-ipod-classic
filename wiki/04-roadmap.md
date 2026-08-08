@@ -65,25 +65,86 @@ sin modelar, el log llega a decenas de millones de líneas y frena la emulación
 tanto que parece colgada. Conviene medir siempre sin `-d` antes de concluir que
 algo no avanza.
 
-### Siguiente: `No partition found`
+### Rockbox arranca de verdad
 
-El bootloader llega a `disk_mount_all()` y no monta nada. Lo que ya está
-descartado:
+Capturando la pantalla en varios instantes se ve que el `No partition found` no
+es el final, es el **segundo** fotograma:
 
-- **El ATA funciona.** El bootloader habría dado `EATA` antes de llegar aquí;
-  `storage_init()` pasó, así que el IDENTIFY responde.
-- **La tabla de particiones de la imagen es correcta**: firma `55AA`, entrada 1
-  de tipo `0x0b`, LBA 160650, 524288 sectores, y el total cuadra con el tamaño
-  del fichero.
-- **El FAT32 es válido**: 512 B/sector, 2 FATs, `FATsz32 = 4033`, root en el
-  clúster 2, `dataclusters ≈ 516190` (muy por encima del mínimo de 65525 que
-  exige `fat_mount_internal`), firma `55AA` en su VBR.
-- **`BPB_HiddSec = 0`** aunque la partición empieza en 160650, pero Rockbox no
-  mira ese campo (no aparece en `firmware/common/fat.c`).
+| t | Pantalla |
+|---|---|
+| ~8 s | el **logo de arranque de Rockbox** a color: "ROCKBOX — open source jukebox firmware", "Ver. 4.0" (538 colores, 22 000 píxeles) |
+| ~20 s en adelante | `No partition found (0). Insert USB cable and fix it.` |
 
-Queda por comprobar si el guest llega a pedir el sector 160650 y qué devuelve
-esa lectura. Es decir: instrumentar el camino de lectura del IDE, no seguir
-mirando la imagen.
+O sea que la secuencia completa funciona: el bootloader monta el FAT32, carga
+`rockbox.ipod`, salta a él, y **la aplicación Rockbox arranca y dibuja su
+logo**. El error es del `disk_mount_all()` de la *app*, no del bootloader.
+
+### El bloqueo real: la app usa DMA, el bootloader no
+
+`-trace "ide_*"` separa las dos fases sin ambigüedad:
+
+```
+# bootloader
+cmd 0xec  IDENTIFY
+cmd 0xef  SET FEATURES  (x2)
+cmd 0xc6  SET MULTIPLE MODE
+cmd 0xc4  READ MULTIPLE   <- x40, cargando rockbox.ipod
+# app
+cmd 0xec  IDENTIFY
+cmd 0xef  SET FEATURES  (x3)
+cmd 0xc6  SET MULTIPLE MODE
+cmd 0xec  IDENTIFY
+cmd 0xc8  READ DMA        <- y aqui se rompe
+ide_reset                 <- inmediatamente despues
+cmd 0xec / 0xef / 0xc6 / 0xec / 0xe7 FLUSH CACHE
+```
+
+Y el sector 0 solo se lee dos veces, las dos al principio: el
+`disk_mount_all()` de la app ni siquiera llega a `disk_init()`.
+
+`ipodvideo` define `HAVE_ATA_DMA`, así que la app pide **READ DMA (0xc8)**
+mientras que el bootloader se queda en PIO. Nosotros usamos el `mmio-ide`
+genérico de QEMU, que **no tiene motor de DMA**: la transferencia nunca ocurre,
+`ata_wait_intrq()` agota sus 10 segundos, el driver resetea el bus y se rinde.
+
+Lo que descartamos por el camino (todo correcto, no tocar): la tabla de
+particiones de la imagen, el FAT32 (512 B/sector, 2 FATs, `FATsz32 = 4033`,
+`dataclusters ≈ 516190`, muy por encima del mínimo de 65525 de
+`fat_mount_internal`), y `BPB_HiddSec = 0`, que Rockbox no mira.
+
+### Siguiente: motor de DMA del IDE del PP502x
+
+En el PP502x el DMA no es bus-master PCI, son registros propios del bloque IDE,
+justo la zona que hoy tenemos como stub. De `ata-target.h` y `ata-pp5020.c`:
+
+| Registro | Dirección | Función |
+|---|---|---|
+| `IDE0_CFG` | `0xC3000028` | bit 3 `INTRQ` (pendiente, se limpia escribiendo 1), bit 15 activo durante el DMA |
+| `IDE_DMA_CONTROL` | `0xC3000400` | bit 0 = **arranca**, bit 1 = arma, bit 3 = dirección (1 = lectura a memoria) |
+| `IDE_DMA_LENGTH` | `0xC3000408` | bytes **menos 4** |
+| `IDE_DMA_ADDR` | `0xC300040C` | dirección física destino |
+
+Secuencia que ejecuta el driver:
+
+```
+IDE0_CFG |= 8              /* limpia INTRQ pendiente */
+IDE_DMA_CONTROL |= 2
+IDE_DMA_LENGTH = bytes - 4
+IDE_DMA_ADDR = addr        /* +DRAM_START si addr < DRAM_START */
+IDE_DMA_CONTROL |= 8       /* lectura */
+IDE0_CFG |= 0x8000
+<comando ATA 0xc8>
+IDE_DMA_CONTROL |= 1       /* <- esto es lo que arranca la transferencia */
+poll IDE0_CFG & 8          /* espera la interrupcion */
+IDE0_CFG &= ~0x8000; IDE_DMA_CONTROL &= ~0x80000001
+```
+
+Lo importante para el modelo: la dirección y la longitud se programan **antes**
+del comando ATA, y el bit de arranque se escribe **después**. Así que hay que
+implementar un `IDEDMAOps` propio (como hacen `hw/ide/macio.c` o `hw/ide/via.c`)
+en el que `start_dma` solo guarde el callback, y sea la escritura del bit 0 de
+`IDE_DMA_CONTROL` la que lo dispare. Al terminar, subir la línea de interrupción
+para que `IDE0_CFG` bit 3 se ponga — eso ya lo hace `pp502x_ide_irq()`.
 
 ## Estrategia (iPod classic 6G)
 
