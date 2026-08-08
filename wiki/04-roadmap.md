@@ -10,7 +10,7 @@ el sistema original de Apple se movió allí.
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
-| `iPod-Video` | PP5022C | **ejecuta el firmware real hasta el acceso a disco** |
+| `iPod-Video` | PP5022C | **el bootloader de Rockbox arranca y dibuja en pantalla** |
 
 El trabajo del Classic sigue intacto y es reaprovechable si algún día
 conseguimos un `osos` descifrado.
@@ -29,12 +29,61 @@ Rockbox extraído del aparato real recorre esta secuencia:
 7. Llega al **controlador IDE** (`+0x1fc`), buscando `rockbox.ipod` en la FAT32
 
 Modelado hasta ahora: DRAM, IRAM, ventana de flash NOR con la revisión de
-hardware, `PROCESSOR_ID`, `CPU_CTL`/`COP_CTL`, `USEC_TIMER` y el UART 16550.
-Todo lo demás son stubs que reportan por `-d unimp`.
+hardware, `PROCESSOR_ID`, `CPU_CTL`/`COP_CTL`, `USEC_TIMER`, UART 16550,
+controlador de interrupciones, IDE, click wheel, GPIO, caché, remap, BCM/LCD,
+reloj/PLL y control de dispositivo.
 
-Lo siguiente, en el orden que lo pide el firmware: controlador **IDE** (para
-que encuentre el disco), **I²C** de verdad, controlador de **interrupciones** y
-**LCD**.
+### El bootloader ya pinta en la pantalla emulada
+
+Estado actual: el bootloader de Rockbox 4.0 arranca entero y escribe en el LCD:
+
+```
+No partition
+found (0).
+Insert USB cable
+and fix it.
+4.0
+```
+
+Para llegar hasta ahí hubo que quitar cuatro bloqueos, todos del mismo tipo —
+un bit de estado que el hardware real pone y nosotros devolvíamos a cero, con
+el firmware esperándolo en un bucle sin salida:
+
+| Síntoma | Causa | Arreglo |
+|---|---|---|
+| bucle leyendo `0x6000603c` | `PLL_STATUS` bit 31 = PLL enganchado. `system-pp502x.c`: `while (!(PLL_STATUS & 0x80000000));` | bloque de reloj en `0x60006000`, con el bit 31 siempre puesto |
+| `Invalid write at 0xF0004000` | `cache_invalidate_special()` escribe a mano todo el array de estado de la caché, que no estaba mapeado | RAM en `0xf0000000`–`0xf000efff` |
+| 20 M lecturas de `0x70000028` | bit 7 = el bloque USB salió de reset. `usb-fw-pp502x.c`: `while ((inl(0x70000028) & 0x80) == 0);`. Ese registro **no aparece en `pp5020.h`** | bloque `DEV_CTL` en `0x70000000`, con el bit 7 siempre puesto |
+| todo corría pero la pantalla seguía negra | `GPO32_VAL` bit 14 alimenta al Broadcom. Si está a 0, `lcd-video.c` cree que debe inicializar el BCM subiendo su firmware `vmcs` desde la NOR (que no tenemos), deja `display_on = false`, y **`lcd_update_rect()` descarta todos los dibujados sin decir nada** | `GPO32_VAL` arranca con `0x4000`, reproduciendo lo que deja el cargador de Apple |
+
+La lección: en este SoC casi todo fallo se manifiesta igual — el emulador
+parece vivo, no hay ninguna excepción, y el firmware está esperando un bit.
+`-d unimp` con `sort | uniq -c | sort -rn` encuentra el bucle en segundos.
+
+Ojo con `-d unimp`: cuando el guest entra en un bucle cerrado sobre un registro
+sin modelar, el log llega a decenas de millones de líneas y frena la emulación
+tanto que parece colgada. Conviene medir siempre sin `-d` antes de concluir que
+algo no avanza.
+
+### Siguiente: `No partition found`
+
+El bootloader llega a `disk_mount_all()` y no monta nada. Lo que ya está
+descartado:
+
+- **El ATA funciona.** El bootloader habría dado `EATA` antes de llegar aquí;
+  `storage_init()` pasó, así que el IDENTIFY responde.
+- **La tabla de particiones de la imagen es correcta**: firma `55AA`, entrada 1
+  de tipo `0x0b`, LBA 160650, 524288 sectores, y el total cuadra con el tamaño
+  del fichero.
+- **El FAT32 es válido**: 512 B/sector, 2 FATs, `FATsz32 = 4033`, root en el
+  clúster 2, `dataclusters ≈ 516190` (muy por encima del mínimo de 65525 que
+  exige `fat_mount_internal`), firma `55AA` en su VBR.
+- **`BPB_HiddSec = 0`** aunque la partición empieza en 160650, pero Rockbox no
+  mira ese campo (no aparece en `firmware/common/fat.c`).
+
+Queda por comprobar si el guest llega a pedir el sector 160650 y qué devuelve
+esa lectura. Es decir: instrumentar el camino de lectura del IDE, no seguir
+mirando la imagen.
 
 ## Estrategia (iPod classic 6G)
 

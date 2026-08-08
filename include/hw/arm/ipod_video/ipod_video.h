@@ -90,6 +90,15 @@
 #define SER0_MEM_BASE       0x70006000   /* 16550-compatible, stride 4 */
 #define SER1_MEM_BASE       0x70006040
 #define USB_MEM_BASE        0xc5000000
+/*
+ * The cache's own arrays, which are addressable memory rather than registers:
+ * data at 0xf0000000, its mirror at 0xf0002000, and the per-core line status
+ * at 0xf0004000 (CPU) and 0xf0006000 (COP), with flush and invalidate windows
+ * at 0xf0008000 and 0xf000c000. Rockbox writes the whole status array by hand
+ * in cache_invalidate_special(), so it has to be backed by something.
+ */
+#define CACHE_ARRAY_MEM_BASE    0xf0000000
+#define CACHE_ARRAY_MEM_SIZE    0x0000f000   /* up to the remap unit */
 #define MMAP_MEM_BASE       0xf000f000   /* remap unit, MMAP0..7 */
 
 /* IRQ numbers from pp5020.h. The high bank starts at 32. */
@@ -146,6 +155,7 @@ typedef struct {
     uint32_t wheel_regs[1024];
     uint32_t wheel_buttons;
     uint32_t clock_regs[1024];
+    uint32_t dev_regs[1024];
 } IPodVideoMachineState;
 
 #endif

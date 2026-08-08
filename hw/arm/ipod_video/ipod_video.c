@@ -598,6 +598,61 @@ static const MemoryRegionOps pp502x_clock_ops = {
     .impl.max_access_size = 4,
 };
 
+/*
+ * Device control: chip version and straps, DEV_INIT1/2, the external memory
+ * bus timings and the 32-bit GPO port. Rockbox's pp5020.h names most of it --
+ * PP_VER1 at +0x00, DEV_INIT1 at +0x10, DEV_INIT2 at +0x20, DEV_TIMING1 at
+ * +0x34, GPO32_VAL at +0x80, GPO32_ENABLE at +0x84 -- and everything named is
+ * a plain register that reads back what was written.
+ *
+ * The exception is +0x28, which pp5020.h does not name at all but which the
+ * USB bring-up in usb-fw-pp502x.c blocks on:
+ *
+ *     DEV_INIT2 |= INIT_USB;
+ *     while ((inl(0x70000028) & 0x80) == 0);
+ *     outl(inl(0x70000028) | 0x2, 0x70000028);
+ *
+ * Bit 7 is the USB block reporting that it came out of reset. Nothing here
+ * takes time to power up, so it reads as set from the start; leaving it clear
+ * is an unbreakable spin, and it was where the firmware sat once the cache
+ * arrays stopped faulting.
+ */
+#define PP_DEV_USB_STATUS   0x28
+#define PP_DEV_USB_READY    0x80
+#define PP_GPO32_VAL        0x80
+#define PP_GPO32_BCM_POWER  0x4000
+
+static uint64_t pp502x_dev_ctl_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset >= sizeof(nms->dev_regs)) {
+        return 0;
+    }
+    if (offset == PP_DEV_USB_STATUS) {
+        return nms->dev_regs[offset / 4] | PP_DEV_USB_READY;
+    }
+    return nms->dev_regs[offset / 4];
+}
+
+static void pp502x_dev_ctl_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset < sizeof(nms->dev_regs)) {
+        nms->dev_regs[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps pp502x_dev_ctl_ops = {
+    .read = pp502x_dev_ctl_read,
+    .write = pp502x_dev_ctl_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
 {
@@ -806,6 +861,25 @@ static void ipod_video_machine_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 0,
                        qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
 
+    /*
+     * The cache arrays. These are not registers, they are the cache's own
+     * storage exposed on the bus, and PP5022 firmware writes them directly:
+     * cache_invalidate_special() in system-pp502x.c walks the whole per-core
+     * line-status array marking every line valid, as a workaround for lines
+     * that would otherwise corrupt memory.
+     *
+     *     for (p = &CACHE_STATUS_BASE_CPU;
+     *          p < (&CACHE_STATUS_BASE_CPU) + CACHE_SIZE/sizeof(*p);
+     *          p += CACHEALIGN_SIZE/sizeof(*p))
+     *         *p = CACHE_LINE_VALID | CACHE_ADDRESS_MASK;
+     *
+     * With nothing mapped there that first store is rejected outright. There
+     * is no cache to model, so plain RAM is enough: the firmware only ever
+     * reads back what it wrote.
+     */
+    allocate_ram(sysmem, "cache-arrays", CACHE_ARRAY_MEM_BASE,
+                 CACHE_ARRAY_MEM_SIZE);
+
     MemoryRegion *mmap = g_new(MemoryRegion, 1);
     /*
      * The header documents MMAP0..7 as 0xf000f000..0xf000f03c, but the
@@ -831,6 +905,32 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_io(clock, NULL, &pp502x_clock_ops, nms,
                           "pp502x.clock", 0x1000);
     memory_region_add_subregion_overlap(sysmem, CLOCK_MEM_BASE, clock, 1);
+
+    MemoryRegion *dev_ctl = g_new(MemoryRegion, 1);
+    memory_region_init_io(dev_ctl, NULL, &pp502x_dev_ctl_ops, nms,
+                          "pp502x.dev-ctl", 0x1000);
+    memory_region_add_subregion_overlap(sysmem, DEV_CTL_MEM_BASE, dev_ctl, 1);
+
+    /*
+     * GPO32 bit 14 powers the Broadcom. Apple's flash ROM loader turns it on
+     * before it hands over, and Rockbox reads it back to decide whether it has
+     * to bring the chip up itself -- from lcd-video.c:
+     *
+     *     if (GPO32_VAL & 0x4000) {
+     *         lcd_state.display_on = true;      -- BCM is powered
+     *     } else {
+     *         lcd_state.display_on = false;     -- must upload BCM firmware
+     *         lcd_awake();
+     *     }
+     *
+     * That firmware is the 'vmcs' section of the flash ROM, which we do not
+     * have, so the second path leaves display_on false forever -- and
+     * lcd_update_rect() returns early when it is, so every draw is dropped
+     * without a word. The screen stayed black while the rest of Rockbox ran
+     * perfectly happily. We skip the ROM loader, so its effect has to be
+     * reproduced here.
+     */
+    nms->dev_regs[PP_GPO32_VAL / 4] = PP_GPO32_BCM_POWER;
 
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
