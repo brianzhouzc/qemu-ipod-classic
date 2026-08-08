@@ -140,10 +140,12 @@ typedef struct {
     MemoryRegion *vect_remap;
     MemoryRegion *dram_remap;
     bool dram_remapped;
-    uint32_t mmap_regs[16];
+    bool force_remap;
+    uint32_t mmap_regs[1024];
     uint32_t gpio_regs[1024];
     uint32_t wheel_regs[1024];
     uint32_t wheel_buttons;
+    uint32_t clock_regs[1024];
 } IPodVideoMachineState;
 
 #endif

@@ -554,6 +554,50 @@ static void ipod_video_key_event(void *opaque, int keycode)
     }
 }
 
+/*
+ * Clock and power control.
+ *
+ * Only PLL_STATUS has behaviour, and it is the one the firmware cannot get
+ * past. From system-pp502x.c, raising the clock on a PP5022:
+ *
+ *     PLL_CONTROL = 0x8a121403;
+ *     while (!(PLL_STATUS & 0x80000000));   -- wait for relock
+ *
+ * Bit 31 says the PLL has locked. There is no PLL here to take time settling,
+ * so it is locked as soon as it is asked for. Everything else in the block is
+ * stored and handed back.
+ */
+#define PP_PLL_STATUS       0x3c
+#define PP_PLL_LOCKED       0x80000000
+
+static uint64_t pp502x_clock_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset == PP_PLL_STATUS) {
+        return nms->clock_regs[offset / 4] | PP_PLL_LOCKED;
+    }
+    return offset < sizeof(nms->clock_regs) ? nms->clock_regs[offset / 4] : 0;
+}
+
+static void pp502x_clock_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    IPodVideoMachineState *nms = opaque;
+
+    if (offset < sizeof(nms->clock_regs)) {
+        nms->clock_regs[offset / 4] = value;
+    }
+}
+
+static const MemoryRegionOps pp502x_clock_ops = {
+    .read = pp502x_clock_read,
+    .write = pp502x_clock_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
 {
@@ -639,8 +683,26 @@ static void ipod_video_set_entry(Object *obj, Visitor *v, const char *name,
     nms->entry_offset = value;
 }
 
+static bool ipod_video_get_remap(Object *obj, Error **errp)
+{
+    return IPOD_VIDEO_MACHINE(obj)->force_remap;
+}
+
+static void ipod_video_set_remap(Object *obj, bool value, Error **errp)
+{
+    IPOD_VIDEO_MACHINE(obj)->force_remap = value;
+}
+
 static void ipod_video_instance_init(Object *obj)
 {
+    object_property_add_bool(obj, "remap", ipod_video_get_remap,
+                             ipod_video_set_remap);
+    object_property_set_description(obj, "remap",
+        "Map DRAM at address 0 from reset, as the firmware would through the "
+        "remap unit. Needed to run a Rockbox application image directly, since "
+        "those are linked for address 0 and normally rely on the bootloader "
+        "having set the mapping up first.");
+
     IPOD_VIDEO_MACHINE(obj)->hw_revision = IPOD_VIDEO_HW_REVISION;
 
     object_property_add(obj, "entry", "uint32", ipod_video_get_entry,
@@ -711,7 +773,8 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_alias(nms->dram_remap, NULL, "dram-remap", dram, 0,
                              DRAM_MEM_SIZE);
     memory_region_add_subregion_overlap(sysmem, 0, nms->dram_remap, 2);
-    memory_region_set_enabled(nms->dram_remap, false);
+    memory_region_set_enabled(nms->dram_remap, nms->force_remap);
+    nms->dram_remapped = nms->force_remap;
 
     MemoryRegion *rom_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
@@ -744,8 +807,13 @@ static void ipod_video_machine_init(MachineState *machine)
                        qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
 
     MemoryRegion *mmap = g_new(MemoryRegion, 1);
+    /*
+     * The header documents MMAP0..7 as 0xf000f000..0xf000f03c, but the
+     * firmware writes 0xf000f040 as well, so the block is bigger than the
+     * eight register pairs Rockbox names. Cover a page.
+     */
     memory_region_init_io(mmap, NULL, &pp502x_mmap_ops, nms,
-                          "pp502x.mmap", 0x40);
+                          "pp502x.mmap", 0x1000);
     memory_region_add_subregion(sysmem, MMAP_MEM_BASE, mmap);
 
     MemoryRegion *gpio = g_new(MemoryRegion, 1);
@@ -758,6 +826,11 @@ static void ipod_video_machine_init(MachineState *machine)
                           "pp502x.clickwheel", 0x1000);
     memory_region_add_subregion_overlap(sysmem, CLICKWHEEL_MEM_BASE, wheel, 1);
     qemu_add_kbd_event_handler(ipod_video_key_event, nms);
+
+    MemoryRegion *clock = g_new(MemoryRegion, 1);
+    memory_region_init_io(clock, NULL, &pp502x_clock_ops, nms,
+                          "pp502x.clock", 0x1000);
+    memory_region_add_subregion_overlap(sysmem, CLOCK_MEM_BASE, clock, 1);
 
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
