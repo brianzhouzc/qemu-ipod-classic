@@ -151,6 +151,12 @@
  */
 #define VC_SURFACE_HEAP     0x00200000
 
+/*
+ * Everything in here is addressed by a u16 offset from the interface base,
+ * because that is what the protocol carries, and VC_IFACE_BASE + 0xFFFF is
+ * inside chip memory -- so a ring pointer cannot leave the buffer however
+ * confused it gets.
+ */
 static inline uint8_t *vc_iface(IPodVideoBCMState *s, uint32_t off)
 {
     return s->mem + VC_IFACE_BASE + off;
@@ -418,7 +424,8 @@ static void vc_dispatch(IPodVideoBCMState *s, int ch, uint32_t seq,
     uint8_t reply[VC_MSG_HDR_LEN + VC_MAX_PAYLOAD];
     char text[VC_MAX_PAYLOAD];
     uint32_t reply_len = 0;
-    uint32_t padded, space;
+    uint32_t padded;
+    int32_t space;
     uint16_t start, end, rd, wr;
     uint32_t ctrl = VC_CTRL_OFF(ch);
 
@@ -465,11 +472,16 @@ static void vc_dispatch(IPodVideoBCMState *s, int ch, uint32_t seq,
     rd    = vc_ld16(s, ctrl + VC_CH_RX_RD);
     wr    = vc_ld16(s, ctrl + VC_CH_RX_WR);
 
-    /* The sixteen bytes the ring never fills are what keep wr off rd. */
-    space = (end - start - 16) - vc_occupancy(start, end, rd, wr);
-    if (padded > space) {
+    /*
+     * The sixteen bytes the ring never fills are what keep wr off rd. Signed,
+     * because a read pointer the guest has put somewhere impossible would
+     * otherwise make this wrap and let the reply run off the end.
+     */
+    space = (int32_t)(end - start - 16)
+          - (int32_t)vc_occupancy(start, end, rd, wr);
+    if ((int32_t)padded > space) {
         qemu_log_mask(LOG_UNIMP, "ipod_video_vc: channel %d reply of %u bytes "
-                      "does not fit in %u\n", ch, padded, space);
+                      "does not fit in %d\n", ch, padded, space);
         return;
     }
 
