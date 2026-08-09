@@ -70,10 +70,33 @@ Banco bajo (0..31) y banco alto (32..63); el alto se encadena por `HI_IRQ`.
 | **23** | `IDE_IRQ`, el disco |
 | 25, 26 | `FIREWIRE_IRQ`, `DMA_IRQ` — la 26 es la del **bloque B** de DMA |
 | **27** | DMA, **bloque A**. No está en `pp5020.h`; sale de la tabla del retailOS (ver abajo) |
-| 30 | `HI_IRQ`, encadena el banco alto |
+| 30 | `HI_IRQ`, encadena el banco alto — **hay que conducirla**, ver abajo |
 | 32..34 | `GPIO0/1/2_IRQ` |
 | 36, 37 | `SER0_IRQ`, `SER1_IRQ` |
 | **40** | `I2C_IRQ`, **y también el click wheel** |
+
+#### `HI_IRQ` no es una fuente, es un resumen
+
+La línea 30 del banco bajo la pone el **banco alto** cuando tiene algo. Rockbox
+la nombra en `pp5020.h` junto a las de verdad y luego **no la lee nunca**: su
+manejador va directo a `CPU_HI_INT_STAT` (`system-pp502x.c:76` en adelante). Con
+solo Rockbox delante, un modelo que deje la línea 30 sin conducir parece
+correcto.
+
+El retailOS hace lo contrario. Su despachador `0x277128` lee las dos palabras de
+estado y **se niega a mirar el banco alto** si el bajo no trae el bit 30:
+
+```
+277134:  ldr r4, [0x60004000]     ; banco bajo
+277138:  ldr r5, [0x60004100]     ; banco alto
+2771a4:  tst r4, #0x40000000      ; hay algo arriba?
+2771a8:  beq  <espuria>
+2771dc:  tst r5, #0x100           ; la linea I2C, o sea el click wheel
+2771e4:  bl 0x281350              ; el manejador del click wheel
+```
+
+O sea que **cada pulsación se tomaba y la tiraba el propio guest**. Es
+exactamente el tipo de fallo que solo enseña el segundo firmware.
 
 ## Registros con comportamiento
 
@@ -340,16 +363,123 @@ Direcciones dentro del chip que importan:
 | `0xC0000000` | SDRAM del chip. Sin modelar |
 
 Las respuestas que el modelo tiene que dar, con lo que fija cada una, están en
-[04-roadmap.md](04-roadmap.md). En resumen: bit 0 de `0x10000C00`,
-`BCMA_COMMAND` valiendo **exactamente 1** (`0x288080` hace `cmp r0,#1`), y una
-estructura de interfaz publicada en `BCMA_STATUS` con todos los canales a cero,
-que es como el driver deletrea "no hay canales" (`0x2871e0`).
+[04-roadmap.md](04-roadmap.md). En resumen: bit 0 de `0x10000C00` y
+`BCMA_COMMAND` valiendo **exactamente 1** (`0x288080` hace `cmp r0,#1`).
 
-**Apple no dibuja por aquí.** No hay ni una instrucción en siete megabytes que
-cargue `0x000E0000` ni `0xFFFF0000` (`BCMCMD_LCD_UPDATE`), y el controlador LCD
-del PP502x (`0x70003000`) tiene una sola referencia en toda la imagen, en la
-rutina de apagado de periféricos del arranque. La UI la pinta el VideoCore,
-tirando de la memoria del host por sus canales de anillo.
+**Apple no dibuja por el camino de Rockbox.** No hay ni una instrucción en siete
+megabytes que cargue `0x000E0000` ni `0xFFFF0000` (`BCMCMD_LCD_UPDATE`), y el
+controlador LCD del PP502x (`0x70003000`) tiene una sola referencia en toda la
+imagen, en la rutina de apagado de periféricos del arranque. Dibuja por la
+interfaz de host del VideoCore, que va justo debajo.
+
+### La interfaz de host del VideoCore
+
+`BCMA_STATUS` no es un registro de estado: es donde el VideoCore publica un
+puntero a memoria del chip, y ahí vive un protocolo entero. Modelado en
+`hw/arm/ipod_video/ipod_video_vc.c`.
+
+Cabecera, tres bloques de dieciséis bytes desde la base:
+
+| Offset | Contenido | Quién lo lee/escribe |
+|---|---|---|
+| `+0x00`…`+0x0f` | ocho `u16`: offset del bloque de control de cada canal, relativo a la base. **0 = canal ausente** | `0x2880b0` los copia, `0x2871d4` los indexa, `0x2871e0` salta los ceros |
+| `+0x10` / `+0x11` | byte de señal / de acuse del **host** | `0x28823c`, `0x288138` |
+| `+0x20` / `+0x21` | byte de acuse / de señal del **VideoCore** | `0x288240`, `0x288118` |
+
+La señalización es **por conmutación**: hay evento en el canal *n* cuando el bit
+*n* de `señal ^ acuse` está puesto (`0x288244`, `0x288120`).
+
+Bloque de control de canal, ochenta bytes (`0x2882c0` los lee de un tirón):
+
+| Offset | Campo |
+|---|---|
+| `+0x04` (u16) | **tipo de canal**: 1 ASCII, 2 gráficos, 5 VCFS, 6 VCHR, 7 sin determinar |
+| `+0x06` / `+0x08` | inicio / fin del anillo **TX** (host → VC) |
+| `+0x0a` / `+0x0c` | inicio / fin del anillo **RX** (VC → host) |
+| `+0x10` | puntero de lectura de TX — **lo mueve el VideoCore** |
+| `+0x20` | puntero de escritura de TX — lo mueve el host |
+| `+0x30` | puntero de lectura de RX — lo mueve el host |
+| `+0x40` | puntero de escritura de RX — **lo mueve el VideoCore** |
+
+Los offsets de anillo son relativos a la base de la interfaz (`0x288478` suma
+`[0x10831980]`). La capacidad útil es `fin − inicio − 16`: esos dieciséis bytes
+de reserva son lo que impide que el escritor alcance al lector (`0x28874c`).
+Cada puntero vive en su propia línea de dieciséis bytes y se transfiere con una
+operación de dieciséis bytes propia (`0x288928`, `0x288800`, `0x28850c`,
+`0x2885cc`) — así los dos lados comparten el anillo sin cerrojo.
+
+Mensaje: cabecera de dieciséis bytes y carga útil redondeada a múltiplo de
+dieciséis (`0x28861c` compone, `0x2872fc` lee).
+
+| Offset | Campo |
+|---|---|
+| `+0x00` | magia **`0xF1A55A1F`** (`0x2886a0`; `0x287360` rechaza la respuesta sin ella) |
+| `+0x04` | secuencia por canal, bit 31 forzado a 0 |
+| `+0x08` | opcode en la petición, **código de resultado** en la respuesta |
+| `+0x0c` (u16) | longitud real de la carga útil; `0xFFFF` = flujo terminado en NUL |
+| `+0x0e` (u16) | siempre cero. Sin determinar |
+
+El timbre host → VideoCore es **la media palabra `0x0031` a `BCM_CONTROL`**
+(`0x287ba4`: `mov r0,#49` y `strh`), no `0x10000400`, que solo aparece en el
+arranque. Se toca cuando el anillo pasa de vacío a no vacío, cuando la ocupación
+cruza 3/4, o cuando el lector alcanzó lo último publicado (`0x288880`).
+
+**No hace falta interrupción para el camino petición/respuesta.** Todas las
+peticiones del retailOS son síncronas dentro de una tarea (`0x28861c` y luego
+`0x2883d4`), y `0x2883d4` solo se duerme si el anillo está vacío: `0x2883f8`
+vuelve en cuanto tiene lo que pidió y `0x288418` refresca el puntero desde la
+memoria del chip antes de que `0x288424` decida esperar. Si la respuesta ya está
+puesta cuando el guest mira, `0x2870dc` no se alcanza nunca.
+
+La dirección **contraria** —el VideoCore hablando primero— sí la necesitaría, y
+no está modelada: el despachador `0x288100` solo corre desde la tarea VCIH
+(`0x1239b8`), que espera un evento en `[0x1081eca8]` que **ninguna instrucción
+de la imagen escribe**. Tiene que venir de la línea de interrupción del BCM, que
+sigue **sin identificar**.
+
+### Los dos canales que dibujan
+
+**Tipo 1, órdenes ASCII.** `0xe9358` manda la orden con el NUL incluido y opcode
+1; la respuesta es texto `clave=valor` terminado en NUL. El vocabulario es el
+del propio firmware: `vmcs.bin` registra veinte órdenes con `gencmd_register`,
+sus nombres en un bloque contiguo en el offset `0xBE24`, y sus plantillas de
+respuesta en `0xBFF8` (`value=%d`) y `0xC004` en adelante (`error=%d
+error_msg="…"`). El retailOS manda cinco en el arranque:
+
+```
+set_vll_dir /Resources/VideoCore/Library
+display_control 0 freeze=0
+display_control 0 model=1 power=-2
+power_management set_policy manual 27
+pm_set_policy min
+```
+
+`0x2872c0` devuelve éxito solo si volvió **al menos un byte** de carga útil
+(`0x2872f0`), así que la cadena vacía vale pero la carga útil vacía no.
+
+**Tipo 2, RPC binario de gráficos.** Todas las llamadas tienen la misma forma:
+mandar 16 o 32 bytes con el opcode en la cabecera, leer 32 de vuelta y quedarse
+con la primera palabra de la carga útil.
+
+| Opcode | Rutina | Qué es |
+|---|---|---|
+| 8 | `0x286ca8` | **crear superficie**. La carga útil lleva formato (+4, byte), ancho (+8), alto (+12), paso (+16) y la dirección de chip que el llamante quiere (+24). **Cero significa "elígela tú"**, y la respuesta devuelve asa en la palabra 0 y dirección en la palabra 1 |
+| 3 | `0x286b6c` | **presentar**. Asa en +12, ancho en +24 y alto en +26 (u16) |
+| 1, 2, 4, 9, 16 | varias | se pasan tokens entre ellas; el host no ramifica sobre ninguno. Sin determinar |
+
+Y aquí está el giro que lo cambia todo: **los píxeles los empuja el host**.
+Después de la respuesta al opcode 8, `0x164500` comprueba que la dirección no
+sea nula y `0x164524` sube la superficie entera por el **puerto alterno**;
+después `0x165024` sube solo la banda sucia. Así que el framebuffer de Apple
+acaba dentro de la memoria del chip, en la dirección que decidimos nosotros, sin
+que haga falta que el VideoCore pida nada.
+
+El código de formato es el `VC_IMAGE_T` de Broadcom, y no es una conjetura:
+`0x286a58` calcula el paso a partir de él y sus cuatro casos —15 a cuatro bytes
+por píxel, 1 a dos, 5 a tres, 17 y 18 a dos— coinciden uno a uno con
+`RGB565 = 1`, `RGB888 = 5`, `RGBA32 = 15`, `RGBA565 = 17`, `RGBA16 = 18`. El
+retailOS etiqueta sus mapas de bits `0x0565` y `0x1888` y `0x164464` los
+traduce a 1 y 15. El que sale en esta máquina es el 1.
 
 ## El click wheel
 
@@ -378,6 +508,28 @@ paquete valido:  (status & 0x800000ff) == 0x8000001a
 **reinicia el acumulador al cambiar de sentido**, así que la primera pulsación
 después de invertir la dirección no mueve nada. Eso es del firmware, no del
 modelo.
+
+**El retailOS usa el mismo formato, byte a byte.** Su manejador es `0x281350`, y
+vale la pena verlo porque confirma el paquete desde una fuente completamente
+independiente de Rockbox:
+
+```
+281358:  ldr r0, [r1, #0x104]        ; r1 = 0x7000c000
+28135c:  tst r0, #0x04000000         ; el mismo bit 26
+281364:  ldr r0, [r1, #0x140]        ; CLICKWHEEL_DATA
+281370:  and ip, r0, #0xbc0000ff     ; mascara propia, deja fuera el bit 30
+281374:  cmp ip, #0x8000001a         ; la misma firma de paquete
+281380:  lsl ip, r0, #18 ; lsr ip, ip, #26   ; botones, bits 8..13
+281384:  tst r0, #0x40000000         ; rueda tocada
+2813e0:  ldr r0,[r1,#0x104] ; orr r0,r0,#0x04000000 ; str  ; acuse
+2813ec:  ldr r0,[r1,#0x100] ; orr r0,r0,#0x60000000 ; str
+```
+
+Dos diferencias con Rockbox, ninguna de fondo: la máscara de validación es
+`0xbc0000ff` en vez de `0x800000ff` —exige además que los bits 26..29 estén a
+cero— y acusa recibo escribiendo solo el bit 26 en `+0x104`, más
+`0x60000000` en `+0x100`. Y una que sí importa y está arriba: el retailOS no
+llega a este manejador si el banco bajo no trae `HI_IRQ`.
 
 ## Cómo arranca un iPod 5G
 

@@ -10,7 +10,7 @@ el sistema original de Apple se movió allí.
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
-| `iPod-Video` | PP5022C | **Rockbox se navega entero; el retailOS de Apple arranca del todo, sube el firmware del chip de vídeo y lo pone en marcha, pero no dibuja: la UI la pinta el VideoCore** |
+| `iPod-Video` | PP5022C | **Rockbox se navega entero, y el retailOS de Apple también: arranca, dibuja su interfaz y responde a la rueda y a los botones** |
 
 El trabajo del Classic sigue intacto y es reaprovechable si algún día
 conseguimos un `osos` descifrado.
@@ -844,6 +844,192 @@ disco, lo sube entero y correcto a la SRAM del chip modelado. Lo único que no
 hace es ejecutarlo. Eso convierte "emular el VideoCore" de idea abstracta en una
 opción con material: el binario está ahí, con símbolos, y el vocabulario de
 comandos que el host le manda está a la vista.
+
+## El retailOS dibuja, y se navega (2026-08-09)
+
+**La interfaz de Apple está en pantalla y responde a la rueda.** Sin ejecutar
+una sola instrucción de VideoCore: lo que se ha modelado es su *protocolo*.
+
+| Fotograma | Qué se ve |
+|---|---|
+| 10 s en adelante | la pantalla de idioma del primer arranque: `Language`, `English`, `日本語`, `Čeština`, `Dansk`, `Deutsch`, `Español`, `Français`, `Ελληνικά`, `Italiano` |
+| SELECT | el **menú principal del iPod** en el idioma elegido: Music / Photos / Videos / Extras / Settings / Shuffle Songs |
+| rueda | la barra azul baja de *Music* a *Videos*, 15 360 px de diferencia |
+| SELECT | entra en *Videos*: Video Playlists / Movies / Music Videos / Video Podcasts / Video Settings, 18 731 px |
+| MENU | vuelve al menú principal con *Videos* aún seleccionado, otros 18 731 px |
+
+Capturas en `assets/apple/`, reproducibles con
+`tools/ipod_video/appletest.sh`. Las seis del arranque (10, 20, 40, 60, 90 y
+120 s) dan **75 267 de 76 800 píxeles encendidos, el 98,00 %, y 307 colores**,
+idénticas entre sí — la pantalla se pinta y se queda.
+
+`navtest.sh` contra `assets/nav-baseline`: **sin regresión**. Seis fotogramas
+difieren 225–227 px (el reloj de la barra de estado) y el séptimo 1 590 px (los
+contadores de la pantalla de grabación, que corren solos), igual que antes.
+
+### El hallazgo que da la vuelta al diagnóstico anterior
+
+La sesión anterior concluyó que la UI la pinta el VideoCore *tirando* de la
+memoria del host, y que por eso hacía falta un VideoCore falso que además
+supiera qué direcciones pedir. **La primera mitad es cierta y la segunda no.**
+
+Esa ruta —los opcodes `'H'`, `'Y'`, `']'` de la tarea VCHR, y el callback de
+líneas de `[0x1083198C]`— existe, pero es la del **pase de diapositivas y las
+transiciones**: `[0x1083198C]` solo lo rellena `0x1c2a90`, y a `0x1c2a90` solo
+lo llaman `0x1c7c30` y `0x1c7cd4`, los dos dentro de la rutina de transiciones.
+
+La UI normal va por el camino contrario, y **es el host quien empuja**:
+
+1. `0x1649ac` pide al VideoCore que le cree **dos** superficies (doble búfer en
+   el chip, un solo búfer de píxeles en el host).
+2. Cada una es un mensaje de **opcode 8** por el canal de tipo 2 que lleva
+   formato, ancho, alto y paso, y una dirección de chip a cero, que en este
+   protocolo significa *"elígela tú"* (`0x286d50` guarda la que devuelve la
+   respuesta solo si el llamante puso cero).
+3. Como el VideoCore somos nosotros, **la dirección la elegimos nosotros**.
+4. `0x164524` sube la superficie entera por el **puerto alterno** y `0x165024`
+   sube después solo la banda sucia.
+5. **Opcode 3** presenta: asa en `+12`, ancho en `+24` y alto en `+26`.
+
+Es decir: no hay que adivinar dónde está el framebuffer de Apple ni pedir nada.
+En cuanto contestamos al opcode 8, el retailOS mete su interfaz dentro de la
+memoria del chip modelado, y la consola de QEMU no tiene más que apuntar ahí.
+
+Confirmación independiente, y muy útil para futuras sesiones: el retailOS ya
+componía su UI entera en la DRAM del host **antes** de todo esto. El descriptor
+estático de `0x10883634` la sitúa en `0x10885db0`, 320×240, RGB565, paso 640, y
+un volcado de esa memoria a los 75 s ya enseñaba la pantalla de idioma
+completa. Lo que faltaba no era el dibujo: era la entrega.
+
+### Los cuatro muros de esta sesión
+
+| # | Muro | Cómo se encontró | Arreglo |
+|---|---|---|---|
+| 1 | los ocho offsets de canal a cero, o sea "no hay canales" | ya estaba acotado | publicar canales de verdad, tipos 1 y 2 |
+| 2 | sin canal, cada orden ASCII se descarta **sin formatear** | `0xe9380` devuelve −1 antes del `vsnprintf` de `0xe9394` | lo anterior |
+| 3 | ninguna interrupción despierta al despachador del VideoCore | `[0x1081eca8]` vale cero toda la ejecución y ninguna instrucción lo escribe | **no hace falta**: ver abajo |
+| 4 | la rueda no movía nada, con Rockbox funcionando en la misma máquina | el despachador de interrupciones de Apple, `0x277128` | conducir `HI_IRQ`, la línea 30 del banco bajo |
+
+#### 1 y 2. Los canales
+
+El protocolo entero —cabecera de dieciséis bytes con magia `0xF1A55A1F`, dos
+anillos por canal, cuatro punteros cada uno en su propia línea de dieciséis
+bytes, y el timbre que es la media palabra `0x0031` a `BCM_CONTROL`— está
+documentado campo a campo, con la instrucción que fija cada uno, en
+[07-pp502x-hardware.md](07-pp502x-hardware.md). El modelo está en
+`hw/arm/ipod_video/ipod_video_vc.c`.
+
+Lo que se publica son dos canales: **tipo 1** (órdenes de texto) y **tipo 2**
+(RPC binario de gráficos). Los tipos 5, 6 y 7 se dejan **ausentes a propósito**:
+son la dirección en la que el VideoCore habla primero, y eso es justo lo que no
+se puede modelar (muro 3). Dejarlos a cero es la ortografía del propio driver
+para un canal que no existe, y `0xcff6c` no mira ni un valor de retorno.
+
+Las respuestas de texto salen del propio `vmcs.bin`: los veinte nombres de orden
+que registra con `gencmd_register` están en un bloque contiguo del offset
+`0xBE24`, y las plantillas de respuesta en `0xBFF8` (`value=%d`) y `0xC004` en
+adelante (`error=%d error_msg="…"`). Una orden registrada recibe **la cadena
+vacía**, que es lo honesto para un *setter* y lo único que no puede ser un
+número equivocado; cualquier otra recibe la plantilla "no registrada" del propio
+firmware. El único requisito duro es que la carga útil **no** sea de longitud
+cero: `0x2872f0` devuelve éxito solo si volvió al menos un byte.
+
+Las cinco órdenes que manda el arranque, tal como las ve el modelo:
+
+```
+set_vll_dir /Resources/VideoCore/Library
+display_control 0 freeze=0
+display_control 0 model=1 power=-2
+power_management set_policy manual 27
+pm_set_policy min
+```
+
+**Corrección a la nota anterior**: la roadmap decía que `0x164e9c` "nunca llegó
+a componer su `display_control`". Era correcto, pero no por lo que se pensaba.
+La llamada sí se hace; lo que pasa es que `0xe9358` comprueba el canal en
+`0xe9374` y aborta en `0xe9380`, **antes** del `vsnprintf` de `0xe9394`, así que
+la cadena formateada nunca llega a existir en el montón. La prueba indirecta del
+volcado de DRAM era buena; la causa que se le atribuyó, no.
+
+#### 3. La interrupción que no hizo falta
+
+El despachador que despertaría a una tarea dormida, `0x288100`, solo corre desde
+la tarea VCIH (`0x1239b8`), que espera un evento en `[0x1081eca8]`. `findlit.py`
+da **una sola** instrucción que carga ese literal y es una lectura; un
+*watchpoint* de escritura durante todo el arranque solo pilla el `memset` del
+*scatter-load*. Sin la línea de interrupción del BCM —que sigue **sin
+identificar**— esa tarea no despierta jamás.
+
+Y resulta que para el camino que dibuja **no importa**. Todas las peticiones del
+retailOS son síncronas dentro de una misma tarea: `0x28861c` para mandar y
+`0x2883d4` justo después para leer. Y `0x2883d4` solo se duerme si el anillo
+está vacío — `0x2883f8` vuelve en cuanto tiene lo que pidió, y antes de esperar
+`0x288418` refresca el puntero de escritura desde la memoria del chip. Así que
+**si la respuesta ya está puesta cuando el guest mira, `0x2870dc` no se alcanza
+nunca**. El modelo actúa sobre el propio `str` del puntero de escritura del
+guest, que ocurre antes, así que siempre llega primero.
+
+Eso convierte "hace falta identificar la IRQ del BCM" de bloqueo estructural en
+deuda acotada: solo hace falta para los canales 5 y 6, o sea para el sistema de
+ficheros del VideoCore y para las transiciones.
+
+#### 4. `HI_IRQ`: el muro que solo podía enseñar Apple
+
+Con la pantalla pintada, la rueda no movía nada — y Rockbox se navegaba entero
+en la misma máquina y con el mismo modelo de rueda. La causa no estaba en la
+rueda.
+
+`pp5020.h` de Rockbox lista `HI_IRQ` como la fuente **30** del banco bajo, entre
+`DMA_IRQ` 26 y `GPIO0_IRQ` 32, y luego **no la lee nunca**: su manejador va
+directo a `CPU_HI_INT_STAT`. Con solo Rockbox delante, dejar esa línea sin
+conducir parece correcto.
+
+El despachador del retailOS, `0x277128`, hace lo contrario: lee las dos palabras
+de estado y se niega a mirar el banco alto si el bajo no trae el bit 30.
+
+```
+277134:  ldr r4, [0x60004000]     ; banco bajo
+277138:  ldr r5, [0x60004100]     ; banco alto
+2771a4:  tst r4, #0x40000000      ; hay algo arriba?
+2771a8:  beq  <espuria>
+2771dc:  tst r5, #0x100           ; la linea I2C, o sea el click wheel
+2771e4:  bl 0x281350              ; el manejador del click wheel
+```
+
+O sea que **cada pulsación se tomaba y la tiraba el propio guest**. El arreglo
+es una línea de lógica en el controlador: el banco alto conduce la línea 30 del
+bajo.
+
+De rebote quedó verificado que el retailOS usa **el mismo formato de paquete de
+rueda** que Rockbox (`0x281374: cmp ip, #0x8000001a`), lo cual es una
+confirmación independiente de algo que hasta ahora solo decía una fuente. Los
+detalles están en [07-pp502x-hardware.md](07-pp502x-hardware.md).
+
+### Lo que se elige y no se deriva, marcado como tal
+
+- **Dónde vive la interfaz** en la memoria del chip (`0x00180000`), dónde van
+  los bloques de control y los anillos dentro de ella, y **dónde van las
+  superficies** (`0x00200000` en adelante). La dirección real la elegiría el
+  firmware `vmcs`, que no corremos; nada depende del número.
+- **Que toda orden registrada tenga éxito.** No somos el VideoCore y no podemos
+  fallar por sus motivos.
+- **El código de resultado 0** en la cabecera de respuesta, y el cero que
+  devuelven los opcodes 1, 2, 4, 9 y 16 del canal de gráficos. Ninguno de los
+  llamantes ramifica sobre ellos.
+- La memoria del chip pasa de 2 a **4 MB** para que quepan las superficies. El
+  BCM2722 real tiene su propia SDRAM para eso; cuánta, sin determinar.
+
+### Lo que sigue sin estar
+
+- **La línea de interrupción del BCM.** Sin ella no hay canal 5 (sistema de
+  ficheros del VideoCore) ni canal 6 (VCHR), y por tanto no hay transiciones ni
+  pase de diapositivas ni reproducción de vídeo.
+- **Los canales de tipo 7** y dieciocho de los treinta opcodes de VCHR.
+- **El campo `+0x00`** del bloque de control de canal y el `u16 +0x0e` de la
+  cabecera de mensaje: siempre cero, nadie los lee.
+- Qué contesta de verdad el firmware a cada `display_control`. Da igual hoy —
+  `0x164eec` solo mira el retorno— pero es una suposición.
+- Audio, y el COP.
 
 ## Estrategia (iPod classic 6G)
 
