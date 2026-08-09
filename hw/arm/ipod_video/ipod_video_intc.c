@@ -44,9 +44,42 @@
 
 #define INTC_BANK_SIZE      0x100
 
+/*
+ * Line 30 of the low bank is not a source of its own: it is the high bank
+ * reporting that it has something. Rockbox's pp5020.h names it in the same
+ * list as the real ones -- TIMER1_IRQ 0, DMA_IRQ 26, HI_IRQ 30 -- and then
+ * never reads it, because its handler goes straight to CPU_HI_INT_STAT
+ * (system-pp502x.c:76 onwards). The retailOS does the opposite: its dispatcher
+ * at 0x277128 reads the two status words and gates the entire high bank behind
+ * this one bit,
+ *
+ *     277134:  ldr r4, [0x60004000]          ; low bank
+ *     277138:  ldr r5, [0x60004100]          ; high bank
+ *     2771a4:  tst r4, #0x40000000           ; anything up there?
+ *     2771a8:  beq  <spurious>
+ *     2771dc:  tst r5, #0x100                ; the click wheel's I2C line
+ *     2771e4:  bl 0x281350                   ; the click wheel handler
+ *
+ * so without it every high-bank interrupt is taken and then thrown away by the
+ * guest's own dispatcher. That is why Apple's firmware saw no keys while
+ * Rockbox saw all of them, and it is invisible from Rockbox alone.
+ */
+#define INTC_HI_IRQ         (1u << 30)
+
 static uint32_t bank_pending(const IPodVideoINTCBank *b)
 {
     return (b->raw | b->forced);
+}
+
+/* What the low bank shows, with the high bank folded into line 30. */
+static uint32_t low_bank_pending(IPodVideoINTCState *s, uint32_t hi_enabled)
+{
+    uint32_t pending = bank_pending(&s->bank[0]);
+
+    if (bank_pending(&s->bank[1]) & hi_enabled) {
+        pending |= INTC_HI_IRQ;
+    }
+    return pending;
 }
 
 static void ipod_video_intc_update(IPodVideoINTCState *s)
@@ -97,14 +130,23 @@ static uint64_t ipod_video_intc_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset % INTC_BANK_SIZE) {
     case INTC_CPU_INT_STAT:
+        if (b == &s->bank[0]) {
+            return low_bank_pending(s, s->bank[1].cpu_enabled) & b->cpu_enabled;
+        }
         return bank_pending(b) & b->cpu_enabled;
     case INTC_COP_INT_STAT:
+        if (b == &s->bank[0]) {
+            return low_bank_pending(s, s->bank[1].cop_enabled) & b->cop_enabled;
+        }
         return bank_pending(b) & b->cop_enabled;
     case INTC_CPU_FIQ_STAT:
     case INTC_COP_FIQ_STAT:
         /* Nothing is routed to FIQ; priority is not modelled. */
         return 0;
     case INTC_INT_STAT:
+        if (b == &s->bank[0]) {
+            return low_bank_pending(s, ~0u);
+        }
         return bank_pending(b);
     case INTC_FORCED_STAT:
         return b->forced;
