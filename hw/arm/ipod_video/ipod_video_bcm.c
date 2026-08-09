@@ -36,17 +36,20 @@
  * beside each answer below. The one place a value could not be derived is
  * marked ASSUMED.
  *
- * What is modelled: the pointer/data/ready protocol on both ports, the chip's
- * address space as plain memory, the bootstrap handshake, the VideoCore
- * release and doorbell, and the two update commands, which push the
+ * What is modelled here: the pointer/data/ready protocol on both ports, the
+ * chip's address space as plain memory, the bootstrap handshake, the VideoCore
+ * release and doorbell, and Rockbox's two update commands, which push the
  * framebuffer to a QEMU console.
  *
- * What is not: TV out, YUV blitting, sleep, and the VideoCore's host interface
- * -- the ring channels the retailOS goes looking for once the handshake
- * succeeds, whose base pointer it reads from BCMA_STATUS at 0x288088. We
- * publish no such pointer, which is a state that driver handles (0x288090
- * treats a null base as "no interface" and gives up cleanly) rather than one
- * it chokes on.
+ * On top of that sits the VideoCore's host interface -- the ring channels the
+ * retailOS goes looking for once the handshake succeeds, whose base pointer it
+ * reads from BCMA_STATUS at 0x288088. That is a protocol rather than a
+ * register file and lives in ipod_video_vc.c; this file publishes its base,
+ * hands it every write that lands in chip memory, and paints whatever surface
+ * it says to paint.
+ *
+ * What is not modelled: TV out, YUV blitting, sleep, and the direction where
+ * the VideoCore speaks first.
  */
 
 #include "qemu/osdep.h"
@@ -88,10 +91,33 @@
 #define BCM_CONTROL_BOOT_READY 0x40
 #define BCM_CONTROL_BOOT_BUSY  0x80
 
+/* And this value written to it is the host-to-VideoCore doorbell (0x287ba4). */
+#define BCM_CONTROL_KICK       0x31
+
 /* Addresses inside the chip. */
+#define BCMA_HANDSHAKE  0x001F0
 #define BCMA_COMMAND    0x001F8
 #define BCMA_STATUS     0x001FC
 #define BCMA_CMDPARAM   0xE0000   /* where a frame is written */
+
+/*
+ * The word below the mailbox is a handshake cell the retailOS uses to start
+ * and stop the VideoCore's host interface: 0x289390 writes {low = 1,
+ * high = 0xA5A5} and then spins at 0x2893c8 until it reads back
+ * {low = 2, high = 0xA5A5}; the shutdown at 0x2894dc writes {0, 0xA5A5} and
+ * 0x28950c waits to read the same thing back. So the top half is a signature
+ * and the bottom half is a state the chip advances: 1 means "start", and 2 is
+ * the chip saying it has.
+ *
+ * This path is not the one the machine takes today -- 0x2892d4 reaches
+ * 0xcff6c through its state-2 branch at 0x2893e4, not the state-1 branch that
+ * runs the handshake -- but it costs nothing to answer correctly, and the
+ * shutdown branch at 0x2894c0 is reachable.
+ */
+#define BCM_HS_MAGIC        0xA5A50000
+#define BCM_HS_MAGIC_MASK   0xFFFF0000
+#define BCM_HS_START        1
+#define BCM_HS_RUNNING      2
 
 /*
  * The VideoCore's release register and its doorbell, in the control window.
@@ -167,12 +193,12 @@
  * channel, then a byte of VideoCore-to-host bits (0x2880bc reads the first,
  * 0xcbe48 and 0xd0558 the other two).
  *
- * We publish that structure with every byte zero, which the driver reads as
- * "the interface is here and has no channels": 0x2871d8 loads a channel's
- * offset and 0x2871e0 skips the channel when it is zero. That is the driver's
- * own spelling of an absent channel, so it is the honest way to say we have
- * none -- we do not run the VideoCore, so there is nothing behind a channel to
- * talk to.
+ * What we put in it is built by ipod_video_vc.c, which speaks the channel
+ * protocol on the other side. Until that existed this structure was published
+ * with every byte zero, which the driver reads as "the interface is here and
+ * has no channels" (0x2871e0 skips a channel whose offset is zero) -- honest,
+ * and exactly why the retailOS drew nothing: 0xe9380 abandons every ASCII
+ * command when there is no channel, and 0x286cf8 every display call.
  *
  * Publishing nothing at all is not an option, and that took a wall to find
  * out. A null base makes 0x288058 return an error at 0x2880a4 -- but its only
@@ -191,7 +217,6 @@
  * Rockbox writes at 0xE0000.
  */
 #define BCM_IFACE_BASE  0x00180000
-#define BCM_IFACE_SIZE  0x30
 
 /*
  * Commands are sent as a value and its complement in the two halves of a word,
@@ -345,7 +370,8 @@ static void bcm_run_command(IPodVideoBCMState *s, uint32_t cmd)
  * control words are written as two halfwords by the retailOS, so acting on the
  * value of a single access would see 0x0000 where 0xC0000000 was meant.
  */
-static void bcm_wrote(IPodVideoBCMState *s, IPodVideoBCMPort *p, uint32_t addr)
+static void bcm_wrote(IPodVideoBCMState *s, IPodVideoBCMPort *p, uint32_t addr,
+                      unsigned size)
 {
     uint32_t word;
 
@@ -376,9 +402,23 @@ static void bcm_wrote(IPodVideoBCMState *s, IPodVideoBCMPort *p, uint32_t addr)
                  * the retailOS whatever byte of the image landed there and it
                  * follows it as a pointer.
                  */
-                memset(s->mem + BCM_IFACE_BASE, 0, BCM_IFACE_SIZE);
+                ipod_video_vc_publish(s);
                 stl_le_p(s->mem + BCMA_STATUS, BCM_IFACE_BASE);
             }
+        }
+        return;
+    }
+
+    /*
+     * The start/stop handshake below the mailbox. The guest writes the low
+     * half then the high half as two halfwords, so this only makes sense on
+     * the assembled word.
+     */
+    if ((addr & ~3u) == BCMA_HANDSHAKE) {
+        word = bcm_mem_word(s, addr);
+        if ((word & BCM_HS_MAGIC_MASK) == BCM_HS_MAGIC
+            && (word & 0xffff) == BCM_HS_START) {
+            stl_le_p(s->mem + BCMA_HANDSHAKE, BCM_HS_MAGIC | BCM_HS_RUNNING);
         }
         return;
     }
@@ -393,7 +433,11 @@ static void bcm_wrote(IPodVideoBCMState *s, IPodVideoBCMPort *p, uint32_t addr)
      */
     if ((addr & ~3u) == BCMA_COMMAND && p->wr_start == BCMA_COMMAND) {
         bcm_run_command(s, bcm_mem_word(s, addr));
+        return;
     }
+
+    /* And everything the VideoCore's host interface cares about. */
+    ipod_video_vc_wrote(s, addr, size);
 }
 
 static uint64_t ipod_video_bcm_read(void *opaque, hwaddr offset, unsigned size)
@@ -447,7 +491,7 @@ static void ipod_video_bcm_write(void *opaque, hwaddr offset, uint64_t value,
         addr = p->wr_addr;
         bcm_mem_write(s, addr, value, size);
         p->wr_addr += size;
-        bcm_wrote(s, p, addr);
+        bcm_wrote(s, p, addr, size);
         break;
 
     case BCM_REG_WR_ADDR:
@@ -464,13 +508,24 @@ static void ipod_video_bcm_write(void *opaque, hwaddr offset, uint64_t value,
     case BCM_REG_CONTROL:
     case BCM_REG_ALT_CONTROL:
         /*
-         * The bootstrap byte sequence and the 0x31 kick both land here. The
-         * kick is the host telling the chip to look at what it just posted,
-         * and since a post is acted on as it happens there is nothing left for
-         * it to do. The bootstrap does not reset the VideoCore either: 0x28805c
-         * runs the same sequence again and then expects to find the firmware
-         * still executing.
+         * The bootstrap byte sequence and the channel kick both land here.
+         *
+         * The kick is 0x31 and nothing else: 0x287ba4 loads "mov r0, #49" and
+         * stores it as a halfword to whichever control register the port
+         * selects, and that is the whole of the host-to-VideoCore interrupt.
+         * The bootstrap sequence -- 0xa1, 0x81, 0x91, 0x02, 0x12, 0x22, 0x72,
+         * 0x62 at 0x287998 -- does not collide with it, and does not reset the
+         * VideoCore either: 0x28805c runs it again and then expects to find
+         * the firmware still executing.
+         *
+         * Draining on the kick is belt and braces. The store of the write
+         * pointer that precedes it has already been acted on, and the bell is
+         * conditional (0x288880), so this is here to be right rather than to
+         * be needed.
          */
+        if (value == BCM_CONTROL_KICK) {
+            ipod_video_vc_kick(s);
+        }
         break;
 
     default:
@@ -488,10 +543,93 @@ static const MemoryRegionOps ipod_video_bcm_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * Point the console at a piece of chip memory.
+ *
+ * The format code is the VideoCore's own image type, and the mapping is not a
+ * guess: 0x286a58 computes a stride from it, and the four cases it knows --
+ * 15 goes four bytes per pixel, 1 two, 5 three, and 17 or 18 two -- line up
+ * one for one with Broadcom's VC_IMAGE_T enum (RGB565 = 1, RGB888 = 5,
+ * RGBA32 = 15, RGBA565 = 17, RGBA16 = 18). The retailOS labels its own bitmaps
+ * 0x0565 and 0x1888 and 0x164464 translates those to 1 and 15.
+ *
+ * The one this machine actually gets is 1, RGB565, which is also what the
+ * panel is and what Rockbox uses, so the common case is a straight alias with
+ * no conversion at all.
+ */
+void ipod_video_bcm_scanout(IPodVideoBCMState *s, uint32_t addr,
+                            uint32_t width, uint32_t height, uint32_t stride,
+                            uint8_t format)
+{
+    if (s->scanout_addr == addr && s->scanout_width == width
+        && s->scanout_height == height && s->scanout_stride == stride
+        && s->scanout_format == format) {
+        s->dirty = true;
+        return;
+    }
+    s->scanout_addr = addr;
+    s->scanout_width = width;
+    s->scanout_height = height;
+    s->scanout_stride = stride;
+    s->scanout_format = format;
+    s->scanout_changed = true;
+    s->dirty = true;
+}
+
+static void ipod_video_bcm_rebuild_surface(IPodVideoBCMState *s)
+{
+    DisplaySurface *surface;
+    pixman_format_code_t fmt;
+    uint32_t bpp;
+
+    switch (s->scanout_format) {
+    case 15:    /* VC_IMAGE_RGBA32: 0xAABBGGRR in memory, so R first. */
+        fmt = PIXMAN_a8b8g8r8;
+        bpp = 4;
+        break;
+    case 1:     /* VC_IMAGE_RGB565 */
+    default:
+        if (s->scanout_format != 1) {
+            qemu_log_mask(LOG_UNIMP, "%s: image format %u is not modelled; "
+                          "showing it as RGB565\n", __func__,
+                          s->scanout_format);
+        }
+        fmt = PIXMAN_r5g6b5;
+        bpp = 2;
+        break;
+    }
+
+    if (s->scanout_width == 0 || s->scanout_height == 0
+        || s->scanout_stride < s->scanout_width * bpp
+        || (uint64_t)s->scanout_addr
+           + (uint64_t)s->scanout_stride * s->scanout_height > BCM_MEM_SIZE) {
+        qemu_log_mask(LOG_UNIMP, "%s: refusing a %ux%u surface at 0x%x "
+                      "stride %u\n", __func__, s->scanout_width,
+                      s->scanout_height, s->scanout_addr, s->scanout_stride);
+        return;
+    }
+
+    qemu_console_resize(s->con, s->scanout_width, s->scanout_height);
+    surface = qemu_create_displaysurface_from(s->scanout_width,
+                                              s->scanout_height, fmt,
+                                              s->scanout_stride,
+                                              s->mem + s->scanout_addr);
+    dpy_gfx_replace_surface(s->con, surface);
+}
+
 static void ipod_video_bcm_gfx_update(void *opaque)
 {
     IPodVideoBCMState *s = opaque;
 
+    /*
+     * Swapping the surface is done here rather than where the guest asks for
+     * it, because a device write handler is not where the display layer wants
+     * to be reentered from.
+     */
+    if (s->scanout_changed) {
+        s->scanout_changed = false;
+        ipod_video_bcm_rebuild_surface(s);
+    }
     if (!s->dirty) {
         return;
     }
@@ -528,6 +666,16 @@ static void ipod_video_bcm_reset(DeviceState *dev)
     s->vc_running = true;
     memset(s->mem, 0, BCM_MEM_SIZE);
     memset(s->ctrl, 0, BCM_CTRL_SIZE);
+
+    ipod_video_vc_reset(s);
+
+    /* Back to Rockbox's framebuffer until a guest says otherwise. */
+    s->scanout_addr = BCMA_CMDPARAM;
+    s->scanout_width = LCD_WIDTH;
+    s->scanout_height = LCD_HEIGHT;
+    s->scanout_stride = LCD_WIDTH * 2;
+    s->scanout_format = 1;
+    s->scanout_changed = true;
 }
 
 static void ipod_video_bcm_realize(DeviceState *dev, Error **errp)
@@ -543,11 +691,11 @@ static void ipod_video_bcm_realize(DeviceState *dev, Error **errp)
      * writes pixels, so an update is just a repaint rather than a copy. The
      * panel is 320x240 RGB565, per Rockbox's config for this target.
      *
-     * This is Rockbox's framebuffer address. The retailOS does not use it: it
-     * never loads 0xE0000 anywhere in seven megabytes, and lets the VideoCore
-     * pull pixels out of host memory at addresses that only exist in messages
-     * the VideoCore sends. So this surface stays black under Apple's firmware
-     * however well the handshake goes.
+     * This is Rockbox's framebuffer address, and it is only the starting
+     * point. The retailOS never loads 0xE0000 anywhere in seven megabytes: it
+     * asks the VideoCore to make it a surface and is told where that surface
+     * lives, so under Apple's firmware the console follows whatever address
+     * ipod_video_vc.c handed out (ipod_video_bcm_scanout).
      */
     surface = qemu_create_displaysurface_from(LCD_WIDTH, LCD_HEIGHT,
                                               PIXMAN_r5g6b5,
