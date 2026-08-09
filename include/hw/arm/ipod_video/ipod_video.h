@@ -115,8 +115,15 @@
 
 /*
  * IRAMORIG in Rockbox's app-pp.lds. That script only claims 0xc000 for the
- * application, which is a budget rather than the size of the hardware; the
- * real figure is not confirmed, so this is deliberately generous.
+ * application, which is a budget rather than the size of the hardware, so this
+ * started out as a deliberately generous guess.
+ *
+ * It is no longer a guess. Apple's firmware hands out its globals at
+ * IRAM_END - 0x100 + N (0x1084, via 0x598) and picks IRAM_END from a single
+ * character of PP_VER1: 0x40020000 for a PP5022, 0x40018000 otherwise. So the
+ * firmware itself puts the top of IRAM at 0x40020000 on this chip, which is
+ * 128 KB, and that is what makes the SysInfo letterbox at 0x4001ff18 land
+ * where iPodLinux says it does. 96 KB would be the PP5020 figure.
  */
 #define IRAM_MEM_BASE       0x40000000
 #define IRAM_MEM_SIZE       0x00020000

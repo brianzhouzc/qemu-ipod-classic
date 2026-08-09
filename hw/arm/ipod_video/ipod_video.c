@@ -18,8 +18,11 @@
  *     now, but nothing is on it except the PCF50605 power management chip at
  *     address 0x08; the codec's address 0x1a is empty, and so is 0x2a, which
  *     Apple's firmware talks to and no public source names.
- *   - The Broadcom's firmware upload path. GPO32 bit 14 is faked as already
- *     set so the panel counts as powered.
+ *   - Executing the Broadcom's firmware. The upload path itself is modelled:
+ *     the retailOS DMAs all 201376 bytes of the real vmcs image into the
+ *     chip's memory and we answer as if it were running, but nothing ever
+ *     executes it. GPO32 bit 14 is faked as already set so that Rockbox, which
+ *     would otherwise try to upload it too, counts the panel as powered.
  *
  * See wiki/07-pp502x-hardware.md.
  */
@@ -61,12 +64,8 @@
  * an unimplemented stub reading back zero -- that is neither value, and the
  * firmware wanders off.
  *
- * With only one core modelled it always answers CPU.
- */
-/*
- * PROCESSOR_ID. Both cores run the same image and the very first thing it does
- * is read this to find out which one it is, so the answer has to depend on who
- * is asking rather than being a constant.
+ * Both cores are modelled, so the answer depends on who is asking rather than
+ * being a constant.
  */
 static uint64_t pp502x_proc_id_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -1206,7 +1205,9 @@ static void ipod_video_machine_init(MachineState *machine)
      * is the switch that turns the block on, and there is no way to hand the
      * firmware its hardware id without it.
      *
-     * Only the four fields listed at SYSINFO_MAGIC_OFF are written. The rest
+     * Only the four fields listed with SYSINFO_MAGIC in the header are
+     * written -- the magic, the length, the hardware revision and the SDRAM
+     * size. The rest
      * of the block stays at the zeros IRAM comes up with: the serial number,
      * the FireWire GUID, the board name and the image revisions are all
      * unknown to us, and a plausible-looking invention is worse than a zero
@@ -1261,8 +1262,10 @@ static void ipod_video_machine_init(MachineState *machine)
 
     /*
      * SER0 is a plain 16550 with its registers four bytes apart, so QEMU's own
-     * model does the job. The interrupt is not wired yet because there is no
-     * interrupt controller to wire it to; transmission does not depend on it.
+     * model does the job. The interrupt is deliberately left unwired -- the
+     * NULL below -- because neither firmware drives the UART by interrupt in
+     * any path we reach, and transmission does not depend on it. PP_SER0_IRQ
+     * is defined but unused for the same reason.
      */
     serial_mm_init(sysmem, SER0_MEM_BASE, 2, NULL, 115200, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
@@ -1296,14 +1299,6 @@ static void ipod_video_machine_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bcm), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bcm), 0, BCM_MEM_BASE);
 
-    /*
-     * The disk. The task file is a standard ATA one with the registers four
-     * bytes apart at IDE_BASE + 0x1e0, and the control register at +0x3f8, so
-     * QEMU's memory-mapped IDE covers it with shift 2. What is PP-specific is
-     * the block of timing and configuration registers below 0x1e0, which is
-     * left as an unimplemented stub: the firmware programs PIO and DMA
-     * timings there, and none of that changes what a read returns.
-     */
     /*
      * The disk. The task file is standard ATA with the registers four bytes
      * apart, but the PP wraps it in its own configuration, timing and DMA
