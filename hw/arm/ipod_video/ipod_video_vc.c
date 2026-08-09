@@ -181,13 +181,16 @@ static uint32_t vc_occupancy(uint16_t start, uint16_t end,
     return wr - rd;
 }
 
+/* Copy len bytes out of a ring; a null destination just skips them. */
 static void vc_ring_read(IPodVideoBCMState *s, uint16_t start, uint16_t end,
                          uint16_t *rd, uint8_t *dst, uint32_t len)
 {
     uint32_t i;
 
     for (i = 0; i < len; i++) {
-        dst[i] = *vc_iface(s, *rd);
+        if (dst) {
+            dst[i] = *vc_iface(s, *rd);
+        }
         if (++*rd == end) {
             *rd = start;
         }
@@ -327,7 +330,7 @@ static uint32_t vc_handle_gfx(IPodVideoBCMState *s, uint32_t opcode,
 
     switch (opcode) {
     case VC_GFX_CREATE: {
-        uint32_t want, size, i;
+        uint32_t want, size, i, handle = 0;
         IPodVideoVCSurface *surf = NULL;
         uint8_t format;
         uint32_t width, height, stride;
@@ -340,17 +343,18 @@ static uint32_t vc_handle_gfx(IPodVideoBCMState *s, uint32_t opcode,
         height = ldl_le_p(req + 12);
         stride = ldl_le_p(req + 16);
         want   = ldl_le_p(req + 24);
-        size   = stride * height;
+        size   = (uint64_t)stride * height > BCM_MEM_SIZE ? 0 : stride * height;
 
         for (i = 0; i < VC_MAX_SURFACES; i++) {
             if (!s->surface[i].valid) {
                 surf = &s->surface[i];
+                handle = i + 1;         /* one-based, so a handle is never 0 */
                 break;
             }
         }
         if (!surf || size == 0) {
             qemu_log_mask(LOG_UNIMP, "ipod_video_vc: no room for a %ux%u "
-                          "surface\n", width, height);
+                          "surface of stride %u\n", width, height, stride);
             break;
         }
 
@@ -358,7 +362,7 @@ static uint32_t vc_handle_gfx(IPodVideoBCMState *s, uint32_t opcode,
             want = s->vc_heap;
             s->vc_heap = (s->vc_heap + size + 15) & ~15u;
         }
-        if (want + size > BCM_MEM_SIZE) {
+        if ((uint64_t)want + size > BCM_MEM_SIZE) {
             qemu_log_mask(LOG_UNIMP, "ipod_video_vc: surface at 0x%x does not "
                           "fit in chip memory\n", want);
             break;
@@ -372,10 +376,10 @@ static uint32_t vc_handle_gfx(IPodVideoBCMState *s, uint32_t opcode,
         surf->size   = size;
         surf->format = format;
 
-        stl_le_p(reply, i + 1);         /* handle, one-based so never zero */
+        stl_le_p(reply, handle);
         stl_le_p(reply + 4, surf->addr);
         qemu_log_mask(LOG_UNIMP, "ipod_video_vc: surface %u = %ux%u fmt %u "
-                      "stride %u at chip 0x%x\n", i + 1, width, height,
+                      "stride %u at chip 0x%x\n", handle, width, height,
                       format, stride, surf->addr);
         break;
     }
@@ -519,11 +523,6 @@ static void vc_pump(IPodVideoBCMState *s, int ch)
         seq    = ldl_le_p(hdr + VC_MSG_OFF_SEQ);
         opcode = ldl_le_p(hdr + VC_MSG_OFF_OPCODE);
         len    = lduw_le_p(hdr + VC_MSG_OFF_LENGTH);
-        if (len > VC_MAX_PAYLOAD) {
-            qemu_log_mask(LOG_UNIMP, "ipod_video_vc: channel %d payload of %u "
-                          "bytes is longer than we handle\n", ch, len);
-            len = VC_MAX_PAYLOAD;
-        }
         padded = (len + 15) & ~15u;
 
         /* A message only exists once all of it is there. */
@@ -531,7 +530,19 @@ static void vc_pump(IPodVideoBCMState *s, int ch)
             break;
         }
         rd = peek;
-        vc_ring_read(s, start, end, &rd, payload, padded);
+        /*
+         * Take what fits and step over the rest, so that an oversized message
+         * costs us the message and not the ring's alignment.
+         */
+        if (len > VC_MAX_PAYLOAD) {
+            qemu_log_mask(LOG_UNIMP, "ipod_video_vc: channel %d payload of %u "
+                          "bytes is longer than we handle\n", ch, len);
+            vc_ring_read(s, start, end, &rd, payload, VC_MAX_PAYLOAD);
+            vc_ring_read(s, start, end, &rd, NULL, padded - VC_MAX_PAYLOAD);
+            len = VC_MAX_PAYLOAD;
+        } else {
+            vc_ring_read(s, start, end, &rd, payload, padded);
+        }
 
         /*
          * Release the space before answering: the reply goes on the other ring,

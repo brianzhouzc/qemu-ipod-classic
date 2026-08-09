@@ -414,7 +414,7 @@ static void bcm_wrote(IPodVideoBCMState *s, IPodVideoBCMPort *p, uint32_t addr,
      * half then the high half as two halfwords, so this only makes sense on
      * the assembled word.
      */
-    if ((addr & ~3u) == BCMA_HANDSHAKE) {
+    if ((addr & ~3u) == BCMA_HANDSHAKE && p->wr_start == BCMA_HANDSHAKE) {
         word = bcm_mem_word(s, addr);
         if ((word & BCM_HS_MAGIC_MASK) == BCM_HS_MAGIC
             && (word & 0xffff) == BCM_HS_START) {
