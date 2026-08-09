@@ -799,6 +799,52 @@ pena montar el anillo o si basta con apuntar la consola de QEMU a esa memoria.
 Lo que no se sabrá por ahí es el formato de los mensajes `'H'`/`'Y'`, que hay que
 sacar de la tabla de saltos de `0xf9e2c` (30 entradas, cinco identificadas).
 
+**Advertencia sobre ese punto de ruptura**: hoy no se alcanza. `0x1c299c` es un
+inicializador estático perezoso y `[0x1083198C]` sigue valiendo cero en marcha,
+igual que `[0x108315c8]`. La rutina de transición solo corre cuando hay pantalla,
+y no la hay. O sea que primero hace falta que arranque la UI, y para eso hace
+falta el canal.
+
+### Dos cosas que se vieron volcando la DRAM, y que cambian el panorama
+
+Con `pmemsave 0x10000000 0x4000000` a los 55 s y buscando cadenas:
+
+**Las cuatro tareas del VideoCore existen y corren.** `VCIH`, `VCFS`, `VCHR` y
+`VCPD` aparecen no solo como literales de la imagen sino **copiados al montón**
+(`0x13e5d9cc`, `0x13e5ef2c`, `0x13e5fd78`, `0x13e60e58`…), que es donde el
+planificador guarda el nombre de cada tarea. El retailOS llegó hasta el final de
+`0x2892d4`.
+
+**Y la que no corrió es la de la pantalla.** `display_control` y `transitions`
+aparecen **solo en direcciones de la imagen** (`0x10163c40`, `0x101c7cd8`); no
+hay ni una copia formateada en el montón. Es decir, `0x164e9c` nunca llegó a
+componer su `display_control %d model=%d power=%d`. Sin canal no hay a quién
+mandárselo, y sin eso la UI no arranca. Es prueba indirecta —un buffer de pila
+pudo haberse pisado— pero apunta en la misma dirección que todo lo demás.
+
+**El `vmcs.bin` que subimos es el de verdad.** Esto no se sabía. El buffer que
+el DMA lee (`0x13ea136c`, `0x312a0` bytes) contiene, en su offset `0xbfe8`, la
+tabla de símbolos del firmware del VideoCore:
+
+```
+tasks, version, commands, power_down, set_vll_dir, led_control, disk_notify,
+usb_inserted, audio_enable, inuse_notify, power_control, audio_control,
+motor_control, camera_control, display_control, end_application,
+power_management, load_application, vmcs_display_clear, vmcs_display_enable
+```
+
+más plantillas de **respuesta** —`value=%d`, `drive=%i inuse=%i`,
+`error=%d error_msg="bad argument"`— que solo tienen sentido en el lado del
+chip. Y viene de `assets/ipod-video-disk.img`, offset de fichero `0xb27508`, que
+es la partición de firmware; el mismo contenido está en
+`assets/ipod-video-fw.bin` en el mismo offset. **No** está en `osos_full.bin`.
+
+O sea: la máquina emulada ya tiene el firmware real del VideoCore, lo lee del
+disco, lo sube entero y correcto a la SRAM del chip modelado. Lo único que no
+hace es ejecutarlo. Eso convierte "emular el VideoCore" de idea abstracta en una
+opción con material: el binario está ahí, con símbolos, y el vocabulario de
+comandos que el host le manda está a la vista.
+
 ## Estrategia (iPod classic 6G)
 
 El `osos` de Apple está cifrado con la clave GID del SoC
