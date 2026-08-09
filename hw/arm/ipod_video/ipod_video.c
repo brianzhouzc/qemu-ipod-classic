@@ -14,11 +14,10 @@
  *
  * Not modelled, and worth knowing before reading anything into a run:
  *
- *   - I2C at 0x7000c000, and everything on that bus. This is where Apple's
- *     retailOS spends its time once it has booted: it talks to the PCF50605
- *     power management chip at address 0x08 and gets nothing back. Rockbox
- *     survives it because its driver reads whatever the data registers happen
- *     to hold and carries on.
+ *   - Audio: the I2S block and the WM8758 codec. There is a modelled I2C bus
+ *     now, but nothing is on it except the PCF50605 power management chip at
+ *     address 0x08; the codec's address 0x1a is empty, and so is 0x2a, which
+ *     Apple's firmware talks to and no public source names.
  *   - The Broadcom's firmware upload path. GPO32 bit 14 is faked as already
  *     set so the panel counts as powered.
  *
@@ -45,6 +44,9 @@
 #include "hw/arm/ipod_video/ipod_video_intc.h"
 #include "hw/sysbus.h"
 #include "hw/arm/ipod_video/ipod_video_ide.h"
+#include "hw/arm/ipod_video/ipod_video_i2c.h"
+#include "hw/arm/ipod_video/ipod_video_pcf50605.h"
+#include "hw/i2c/i2c.h"
 #include "sysemu/blockdev.h"
 #include "hw/qdev-properties.h"
 #include "ui/console.h"
@@ -1034,6 +1036,7 @@ static void ipod_video_machine_init(MachineState *machine)
                              FLASH_ROM_MEM_SIZE);
     memory_region_add_subregion(sysmem, FLASH_ROM_REMAP_BASE, rom_alias);
 
+
     uint32_t hwrev = cpu_to_le32(nms->hw_revision);
     cpu_physical_memory_write(FLASH_ROM_MEM_BASE + IPOD_HW_REVISION_OFF,
                               &hwrev, sizeof(hwrev));
@@ -1267,6 +1270,31 @@ static void ipod_video_machine_init(MachineState *machine)
                        qdev_get_gpio_in(nms->intc, PP_IDE_IRQ));
     sysbus_mmio_map(SYS_BUS_DEVICE(ide), 0, IDE_MEM_BASE);
     pp502x_ide_init_drive(ide, drive_get(IF_IDE, 0, 0));
+
+    /*
+     * I2C, and the power management chip on it. This shares its window with
+     * the click wheel: the controller has +0x00..+0xff and the wheel +0x100
+     * upwards, so it goes in at a higher overlap priority than the wheel's
+     * page-sized region rather than beside it.
+     *
+     * No interrupt is connected. Neither firmware uses one for I2C -- both
+     * poll STATUS -- and on this SoC the line the header calls I2C_IRQ is the
+     * click wheel's.
+     */
+    DeviceState *i2c = qdev_new(TYPE_PP502X_I2C);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2c), 0, I2C_MEM_BASE, 2);
+
+    /*
+     * The PCF50605 at 7-bit address 0x08, which is where Rockbox's
+     * pcf50605.c, iPodLinux and Apple's 0x283540 all address it. It is the
+     * only device we can identify on this bus; Apple also talks to something
+     * at 0x2a, which nothing in Rockbox or iPodLinux names, so that address
+     * stays empty and transfers to it are answered with a bus error, which is
+     * what an unpopulated address does.
+     */
+    i2c_slave_create_simple(pp502x_i2c_get_bus(i2c), TYPE_PCF50605,
+                            PCF50605_I2C_ADDR);
 
     ipod_video_load_image(machine, nms);
 

@@ -693,6 +693,8 @@ config IPOD_VIDEO_5G
      select IDE_QDEV
      # SER0 on the PP502x is a plain 16550 with a four-byte register stride.
      select SERIAL
+     # The PCF50605 power management chip hangs off an I2C bus.
+     select I2C
 
 config IPOD_CLASSIC_6G
      bool

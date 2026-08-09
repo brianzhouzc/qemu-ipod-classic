@@ -75,6 +75,7 @@
  */
 #define DRAM_ALIAS_BIT      0x04000000
 
+
 /*
  * IRAMORIG in Rockbox's app-pp.lds. That script only claims 0xc000 for the
  * application, which is a budget rather than the size of the hardware; the
@@ -203,11 +204,14 @@
 #define IDE_CONTROL_OFF     0x3f8
 #define DEV_CTL_MEM_BASE    0x70000000   /* DEV_INIT1/2, GPO32_VAL, GPO32_ENABLE */
 /*
- * The click wheel, not I2C as this was first labelled. Rockbox reads
- * CLICKWHEEL_DATA from 0x7000c140 in button-clickwheel.c, and the trace shows
- * the firmware reading exactly that offset. This is both why the firmware may
- * believe buttons are held and the device needed to navigate anything.
+ * One window, two unrelated blocks. The I2C controller has +0x00..+0xff and
+ * the click wheel +0x100 upwards, and they even share an interrupt line. Which
+ * of the two owns the window was got wrong once already, in both directions:
+ * the whole thing was first labelled I2C, then relabelled click wheel when
+ * Rockbox was seen reading CLICKWHEEL_DATA at 0x7000c140. Both were half
+ * right.
  */
+#define I2C_MEM_BASE        0x7000c000
 #define CLICKWHEEL_MEM_BASE 0x7000c000
 #define CLICKWHEEL_DATA_OFF 0x140
 #define I2S_MEM_BASE        0x70002800
