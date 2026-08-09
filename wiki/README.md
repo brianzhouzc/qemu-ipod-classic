@@ -8,10 +8,15 @@ está cifrado con una clave que vive en el silicio. Al aparecer un **iPod Video
 5G** físico, cuyo firmware está en claro, el objetivo de arrancar software real
 se movió allí.
 
+El 2026-08-09 el bloqueo del Classic cayó: no hacía falta extraer la clave, sino
+que **descifrara el propio aparato**. Con el iPod classic 6G físico corriendo
+emCORE, su motor AES suelta el `osos` de Apple en claro por USB. Ver
+[10-classic6g-emcore.md](10-classic6g-emcore.md).
+
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Video` | PP5022C | **arranca los dos firmwares del aparato real: Rockbox hasta el menú, y el retailOS de Apple dibujando su interfaz y navegable** |
-| `iPod-Classic` | S5L8702 | ejecuta código; timers e interrupciones verificados. **No arranca firmware real** (cifrado) |
+| `iPod-Classic` | S5L8702 | ejecuta código; timers e interrupciones verificados. Aún no arranca firmware real, pero **el `osos` ya está descifrado** (2026-08-09) y deja de ser el bloqueo |
 
 Para una introducción de una página, empezar por el
 [README de la raíz](../README.md). Para ejecutarlo y probarlo:
@@ -36,6 +41,7 @@ Para una introducción de una página, empezar por el
 | [02-s5l8702-hardware.md](02-s5l8702-hardware.md) | Mapa de memoria, periféricos, números de IRQ y componentes de placa del S5L8702. Corregido en `e17924eab`: la primera versión coló bases que sólo existen en S5L8700/8701. |
 | [03-reuse-qemu-ios.md](03-reuse-qemu-ios.md) | Qué modelos de dispositivo de la rama `ipod_touch_2g` se pueden reaprovechar y cuáles hay que escribir de cero. |
 | [08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md) | Correcciones al mapa de memoria, bootrom, cadena de arranque, click wheel, y el **modelo QEMU del S5L8702 que ya existe** en `freemyipod/qemu`. Leerlo antes de escribir nada nuevo del Classic. |
+| [10-classic6g-emcore.md](10-classic6g-emcore.md) | **El aparato real por USB**: el protocolo de emCORE r859 (y por qué los clientes oficiales no funcionan), **el descifrado del `osos` con la clave GID del propio SoC** — el bloqueo fundacional, resuelto —, el volcado de la NOR con su bloque `SCfg`, la prueba de que **la bootrom está bloqueada** y no se puede volcar por esta vía, y la dirección que cuelga el monitor. |
 
 ### Transversal
 

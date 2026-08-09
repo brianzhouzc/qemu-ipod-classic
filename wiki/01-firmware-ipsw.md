@@ -127,6 +127,19 @@ descifrar con la clave del S5L8702. Por eso **el primer objetivo no es el OS de
 Apple sino Rockbox**, que es open source, se compila sin firmar y se carga desde
 `0x08000000` igual que el `osos`. Ver [04-roadmap.md](04-roadmap.md).
 
+### RESUELTO (2026-08-09) — ya no hace falta la clave
+
+El razonamiento de arriba daba por supuesto que había que *tener* la clave GID.
+No hace falta: basta con que **descifre el propio aparato**. Con el iPod classic
+6G físico corriendo emCORE, su motor AES descifra el payload por USB en 1,2 s.
+
+`osos_decrypted.bin` está en `assets/classic6g/` (gitignorado) y es
+inequívocamente el retailOS de Apple: vectores ARM, `Copyright 2001-2008 Apple
+Inc.`, la interfaz (`Cover Flow`, `Now Playing`), `RTXC v3.2b`.
+
+El procedimiento completo, el protocolo y la herramienta:
+[10-classic6g-emcore.md](10-classic6g-emcore.md).
+
 ## Uso de la herramienta
 
 ```bash
