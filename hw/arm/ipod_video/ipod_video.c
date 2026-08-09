@@ -38,7 +38,7 @@
 #include "hw/arm/ipod_video/ipod_video_bcm.h"
 #include "hw/arm/ipod_video/ipod_video_intc.h"
 #include "hw/sysbus.h"
-#include "hw/ide/mmio.h"
+#include "hw/arm/ipod_video/ipod_video_ide.h"
 #include "sysemu/blockdev.h"
 #include "hw/qdev-properties.h"
 #include "ui/console.h"
@@ -260,71 +260,6 @@ static const MemoryRegionOps pp502x_timer_ops = {
 };
 
 /*
- * The PP-specific half of the IDE controller: bus timings, and IDE0_CFG.
- *
- * Only one bit of it matters for getting the disk read. Rockbox does not take
- * the ATA interrupt; it polls for it, from ata-pp5020.c:
- *
- *     static int ata_wait_intrq(void)
- *     {
- *         do {
- *             if (IDE0_CFG & IDE_CFG_INTRQ)
- *                 return 1;
- *             yield();
- *         } while (TIME_BEFORE(current_tick, timeout));
- *         return 0;
- *     }
- *
- * So IDE0_CFG bit 3 has to follow the controller's interrupt line, otherwise
- * every transfer waits forever. The timing registers are stored and handed
- * back unchanged: they set up PIO and DMA cycle lengths, which cannot change
- * what a read returns here.
- */
-#define PP_IDE0_CFG         0x28
-#define PP_IDE_CFG_INTRQ    (1 << 3)
-
-static uint64_t pp502x_ide_cfg_read(void *opaque, hwaddr offset, unsigned size)
-{
-    IPodVideoMachineState *nms = opaque;
-
-    if (offset == PP_IDE0_CFG) {
-        return nms->ide_cfg | (nms->ide_intrq ? PP_IDE_CFG_INTRQ : 0);
-    }
-    if (offset < sizeof(nms->ide_timing)) {
-        return nms->ide_timing[offset / 4];
-    }
-    return 0;
-}
-
-static void pp502x_ide_cfg_write(void *opaque, hwaddr offset, uint64_t value,
-                                 unsigned size)
-{
-    IPodVideoMachineState *nms = opaque;
-
-    if (offset == PP_IDE0_CFG) {
-        nms->ide_cfg = value & ~PP_IDE_CFG_INTRQ;
-    } else if (offset < sizeof(nms->ide_timing)) {
-        nms->ide_timing[offset / 4] = value;
-    }
-}
-
-static const MemoryRegionOps pp502x_ide_cfg_ops = {
-    .read = pp502x_ide_cfg_read,
-    .write = pp502x_ide_cfg_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .impl.min_access_size = 4,
-    .impl.max_access_size = 4,
-};
-
-static void pp502x_ide_irq(void *opaque, int n, int level)
-{
-    IPodVideoMachineState *nms = opaque;
-
-    nms->ide_intrq = level;
-    qemu_set_irq(qdev_get_gpio_in(nms->intc, PP_IDE_IRQ), level);
-}
-
-/*
  * The cache controller, which is also where the vector table lives or does
  * not. From pp5020.h:
  *
@@ -494,8 +429,35 @@ static const MemoryRegionOps pp502x_gpio_ops = {
  *
  * The wheel itself -- bit 30 with a position in bits 16..22 -- is not
  * generated yet; only the five buttons are, from the keyboard.
+ *
+ * On the PP the wheel is interrupt driven, not polled: ipod_4g_button_read()
+ * is only ever called from ipod_4g_button_int(), and it refuses to look at the
+ * data at all unless a status bit is set first:
+ *
+ *     if ((inl(0x7000c104) & 0x04000000) != 0) {
+ *         unsigned status = CLICKWHEEL_DATA;
+ *         ...
+ *     }
+ *
+ * and the handler acknowledges with outl(inl(0x7000c104) | 0x0c000000, ...).
+ * So a key press has to do two things: latch that bit, and raise the wheel's
+ * interrupt, which on this SoC is the I2C line in the high bank. Without both
+ * the firmware never reads the wheel and nothing at all happens.
  */
 #define PP_CLICKWHEEL_PACKET    0x8000001a
+#define PP_WHEEL_STATUS_OFF     0x104
+#define PP_WHEEL_STATUS_RX      (1 << 26)
+#define PP_WHEEL_TOUCHED        0x40000000
+#define PP_WHEEL_POS_SHIFT      16
+#define PP_WHEEL_POS_MASK       0x7f
+/*
+ * "Highest wheel = 0x5F, clockwise increases" -- 96 positions to the turn,
+ * which is WHEELCLICKS_PER_ROTATION. Rockbox needs WHEEL_SENSITIVITY (4)
+ * clicks of accumulated travel before it moves the selection by one, so each
+ * key event steps two and a press/release pair moves exactly one item.
+ */
+#define PP_WHEEL_CLICKS         96
+#define PP_WHEEL_STEP           2
 #define PP_WHEEL_SELECT         0x00000100
 #define PP_WHEEL_RIGHT          0x00000200
 #define PP_WHEEL_LEFT           0x00000400
@@ -508,7 +470,17 @@ static uint64_t pp502x_clickwheel_read(void *opaque, hwaddr offset,
     IPodVideoMachineState *nms = opaque;
 
     if (offset == CLICKWHEEL_DATA_OFF) {
-        return PP_CLICKWHEEL_PACKET | nms->wheel_buttons;
+        uint32_t packet = PP_CLICKWHEEL_PACKET | nms->wheel_buttons;
+        if (nms->wheel_touched) {
+            packet |= PP_WHEEL_TOUCHED
+                   | ((nms->wheel_position & PP_WHEEL_POS_MASK)
+                      << PP_WHEEL_POS_SHIFT);
+        }
+        return packet;
+    }
+    if (offset == PP_WHEEL_STATUS_OFF) {
+        return nms->wheel_regs[offset / 4]
+             | (nms->wheel_pending ? PP_WHEEL_STATUS_RX : 0);
     }
     return offset < sizeof(nms->wheel_regs) ? nms->wheel_regs[offset / 4] : 0;
 }
@@ -517,6 +489,13 @@ static void pp502x_clickwheel_write(void *opaque, hwaddr offset,
                                     uint64_t value, unsigned size)
 {
     IPodVideoMachineState *nms = opaque;
+
+    if (offset == PP_WHEEL_STATUS_OFF && (value & PP_WHEEL_STATUS_RX)) {
+        /* The handler acknowledges the packet by writing the bit back. */
+        nms->wheel_pending = false;
+        qemu_set_irq(qdev_get_gpio_in(nms->intc, PP_I2C_IRQ), 0);
+        value &= ~PP_WHEEL_STATUS_RX;
+    }
 
     if (offset < sizeof(nms->wheel_regs)) {
         nms->wheel_regs[offset / 4] = value;
@@ -544,6 +523,24 @@ static void ipod_video_key_event(void *opaque, int keycode)
     case 0x1f: bit = PP_WHEEL_PLAY;   break;   /* s */
     case 0x20: bit = PP_WHEEL_RIGHT;  break;   /* d */
     case 0x1c: bit = PP_WHEEL_SELECT; break;   /* enter */
+
+    /*
+     * Turning the wheel. Both the press and the release step it, so one
+     * keystroke is four clicks: enough for Rockbox to call it a scroll, and
+     * frequent enough that its 150 ms untouch timeout never fires and resets
+     * the accumulator.
+     */
+    case 0x12:                                 /* e: clockwise */
+    case 0x10:                                 /* q: anticlockwise */
+        nms->wheel_position += (keycode & 0x7f) == 0x12
+                             ? PP_WHEEL_STEP
+                             : PP_WHEEL_CLICKS - PP_WHEEL_STEP;
+        nms->wheel_position %= PP_WHEEL_CLICKS;
+        nms->wheel_touched = true;
+        nms->wheel_pending = true;
+        qemu_set_irq(qdev_get_gpio_in(nms->intc, PP_I2C_IRQ), 1);
+        return;
+
     default: return;
     }
 
@@ -552,6 +549,10 @@ static void ipod_video_key_event(void *opaque, int keycode)
     } else {
         nms->wheel_buttons |= bit;
     }
+
+    /* A change is a new packet: latch the status bit and interrupt. */
+    nms->wheel_pending = true;
+    qemu_set_irq(qdev_get_gpio_in(nms->intc, PP_I2C_IRQ), 1);
 }
 
 /*
@@ -988,28 +989,18 @@ static void ipod_video_machine_init(MachineState *machine)
      * timings there, and none of that changes what a read returns.
      */
     /*
-     * Cover the whole IDE window, not just the registers below the task file.
-     * The controller has more in it than the parts we model -- DMA control,
-     * more status -- and leaving those addresses unmapped turns every stray
-     * access into a data abort, which with no vector table installed takes the
-     * CPU somewhere it never comes back from. This sits underneath and the
-     * task file is layered on top.
+     * The disk. The task file is standard ATA with the registers four bytes
+     * apart, but the PP wraps it in its own configuration, timing and DMA
+     * registers, and the application needs that DMA: the Rockbox bootloader
+     * reads with READ MULTIPLE, the app issues READ DMA. So the whole window
+     * is one device rather than the generic mmio-ide with a stub beside it.
      */
-    MemoryRegion *ide_cfg = g_new(MemoryRegion, 1);
-    memory_region_init_io(ide_cfg, NULL, &pp502x_ide_cfg_ops, nms,
-                          "pp502x.ide-cfg", 0x1000);
-    memory_region_add_subregion(sysmem, IDE_MEM_BASE, ide_cfg);
-
-    DeviceState *ide = qdev_new(TYPE_MMIO_IDE);
-    qdev_prop_set_uint32(ide, "shift", 2);
+    DeviceState *ide = qdev_new(TYPE_PP502X_IDE);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ide), &error_fatal);
     sysbus_connect_irq(SYS_BUS_DEVICE(ide), 0,
-                       qemu_allocate_irq(pp502x_ide_irq, nms, 0));
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(ide), 0,
-                            IDE_MEM_BASE + IDE_TASKFILE_OFF, 1);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(ide), 1,
-                            IDE_MEM_BASE + IDE_CONTROL_OFF, 1);
-    mmio_ide_init_drives(ide, drive_get(IF_IDE, 0, 0), NULL);
+                       qdev_get_gpio_in(nms->intc, PP_IDE_IRQ));
+    sysbus_mmio_map(SYS_BUS_DEVICE(ide), 0, IDE_MEM_BASE);
+    pp502x_ide_init_drive(ide, drive_get(IF_IDE, 0, 0));
 
     ipod_video_load_image(machine, nms);
 

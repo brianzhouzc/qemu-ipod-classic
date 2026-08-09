@@ -104,6 +104,8 @@
 /* IRQ numbers from pp5020.h. The high bank starts at 32. */
 #define PP_IDE_IRQ          23
 #define PP_SER0_IRQ         (32 + 4)
+/* The click wheel shares the I2C line; see button-clickwheel.c. */
+#define PP_I2C_IRQ          (32 + 8)
 
 /* Identity read back by each core so it can tell which one it is. */
 #define PP_PROC_ID_CPU      0x55
@@ -138,9 +140,6 @@ typedef struct {
     uint32_t timer1_cfg;
     uint32_t timer2_cfg;
     uint32_t hw_revision;
-    uint32_t ide_cfg;
-    uint32_t ide_timing[8];
-    bool ide_intrq;
     DeviceState *intc;
     QEMUTimer *timer1;
     QEMUTimer *timer2;
@@ -154,6 +153,9 @@ typedef struct {
     uint32_t gpio_regs[1024];
     uint32_t wheel_regs[1024];
     uint32_t wheel_buttons;
+    bool wheel_pending;
+    bool wheel_touched;
+    uint32_t wheel_position;
     uint32_t clock_regs[1024];
     uint32_t dev_regs[1024];
 } IPodVideoMachineState;

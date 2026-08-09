@@ -112,10 +112,10 @@ particiones de la imagen, el FAT32 (512 B/sector, 2 FATs, `FATsz32 = 4033`,
 `dataclusters ≈ 516190`, muy por encima del mínimo de 65525 de
 `fat_mount_internal`), y `BPB_HiddSec = 0`, que Rockbox no mira.
 
-### Siguiente: motor de DMA del IDE del PP502x
+### Resuelto: motor de DMA del IDE del PP502x
 
-En el PP502x el DMA no es bus-master PCI, son registros propios del bloque IDE,
-justo la zona que hoy tenemos como stub. De `ata-target.h` y `ata-pp5020.c`:
+En el PP502x el DMA no es bus-master PCI, son registros propios del bloque IDE.
+De `ata-target.h` y `ata-pp5020.c`:
 
 | Registro | Dirección | Función |
 |---|---|---|
@@ -124,27 +124,83 @@ justo la zona que hoy tenemos como stub. De `ata-target.h` y `ata-pp5020.c`:
 | `IDE_DMA_LENGTH` | `0xC3000408` | bytes **menos 4** |
 | `IDE_DMA_ADDR` | `0xC300040C` | dirección física destino |
 
-Secuencia que ejecuta el driver:
+La dirección y la longitud se programan **antes** del comando ATA y el bit de
+arranque **después**, así que `start_dma` solo puede guardar el callback que le
+pasa el núcleo IDE; es la escritura del bit 0 la que dispara la transferencia.
+Es el mismo reparto que usa el IDE bus-master de PCI, por el mismo motivo.
 
-```
-IDE0_CFG |= 8              /* limpia INTRQ pendiente */
-IDE_DMA_CONTROL |= 2
-IDE_DMA_LENGTH = bytes - 4
-IDE_DMA_ADDR = addr        /* +DRAM_START si addr < DRAM_START */
-IDE_DMA_CONTROL |= 8       /* lectura */
-IDE0_CFG |= 0x8000
-<comando ATA 0xc8>
-IDE_DMA_CONTROL |= 1       /* <- esto es lo que arranca la transferencia */
-poll IDE0_CFG & 8          /* espera la interrupcion */
-IDE0_CFG &= ~0x8000; IDE_DMA_CONTROL &= ~0x80000001
+Está en `hw/arm/ipod_video/ipod_video_ide.c`, un dispositivo `pp502x-ide` que
+se queda con toda la ventana `0xc3000000`–`0xc3000fff`: el task file, los
+registros de configuración y temporización, y el DMA. Sustituye al `mmio-ide`
+genérico más el stub que había al lado.
+
+Una trampa que costó un ciclo: `ide_bus_init_output_irq()` **termina** con
+`bus->dma = &ide_dma_nop`. Si reclamas el bus antes de llamarla, se pierde sin
+ningún aviso y todos los comandos DMA se aceptan y se ignoran. Hay que
+asignarlo después.
+
+`INTRQ` es un **pestillo**, no un espejo de la línea de interrupción: durante el
+DMA el firmware nunca lee el estado ATA (hacerlo "causes failures and hangs"),
+así que ese bit es su única señal de fin. Se pone en el flanco de subida y se
+borra escribiendo un uno.
+
+### El click wheel: dos cosas más
+
+Con el disco montado, Rockbox arrancaba entero pero no respondía a las teclas.
+En el PP la rueda es **por interrupción**, no por sondeo: `ipod_4g_button_read()`
+solo se llama desde `ipod_4g_button_int()`, y ni siquiera mira los datos si no
+hay un bit de estado puesto:
+
+```c
+if ((inl(0x7000c104) & 0x04000000) != 0) {
+    unsigned status = CLICKWHEEL_DATA;   /* 0x7000c140 */
+    ...
+}
+/* y el handler reconoce con: */
+outl(inl(0x7000c104) | 0x0c000000, 0x7000c104);
 ```
 
-Lo importante para el modelo: la dirección y la longitud se programan **antes**
-del comando ATA, y el bit de arranque se escribe **después**. Así que hay que
-implementar un `IDEDMAOps` propio (como hacen `hw/ide/macio.c` o `hw/ide/via.c`)
-en el que `start_dma` solo guarde el callback, y sea la escritura del bit 0 de
-`IDE_DMA_CONTROL` la que lo dispare. Al terminar, subir la línea de interrupción
-para que `IDE0_CFG` bit 3 se ponga — eso ya lo hace `pp502x_ide_irq()`.
+Así que una pulsación tiene que hacer dos cosas: poner el bit 26 de `0x7000c104`
+y levantar la interrupción de la rueda, que en este SoC es **la línea de I²C del
+banco alto** (`I2C_IRQ = 32+8`). Sin las dos, el firmware no lee la rueda jamás.
+
+El giro va en el mismo paquete: bit 30 = rueda tocada, posición en los bits
+16..22, 96 clics por vuelta, el sentido horario incrementa. Rockbox exige
+`WHEEL_SENSITIVITY` (4) clics acumulados para mover la selección un ítem, así
+que cada evento de tecla avanza dos y una pulsación completa (presionar +
+soltar) mueve exactamente uno.
+
+## Estado: se navega el menú
+
+`tools/ipod_video/navtest.sh` lo comprueba solo: arranca, sale de *Now Playing*
+con MENU, gira la rueda y selecciona, capturando la pantalla en cada paso.
+
+| Fotograma | Resultado |
+|---|---|
+| arranque | pantalla *Now Playing* con tema, carátula, barra de progreso y batería |
+| MENU | menú principal: Files / Database / Now Playing / Settings / Recording / Playlists / Plugins / System |
+| rueda horaria ×2 | la barra de selección baja de *Now Playing* a *Settings* y luego a *Recording* |
+| SELECT | entra en *Recording* (Time, Size, Volume −28 dB, Gain) |
+| rueda antihoraria ×3 | la selección vuelve a subir |
+
+Detalle real, no fallo del modelo: **la primera pulsación después de cambiar de
+sentido no mueve nada**. Rockbox reinicia su acumulador al cambiar de
+dirección, así que se come esos cuatro clics. Se ve en las cifras del test: el
+fotograma siguiente al cambio de sentido difiere ~2 300 píxeles (solo el ticker
+del título, que se desplaza solo) y el siguiente ya ~14 000 (la barra movida).
+
+Ojo con eso al medir: la pantalla *Now Playing* se anima sola, así que una
+diferencia pequeña de píxeles **no prueba nada**. Solo vale la barra movida.
+
+### Lo que sigue sin modelar
+
+- **El COP.** `core_thread_init()` despierta al segundo núcleo y se duerme
+  esperándolo; como nuestro `sleep_core` no duerme, el CPU sigue y arranca
+  igual, pero todo lo que Rockbox programe en el COP no se ejecuta.
+- **Audio.** El I²S y el códec no están; la reproducción no suena.
+- **Escritura por DMA.** Solo se ha ejercitado la lectura. El camino de
+  escritura está implementado pero no probado.
+- **La rueda no genera "untouch"**: una vez tocada se queda tocada.
 
 ## Estrategia (iPod classic 6G)
 
