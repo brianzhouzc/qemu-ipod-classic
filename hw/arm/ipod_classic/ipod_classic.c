@@ -28,6 +28,8 @@
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
+#include "semihosting/semihost.h"
 
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
@@ -55,6 +57,32 @@ static void ipod_classic_cpu_setup(MachineState *machine, MemoryRegion **sysmem,
     object_unref(cpuobj);
 }
 
+/*
+ * Reproduce what the bootrom leaves in the top of IRAM1 before it jumps into
+ * the OS image. See the S5L8702_SYSINFO_* comments in the machine header for
+ * the disassembly each field comes from.
+ *
+ * Written on every reset, not just at startup, because it lives in RAM the
+ * guest is free to overwrite and because a guest-requested reboot (SWRCON)
+ * has to come back to a machine that looks freshly powered on.
+ */
+static void ipod_classic_write_bootinfo(IPodClassicMachineState *nms)
+{
+    uint32_t sysinfo[S5L8702_SYSINFO_SIZE / 4] = {
+        [S5L8702_SYSINFO_HW_ID_OFF / 4]     = cpu_to_le32(S5L8702_HW_ID),
+        [S5L8702_SYSINFO_DRAM_SIZE_OFF / 4] = cpu_to_le32(SDRAM_MEM_SIZE),
+        [S5L8702_SYSINFO_DRAM_BASE_OFF / 4] = cpu_to_le32(SDRAM_MEM_BASE),
+    };
+    uint32_t tag = cpu_to_le32(S5L8702_SYSINFO_MAGIC);
+    uint32_t ptr = cpu_to_le32(S5L8702_SYSINFO_BASE);
+    uint8_t zero[0x100] = { 0 };
+
+    cpu_physical_memory_write(S5L8702_BOOTINFO_BASE, zero, sizeof(zero));
+    cpu_physical_memory_write(S5L8702_SYSINFO_BASE, sysinfo, sizeof(sysinfo));
+    cpu_physical_memory_write(S5L8702_BOOTINFO_TAG, &tag, sizeof(tag));
+    cpu_physical_memory_write(S5L8702_BOOTINFO_PTR, &ptr, sizeof(ptr));
+}
+
 static void ipod_classic_cpu_reset(void *opaque)
 {
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE((MachineState *)opaque);
@@ -62,6 +90,7 @@ static void ipod_classic_cpu_reset(void *opaque)
 
     cpu_reset(cs);
     cpu_set_pc(cs, nms->reset_pc);
+    ipod_classic_write_bootinfo(nms);
 }
 
 static void ipod_classic_memory_setup(MachineState *machine,
@@ -174,12 +203,41 @@ static void ipod_classic_set_bootrom_path(Object *obj, const char *value,
     g_strlcpy(nms->bootrom_path, value, sizeof(nms->bootrom_path));
 }
 
+static bool ipod_classic_get_semihosting(Object *obj, Error **errp)
+{
+    return IPOD_CLASSIC_MACHINE(obj)->semihosting;
+}
+
+static void ipod_classic_set_semihosting(Object *obj, bool value, Error **errp)
+{
+    IPOD_CLASSIC_MACHINE(obj)->semihosting = value;
+}
+
 static void ipod_classic_instance_init(Object *obj)
 {
     object_property_add_str(obj, "bootrom", ipod_classic_get_bootrom_path,
                             ipod_classic_set_bootrom_path);
     object_property_set_description(obj, "bootrom",
                                     "Path to the S5L8702 bootrom binary");
+
+    /*
+     * Apple's retailOS is built against ARM's own C library with the
+     * semihosting retarget left in: 131 "svc 0x123456" sites in the image,
+     * 115 of them preceded by "mov r0, #4", which is SYS_WRITE0. It also ships
+     * RTXCbug, the RTXC kernel's interactive debugger, whose prompt strings
+     * ("** RTXCbug - ", "RTXCbug> ", "Bad command") sit at 0x0827bd79 and are
+     * printed the same way. With semihosting off those SVCs go to a vector the
+     * firmware may not have installed and the machine dies quietly; with it on
+     * the firmware tells us what it thinks is wrong. Costs nothing when
+     * nothing is printed, so it is on by default.
+     */
+    IPOD_CLASSIC_MACHINE(obj)->semihosting = true;
+    object_property_add_bool(obj, "semihosting", ipod_classic_get_semihosting,
+                             ipod_classic_set_semihosting);
+    object_property_set_description(obj, "semihosting",
+        "Answer ARM semihosting calls (SVC 0x123456). Apple's retailOS prints "
+        "its diagnostics through them. Turn it off to see the firmware take "
+        "the SVC vector instead.");
 }
 
 static inline qemu_irq s5l8702_get_irq(IPodClassicMachineState *s, int n)
@@ -227,6 +285,35 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.adm",      ADM_MEM_BASE,      0x100000 },
 };
 
+/*
+ * Everything in the peripheral window that is not one of the blocks above.
+ * Same behaviour as create_unimplemented_device(), but one region for the
+ * whole window and at a lower priority so the named blocks stay on top.
+ */
+static uint64_t ipod_classic_io_floor_read(void *opaque, hwaddr offset,
+                                           unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "s5l8702.io: read  (size %d, addr 0x%08" PRIx64
+                  ")\n", size, (uint64_t)(IO_WINDOW_BASE + offset));
+    return 0;
+}
+
+static void ipod_classic_io_floor_write(void *opaque, hwaddr offset,
+                                        uint64_t value, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "s5l8702.io: write (size %d, addr 0x%08" PRIx64
+                  ", value 0x%" PRIx64 ")\n", size,
+                  (uint64_t)(IO_WINDOW_BASE + offset), value);
+}
+
+static const MemoryRegionOps ipod_classic_io_floor_ops = {
+    .read = ipod_classic_io_floor_read,
+    .write = ipod_classic_io_floor_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+};
+
 static void ipod_classic_machine_init(MachineState *machine)
 {
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(machine);
@@ -234,6 +321,10 @@ static void ipod_classic_machine_init(MachineState *machine)
     AddressSpace *nsas;
     ARMCPU *cpu;
     DeviceState *dev;
+
+    if (nms->semihosting) {
+        qemu_semihosting_enable();
+    }
 
     ipod_classic_cpu_setup(machine, &sysmem, &cpu, &nsas);
     nms->cpu = cpu;
@@ -267,10 +358,11 @@ static void ipod_classic_machine_init(MachineState *machine)
 
     nms->vic1->daisy = nms->vic0;
 
-    /* Clock/PLL block. Pure register file, reused from the iPod Touch model. */
-    dev = qdev_new("ipodtouch.clock");
-    nms->clock0 = IPOD_TOUCH_CLOCK(dev);
-    memory_region_add_subregion(sysmem, CLOCK0_MEM_BASE, &nms->clock0->iomem);
+    /* Clock and PLL block. */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_CLK);
+    nms->clock0 = IPOD_CLASSIC_CLK(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, CLOCK0_MEM_BASE);
 
     /*
      * Timers. Channels A..D share IRQ 8 and E..H share IRQ 7; Rockbox drives
@@ -294,6 +386,20 @@ static void ipod_classic_machine_init(MachineState *machine)
                                     ipod_classic_unimplemented[i].base,
                                     ipod_classic_unimplemented[i].size);
     }
+
+    /*
+     * A floor under the whole peripheral window. The retailOS maps
+     * 0x38000000..0x3fffffff as one 768 MB uncached identity range in the page
+     * table it builds at 0x22004534, so a register we have not listed above is
+     * not a harmless zero read: it is a data abort, taken through a handler
+     * that lives in DRAM and will cascade. Priority -2000 puts it below the
+     * per-block windows, which are themselves at -1000.
+     */
+    MemoryRegion *io_floor = g_new(MemoryRegion, 1);
+    memory_region_init_io(io_floor, NULL, &ipod_classic_io_floor_ops, NULL,
+                          "s5l8702.io", IO_WINDOW_SIZE);
+    memory_region_add_subregion_overlap(sysmem, IO_WINDOW_BASE, io_floor,
+                                        -2000);
 
     qemu_register_reset(ipod_classic_cpu_reset, nms);
 }

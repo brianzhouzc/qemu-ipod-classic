@@ -15,8 +15,8 @@
 #include "hw/arm/boot.h"
 #include "ui/console.h"
 #include "cpu.h"
-#include "hw/arm/ipod_touch_clock.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
+#include "hw/arm/ipod_classic/ipod_classic_clk.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 
@@ -42,6 +42,14 @@
  */
 #define BOOTROM_MEM_BASE  0x00000000
 #define BOOTROM_MEM_SIZE  0x00020000
+
+/*
+ * The peripheral window. The retailOS maps all 768 MB of it as one uncached
+ * identity section in its page table (0x22004534), so every address in here
+ * has to answer: an unmapped one is a data abort, not a zero read.
+ */
+#define IO_WINDOW_BASE    0x38000000
+#define IO_WINDOW_SIZE    0x08000000
 
 /* Peripherals, IO_BASE 0x38000000. */
 #define SHA1_MEM_BASE     0x38000000   /* SHA1_BASE */
@@ -114,6 +122,64 @@
 #define S5L8702_NANDECC_IRQ  43
 #define S5L8702_MMC_IRQ      44
 
+/*
+ * The parameter block the bootrom leaves behind, in the last 256 bytes of
+ * IRAM1. Skipping the bootrom means we owe the firmware everything that block
+ * would have contained; see wiki/11-classic6g-retailos.md for how each field
+ * below was found.
+ *
+ *   +0x00  eight bytes naming the image that should run: "retailOS",
+ *          "diskmode", "diskscan", "softupdt" or "--------". The retailOS
+ *          writes it (0x0827a8d4) before asking for a reboot, and the bootrom
+ *          is what reads it back. VERIFIED as a writer; nothing in the osos
+ *          reads it, so what the bootrom expects at power-on is UNDETERMINED
+ *          and we leave it zero.
+ *   +0x18  'IsyS' if what follows is valid
+ *   +0x1c  pointer to a 288-byte SysInfo struct
+ *
+ * 0x0827a904 is the whole accessor: "return 0x2203ff00 + N". 0x08323aec is the
+ * only caller, asking for N = 24, comparing 'IsyS' and memcpy()ing 0x120 bytes
+ * from the pointer into its own bss at 0x0896d6fc.
+ */
+#define S5L8702_BOOTINFO_BASE     0x2203ff00
+#define S5L8702_BOOTINFO_TAG      (S5L8702_BOOTINFO_BASE + 0x18)
+#define S5L8702_BOOTINFO_PTR      (S5L8702_BOOTINFO_BASE + 0x1c)
+#define S5L8702_SYSINFO_MAGIC     0x53797349   /* 'IsyS' */
+#define S5L8702_SYSINFO_SIZE      0x120
+
+/*
+ * Where we put the struct itself. ASSUMED: the real bootrom's address for it
+ * is unknown, and nothing in the osos cares -- it only ever follows the
+ * pointer. Parking it immediately below the parameter block keeps both in the
+ * same 512 bytes at the top of IRAM1, away from anything the firmware uses.
+ */
+#define S5L8702_SYSINFO_BASE      (S5L8702_BOOTINFO_BASE - S5L8702_SYSINFO_SIZE)
+
+/*
+ * The three fields of that struct the boot path actually reads.
+ *
+ *   +0x84  hardware id. 0x0827a188 demands (id >> 16) == 19 and 0x083286d4
+ *          reboots into "softupdt" when it is anything else, so this one is
+ *          not optional and its value is not a guess. 19 == 0x13 also matches
+ *          the HwVr entry of the SysCfg block in this device's own NOR
+ *          (assets/classic6g/bootflash_nor_1MB.bin, offset 0x5c).
+ *   +0xe0  DRAM size, +0xe4 DRAM base. 0x22004534 maps
+ *          [+0xe4 .. +0xe4 + +0xe0) as cached identity in the page table it
+ *          builds, and 0x080634c4 hands +0xe4 + +0xe0 to the heap as the top
+ *          of memory. Zeros there produce an identity map over all 4 GB that
+ *          wipes out the VA 0 -> IRAM0 entry, and a heap whose top is below
+ *          its base.
+ *
+ * Everything else stays zero on purpose. 0x08323aa4's callers also read +0x18,
+ * +0x38, +0x3c, +0x48, +0x4c, +0x94, +0xe8 and +0x104; what those mean is
+ * UNDETERMINED, and filling them from a plausible-looking guess would be
+ * inventing with the appearance of rigour.
+ */
+#define S5L8702_SYSINFO_HW_ID_OFF     0x84
+#define S5L8702_SYSINFO_DRAM_SIZE_OFF 0xe0
+#define S5L8702_SYSINFO_DRAM_BASE_OFF 0xe4
+#define S5L8702_HW_ID                 0x00130000
+
 typedef struct {
     MachineClass parent;
 } IPodClassicMachineClass;
@@ -125,9 +191,10 @@ typedef struct {
     ARMCPU *cpu;
     PL192State *vic0;
     PL192State *vic1;
-    IPodTouchClockState *clock0;
+    IPodClassicClkState *clock0;
     IPodClassicTimerState *timer;
     Clock *sysclk;
+    bool semihosting;
     /*
      * Where the CPU starts executing after reset. Either BOOTROM_MEM_BASE when
      * a bootrom is supplied, or SDRAM_MEM_BASE when a raw image is loaded with
