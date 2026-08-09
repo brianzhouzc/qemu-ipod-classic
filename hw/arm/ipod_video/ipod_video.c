@@ -46,6 +46,7 @@
 #include "hw/arm/ipod_video/ipod_video_ide.h"
 #include "hw/arm/ipod_video/ipod_video_i2c.h"
 #include "hw/arm/ipod_video/ipod_video_pcf50605.h"
+#include "hw/arm/ipod_video/ipod_video_dma.h"
 #include "hw/i2c/i2c.h"
 #include "sysemu/blockdev.h"
 #include "hw/qdev-properties.h"
@@ -1265,6 +1266,27 @@ static void ipod_video_machine_init(MachineState *machine)
      */
     serial_mm_init(sysmem, SER0_MEM_BASE, 2, NULL, 115200, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
+
+    /*
+     * The two DMA blocks. They sit inside the pp502x.soc-regs floor, so they
+     * go in at a higher overlap priority rather than beside it.
+     *
+     * Block A is the one Apple uses to push the Broadcom's firmware into the
+     * chip; block B is the one Rockbox documents and uses for audio. Both are
+     * wired because the retailOS's boot sweep touches both and its driver
+     * builds channels on both.
+     */
+    static const struct { hwaddr base; int irq; } dma_blocks[] = {
+        { DMA_A_MEM_BASE, PP_DMA_A_IRQ },
+        { DMA_B_MEM_BASE, PP_DMA_B_IRQ },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(dma_blocks); i++) {
+        DeviceState *dma = qdev_new(TYPE_PP502X_DMA);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dma), &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dma), 0,
+                           qdev_get_gpio_in(nms->intc, dma_blocks[i].irq));
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dma), 0, dma_blocks[i].base, 1);
+    }
 
     /*
      * The panel hangs off a Broadcom companion chip rather than off the SoC,

@@ -230,7 +230,15 @@
 #define PROC_CTL_MEM_BASE   0x60007000   /* CPU_CTL +0x00, COP_CTL +0x04 */
 #define CACHE_CTL_MEM_BASE  0x6000c000   /* includes CACHE_CTL_VECT_REMAP */
 #define GPIO_MEM_BASE       0x6000d000
-#define DMA_MEM_BASE        0x6000a000
+/*
+ * Two DMA blocks, identical register for register. Only the second is in
+ * pp5020.h (DMA_MASTER_CONTROL 0x6000a000, DMA0..3 at 0x6000b000); the first
+ * is documented by nothing but Apple's own firmware, which loads 0x60008000 at
+ * 0x1da198 and hangs two channels off it. Each block's master page is at the
+ * base and its channels 0x1000 higher.
+ */
+#define DMA_A_MEM_BASE      0x60008000
+#define DMA_B_MEM_BASE      0x6000a000
 #define IDE_MEM_BASE        0xc3000000   /* the disk, IDE_IRQ 23 */
 /*
  * ATA_DATA..ATA_COMMAND live at IDE_BASE + 0x1e0 four bytes apart and
@@ -269,6 +277,19 @@
 
 /* IRQ numbers from pp5020.h. The high bank starts at 32. */
 #define PP_IDE_IRQ          23
+/*
+ * DMA_IRQ in pp5020.h is 26, and it belongs to the block that header
+ * documents, which is the one at 0x6000a000. The other block's line is 27, and
+ * that comes from the retailOS rather than from Rockbox, which never saw the
+ * block at all: 0x1d98d0 registers block B's handler under the firmware's own
+ * interrupt index 27 and block A's under 28, and the table built at 0x1fcaa0
+ * translates index 27 to hardware line 26 (0x1fcc38) and index 28 to line 27
+ * (0x1fcc44). Index 27 landing on Rockbox's documented DMA_IRQ is what makes
+ * the pair trustworthy; a running machine agrees, with CPU_INT_EN_STAT reading
+ * 0xcc002017 -- lines 26 and 27 enabled, 28 not.
+ */
+#define PP_DMA_B_IRQ        26
+#define PP_DMA_A_IRQ        27
 #define PP_SER0_IRQ         (32 + 4)
 /* The click wheel shares the I2C line; see button-clickwheel.c. */
 #define PP_I2C_IRQ          (32 + 8)
