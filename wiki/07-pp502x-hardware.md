@@ -513,3 +513,42 @@ Tres hipótesis planteadas sobre este mismo assert, tres retiradas:
 Lo verificado y sólido, que no cambia: el sistema cree que hay cero bytes de
 RAM porque la global 28 vale cero, y el assert de la línea 231 salta. Lo que
 falta es encontrar quién debería escribirla.
+
+
+## El retailOS de Apple: dónde se para exactamente (2026-08-08)
+
+Con la cadena del chip corregida (ver el commit de `PP_VER1`), el firmware pasa
+el assert del tamaño de RAM y llega mucho más lejos. Se para aquí, y la traza
+lo deja sin ambigüedad:
+
+
+
+El vector SWI en `+0x08` es `e59ff0dc` = `ldr pc,[pc,#0xdc]`, que carga la
+dirección del manejador desde `+0xec`. Ese literal vale **`0x40000008`**:
+IRAM. Y la IRAM está entera a ceros, así que la CPU hace un NOP sled por ella
+hasta tropezar.
+
+Es decir: **el firmware espera encontrar sus manejadores de excepción ya
+instalados en IRAM antes de hacer su primera llamada al sistema.** Nadie los
+pone ahí en nuestro modelo.
+
+Lo que falta averiguar es quién debería ponerlos:
+
+1. El propio `osos`, en algún punto de su ruta de reset que no estamos
+   recorriendo o que falla antes en silencio.
+2. La ROM de arranque del PP, que nos saltamos entera. Si es esto, **el volcado
+   de la flash pasa a ser necesario** — y esta vez como conclusión derivada de
+   la traza, no como corazonada.
+
+La forma de distinguirlo es buscar en el binario una copia hacia `0x40000000`:
+un bucle de `ldmia`/`stmia` con `0x40000000` como destino, o una escritura de
+literales a esa base. Si no existe ninguna, la respuesta es la ROM.
+
+### Método
+
+Los cuatro obstáculos de esta fase se resolvieron igual: **desensamblar el
+binario en la dirección que señala la traza**, en lugar de razonar sobre qué
+periférico podría faltar. Las tres hipótesis que se plantearon sobre el
+hardware —flash en blanco, bloque de parámetros de la ROM, el COP— fallaron
+las tres. Los literales `"PP5020A "` estaban a la vista, doce bytes después
+de la comparación que los usa.
