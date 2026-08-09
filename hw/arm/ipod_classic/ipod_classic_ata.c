@@ -175,6 +175,15 @@ static uint64_t ipod_classic_ata_read(void *opaque, hwaddr offset,
         return s->reg[offset / 4] | S5L8702_ATA_CONTROL_CLOCKDOWN;
 
     case S5L8702_ATA_PIO_READY:
+        /*
+         * Bit 1 is hardwired set: a cycle may always be started, because ours
+         * completes inside the store or load that begins it and there is no
+         * window in which the bridge could be busy. That is a simplification
+         * of real hardware, not something read off a driver -- but reporting
+         * busy here has no upside and both drivers spin on it without a
+         * timeout. Bit 0 is the real state: it goes up when a read cycle has
+         * latched a result and down when ATA_PIO_RDATA takes it.
+         */
         return S5L8702_ATA_READY_CYCLE |
                (s->rdata_valid ? S5L8702_ATA_READY_RDATA : 0);
 
