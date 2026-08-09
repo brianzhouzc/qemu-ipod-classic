@@ -540,9 +540,18 @@ Lo que falta averiguar es quién debería ponerlos:
    de la flash pasa a ser necesario** — y esta vez como conclusión derivada de
    la traza, no como corazonada.
 
-La forma de distinguirlo es buscar en el binario una copia hacia `0x40000000`:
-un bucle de `ldmia`/`stmia` con `0x40000000` como destino, o una escritura de
-literales a esa base. Si no existe ninguna, la respuesta es la ROM.
+La forma de distinguirlo es buscar en el binario referencias a `0x40000000`.
+**Las hay**: 139 literales alineados a palabra, el primero en `0x7f7b4`. Y
+`0x40000008` aparece dos veces alineado — en `0xec` (el vector SWI) y en
+`0x53f508`.
+
+Eso inclina la balanza hacia la **hipótesis 1**: el `osos` sí tiene código que
+toca la base de IRAM, así que probablemente es él quien debería instalar los
+manejadores y no llega a hacerlo. Queda por comprobar si alguna de esas
+referencias es realmente una copia de la tabla de vectores, y en qué punto del
+arranque debería ejecutarse respecto a la primera llamada al sistema en
+`0xe9b98`. La segunda aparición de `0x40000008` en `0x53f508` es el sitio por
+donde empezar a mirar.
 
 ### Método
 
