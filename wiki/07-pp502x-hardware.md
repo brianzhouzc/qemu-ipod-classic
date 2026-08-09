@@ -240,30 +240,152 @@ Cómo se detectó: `bootloader/ipod.c` dice que `"portalplayer"` está en
 
 Todo lo anterior es la vía de Rockbox, que ya arranca hasta el menú (ver
 [04-roadmap.md](04-roadmap.md)). El firmware original de Apple es una vía
-aparte y sigue atascada donde estaba.
+aparte, y ahora sabemos exactamente por qué no arranca.
 
-### Dónde se queda (2026-08-06)
+### El síntoma
 
-Con el remapeo MMAP y el suelo de registros, el firmware de Apple ejecuta
-código real y extenso por todo su espacio: `0x82694`, `0x7d080`,
-`0x144cc8`, `0x10c360`, `0x25f77c`, `0x90494`, `0xf23bc`, `0xe9b98`.
-
-Se detiene en la instrucción de `0xe9b98`:
+Con `-M iPod-Video,entry=0` la pantalla se queda negra (0 píxeles encendidos) y
+solo se traducen 266 bloques, frente a ~3700 de Rockbox. La secuencia de
+excepciones es:
 
 ```
-0x000e9b98:  ef123456      svc 0x123456
+Taking exception 2 [SVC]
+Taking exception 1 [Undefined Instruction]
+Invalid write at addr 0xFFFFFFC8 ... rejected
+Taking exception 4 [Data Abort]        <- en bucle infinito
 ```
 
-Una llamada al sistema. QEMU la vectoriza bien a `0x08`, donde el
-`ldr pc,[pc,#0xdc]` de la tabla de vectores del propio firmware lleva a su
-manejador. El manejador arranca y **hace push a una pila de modo supervisor
-que nunca se inicializó**: la falta resultante es una escritura en
-`0xffffffc8`, o sea SP envuelto desde cero.
+Eso es el **final** de la historia, no el principio. Trazando hacia atrás:
 
-Eso ya no es un hueco en el mapa de memoria. Es que el firmware llega a esa
-ruta sin haber pasado por el código que configura las pilas de cada modo, o
-bien las configura en algo que todavía no modelamos correctamente.
+### La cadena, de atrás hacia delante
 
-Siguiente paso: trazar hacia atrás desde `0xe9b98` para ver qué camino lleva
-ahí, y comparar con la ruta de inicialización que el firmware debería haber
-recorrido antes.
+El vector SWI del propio retailOS, en la tabla de vectores de la imagen:
+
+```
++08: e59ff0dc   ldr pc, [pc, #0xdc]   -> literal en 0xEC = 0x40000008
+```
+
+O sea que su manejador de SWI vive en **IRAM**, que en nuestra máquina está
+vacía. Al hacer el SVC, el CPU salta a IRAM en blanco, camina hacia delante
+por los ceros hasta tropezar con una instrucción indefinida, y el manejador de
+esa excepción hace `push` sobre una pila que nunca se montó: `0xFFFFFFC8` es el
+puntero de pila envuelto por debajo de cero. De ahí el bucle.
+
+Pero el SVC no es un fallo, es **deliberado**: `0xe9b98` es el reportador de
+fallos del firmware. Cerca están las cadenas `"Type: "` y `"Undefined
+instruction"`, y el propio SVC es `ef123456`, un valor mágico. El firmware ya
+había detectado un problema por software y estaba intentando informarlo.
+
+¿Qué problema? La llamada viene de aquí:
+
+```
+144cc8: movs r3, r0        ; el resultado es cero?
+144cd4: beq  0x10c360      ; si -> reportar fallo
+```
+
+y quien la invoca es un assert con número de línea:
+
+```
+d98: ldr r0, [r4, #0x24]   ; fin calculado de la imagen
+d9c: ldr r1, [r4, #0x20]   ; memoria disponible
+da0: cmp r0, r1
+da8: movhi r1, #231        ; numero de linea
+db0: blhi 0x144cc8         ; si no cabe -> fallo
+```
+
+Leyendo la estructura en ejecución con `xp /16xw 0x40006000`:
+
+```
++0x10 = 0x10000000   DRAM_START
++0x14 = 0x00800000   8 MB
++0x18 = 0x0020e294   tamaño de la imagen
++0x20 = 0x00000000   <- memoria disponible: CERO
++0x24 = 0x00a0e294   fin calculado, ~10 MB
+```
+
+`0xa0e294 > 0`, así que salta. **El firmware cree que el aparato tiene cero
+bytes de RAM.**
+
+### De dónde sale ese cero
+
+`+0x20` es la suma de cuatro búsquedas en una tabla, indexadas por los cuatro
+nibbles de un valor empaquetado (`0xdf8`). La tabla está en `0x16d8` y es de
+tamaños potencia de dos:
+
+| índice | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| tamaño | 0 | 512K | 1M | 2M | 4M | 8M | 16M | 32M | **64M** | 128M |
+
+Es la configuración de bancos de SDRAM: un nibble por banco. El valor
+empaquetado arranca como una constante, `mov fp, #0x700` en `0x1f4`, pero antes
+de usarlo el nibble 2 se sobrescribe (`0xe6c` es un setter de nibble) con un
+campo de una estructura que resulta valer cero.
+
+Y esa estructura nunca se rellena, porque quien la rellena es esto:
+
+```
+95024: ...
+9503c: bl  0xb68
+95040: cmp r0, #0
+95044: beq 0x95064      ; si r0 == 0, salir sin hacer nada
+
+b68:   mov  r0, #0x60000000   ; PROCESSOR_ID
+b6c:   ldrb r0, [r0]
+b70:   cmp  r0, #0xaa         ; soy el COP?
+b74:   movne r0, #0           ; no -> 0
+b78:   moveq r0, #1
+```
+
+### La causa raíz: el retailOS necesita los dos núcleos
+
+`0x95024` **solo hace su trabajo si corre en el COP**. En el CPU sale
+inmediatamente sin tocar nada.
+
+Y no es un caso aislado. La misma imagen corre en los dos núcleos y se bifurca
+nada más arrancar:
+
+```
+240: mov  r0, #0x60000000
+244: ldrb r2, [r0]
+248: cmp  r2, #0x55        ; soy el CPU?
+24c: beq  0x25c            ; si  -> pila del CPU, camino del CPU
+250: ldr  sp, [pc, #168]   ; no -> pila del COP
+254: bl   0x1498           ;        init del COP
+```
+
+Nuestra máquina tiene `mc->max_cpus = 1`, un solo ARM, y
+`pp502x_proc_id_read()` devuelve siempre `PP_PROC_ID_CPU`. El COP no existe, así
+que nunca ejecuta su mitad de la inicialización, y el CPU acaba leyendo ceros
+donde esperaba la configuración de memoria.
+
+**Y esto es justo lo que distingue a Rockbox del retailOS.** Rockbox también
+espera al COP —`core_thread_init()` lo despierta y se duerme esperándolo— pero
+como nuestro `sleep_core` no duerme de verdad, el CPU sigue adelante y arranca
+igual, sacrificando solo lo que Rockbox hubiera programado en el segundo
+núcleo. El retailOS no es tan indulgente: sin el COP no calcula ni el tamaño de
+la RAM.
+
+### Lo que haría falta
+
+Modelar el segundo núcleo de verdad:
+
+- Un segundo ARM en la máquina, `max_cpus = 2`.
+- `PROCESSOR_ID` (`0x60000000`) devolviendo `0x55` o `0xaa` **según qué núcleo
+  lee**, no una constante.
+- `CPU_CTL` / `COP_CTL` (`0x60007000` / `+0x04`) con dormir y despertar reales.
+- El buzón de `0x60001000` (`MBX_MSG_STAT` / `SET` / `CLR`), hoy sin modelar.
+- Los bancos por núcleo del controlador de interrupciones: los registros
+  `COP_INT_EN` y compañía ya existen en el mapa, pero el modelo solo enruta al
+  CPU.
+
+### Lo que NO hace falta, y me equivoqué al suponerlo
+
+Antes de trazar esto planteé como hipótesis que el problema fuese la **flash
+ROM en blanco**, porque el retailOS es el firmware nativo de esa ROM y nosotros
+le damos 1 MB de ceros con una sola palabra dentro. Esa hipótesis **no se
+sostiene**: el firmware no llega ni a mirar la flash antes de morir. El
+bloqueo es el segundo núcleo, y se puede atacar sin pedirle ningún volcado al
+usuario.
+
+La flash seguirá haciendo falta más adelante —`lcd-video.c` saca de ella el
+firmware del Broadcom, sección `vmcs`— pero no es el obstáculo de ahora.
