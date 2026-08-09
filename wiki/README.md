@@ -16,7 +16,7 @@ emCORE, su motor AES suelta el `osos` de Apple en claro por USB. Ver
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Video` | PP5022C | **arranca los dos firmwares del aparato real: Rockbox hasta el menú, y el retailOS de Apple dibujando su interfaz y navegable** |
-| `iPod-Classic` | S5L8702 | ejecuta código; timers e interrupciones verificados. Aún no arranca firmware real, pero **el `osos` ya está descifrado** (2026-08-09) y deja de ser el bloqueo |
+| `iPod-Classic` | S5L8702 | **arranca el retailOS de Apple**: kernel RTXC en marcha, planificador vivo, ATA con DMA leyendo el disco. Se queda en el bucle idle sin llegar a dibujar — ver [11](11-classic6g-retailos.md) |
 
 Para una introducción de una página, empezar por el
 [README de la raíz](../README.md). Para ejecutarlo y probarlo:
@@ -42,6 +42,7 @@ Para una introducción de una página, empezar por el
 | [03-reuse-qemu-ios.md](03-reuse-qemu-ios.md) | Qué modelos de dispositivo de la rama `ipod_touch_2g` se pueden reaprovechar y cuáles hay que escribir de cero. |
 | [08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md) | Correcciones al mapa de memoria, bootrom, cadena de arranque, click wheel, y el **modelo QEMU del S5L8702 que ya existe** en `freemyipod/qemu`. Leerlo antes de escribir nada nuevo del Classic. |
 | [10-classic6g-emcore.md](10-classic6g-emcore.md) | **El aparato real por USB**: el protocolo de emCORE r859 (y por qué los clientes oficiales no funcionan), **el descifrado del `osos` con la clave GID del propio SoC** — el bloqueo fundacional, resuelto —, el volcado de la NOR con su bloque `SCfg`, la prueba de que **la bootrom está bloqueada** y no se puede volcar por esta vía, y la dirección que cuelga el monitor. |
+| [11-classic6g-retailos.md](11-classic6g-retailos.md) | **El retailOS corriendo**: las dos regiones de enlace de la imagen, el bloque sin nombre de `0x3C100000` y por qué no tiene bit de habilitación, los bits de estado del LCD, el puente ATA y su DMA, **el ciclo de caída sin disco y su causa** (una llamada virtual sobre nulo que no falla porque VA 0 está mapeado), dónde se para hoy y qué hipótesis se descartaron con medida. |
 
 ### Transversal
 
