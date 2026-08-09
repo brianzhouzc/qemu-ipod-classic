@@ -665,7 +665,19 @@ static const MemoryRegionOps pp502x_clock_ops = {
  */
 #define PP_VER1_OFF         0x00
 #define PP_VER2_OFF         0x04
-#define PP5022C_VER1        0x32324300   /* '2' '2' 'C' '\0' */
+/*
+ * Apple's firmware compares these eight bytes against "PP5020A " and
+ * "PP5022A " -- the literals at 0x27ead4 and 0x27eae0 in the retailOS -- and
+ * returns 7, 8 or 0. Its caller at 0xf1c then does cmp r0, #4 and picks where
+ * its global variables live: 0x40018000 if it recognised the chip, 0x40007ffc
+ * if it did not. Spelling anything else here sends it to the wrong base, where
+ * every global reads back zero, including the RAM size its assert checks.
+ *
+ * Rockbox's debug screen renders this device as PP5022C, which is where the
+ * earlier value came from. The firmware wants the 'A' form, and the real
+ * device boots it, so that is what the registers have to say.
+ */
+#define PP5022C_VER1        0x32324120   /* '2' '2' 'A' ' ' */
 #define PP5022C_VER2        0x50503530   /* 'P' 'P' '5' '0'  */
 
 static uint64_t pp502x_dev_ctl_read(void *opaque, hwaddr offset, unsigned size)
