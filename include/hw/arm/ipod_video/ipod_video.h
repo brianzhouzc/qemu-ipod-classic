@@ -72,6 +72,86 @@
 #define IRAM_MEM_SIZE       0x00020000
 
 /*
+ * The last 256 bytes of IRAM are the boot ROM's letterbox. iPodLinux's
+ * ipodloader2/ipodhw.c reads a magic word and a pointer from the top of it and
+ * comments that "the last 256 bytes appear to be used for special things by
+ * the Flash ROM":
+ *
+ *     #define SYSINFO_TAG_PP5022 0x4001ff18
+ *     #define SYSINFO_PTR_PP5022 0x4001ff1c
+ *
+ * Apple's firmware agrees to the byte. 0x1084 hands out globals at
+ * IRAM_END - 0x100 + N; 0x13bc asks it for N = 24, reads the pointer at +4 and
+ * compares the word at +0 against 0x53797349 ("IsyS"), which is loaded by
+ * exactly one instruction in the whole image (0x13fc) and only ever compared,
+ * never stored. Nothing in the osos writes either word, so whatever is there
+ * was left by the ROM we skip -- exactly like GPO32_VAL bit 14.
+ */
+#define SYSINFO_TAG_ADDR    0x4001ff18
+#define SYSINFO_PTR_ADDR    0x4001ff1c
+#define SYSINFO_MAGIC       0x53797349   /* "IsyS" */
+
+/*
+ * Where we put the block the pointer points at. The ROM's own choice is not
+ * known -- no dump of it exists -- so this is ours: the 256 bytes immediately
+ * below the letterbox. It is clear of everything the firmware uses early on:
+ * the overlay copied by 0x8392c ends at 0x4001ded4, the reset stack starts at
+ * 0x40003ff8 and grows down, and the scatter-load at 0x83848 stops at
+ * 0x40001554.
+ */
+#define SYSINFO_BLOCK_ADDR  0x4001fe00
+#define SYSINFO_BLOCK_SIZE  0x100
+
+/*
+ * The four fields of it we can account for, and only those. Each one is here
+ * because a disassembly shows the firmware reading that exact offset and what
+ * it does with the answer; the other 240 bytes stay at zero because we do not
+ * know, and guessing them from iPodLinux's sysinfo_t would be inventing with
+ * the appearance of rigour -- that struct does not even agree with this
+ * firmware (it puts sdram_size at +0x80, while what gets read here is +0xe0,
+ * which falls inside a pad iPodLinux never decoded).
+ *
+ *   +0x04  length. 0x281238 reads it, clamps it to 248 and uses it as a
+ *          memcpy count.
+ *
+ *          +0x00 is left alone. iPodLinux's struct starts with its own "IsyS"
+ *          there, but no instruction in this image reads it, so we have
+ *          nothing to go on and write nothing.
+ *
+ *   +0x84  hardware id, model in the top half and revision in the bottom.
+ *          0x26516c reads it out of the installed block; 0x2653a4 shifts the
+ *          top half down and runs it through a 13-entry jump table at
+ *          0x2653c8 that answers 1, 2 or 3; 0x111c58 turns that into one of
+ *          three driver objects and returns null for anything else. Our
+ *          IPOD_VIDEO_HW_REVISION, which came off the real device through
+ *          Rockbox's HW info screen, has 0x000b on top: entry 11, which
+ *          answers 3. Apple's own table having a live entry exactly where the
+ *          device's own revision points is the check that this offset really
+ *          is the hardware id.
+ *
+ *   +0xe0  SDRAM size in bytes. 0x13e8 reads it and hands it to 0xe6c, which
+ *          rounds it down to a power of two against the table at 0x16d8 and
+ *          encodes it as the size of bank 2; 0xdf8 sums the four banks into
+ *          0x40006020.
+ *
+ * The magic itself is not in the block: it is the word beside the pointer, at
+ * SYSINFO_TAG_ADDR. 0x13f8 loads it from there.
+ *
+ * How the block reaches the code that reads +0x84, all verified:
+ *   0x140c   [0x4000608c] = pointer, if the magic matched
+ *   0x2b8    bl 0x1658, memcpy(0x14983060, 0x40006000, 0x90) -- the whole
+ *            memory-config block, pointer included, into DRAM
+ *   0x2bc    bl 0x281224, which reads [0x149830ec] (that pointer), returns
+ *            immediately if it is null, and otherwise copies the block to
+ *            0x108710dc and installs it as the hardware-info singleton
+ *   0x2d0    bl 0x2668c4 -> 0x111c58 -> 0x2653a4 -> 0x265164, which reads
+ *            +0x84 out of the singleton
+ */
+#define SYSINFO_LENGTH_OFF      0x04
+#define SYSINFO_HW_REV_OFF      0x84
+#define SYSINFO_SDRAM_SIZE_OFF  0xe0
+
+/*
  * The PP's NOR flash. It is what address 0 answers to while the bootloader
  * runs; afterwards it is remapped to 0x20000000. Rockbox's hwcompat.h reads
  * the board revision from 0x405c through the first window and 0x2000405c

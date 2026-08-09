@@ -1078,6 +1078,67 @@ static void ipod_video_machine_init(MachineState *machine)
     nms->dev_regs[PP_VER1_OFF / 4] = PP5022C_VER1;
     nms->dev_regs[PP_VER2_OFF / 4] = PP5022C_VER2;
 
+    /*
+     * The other thing the ROM loader leaves behind: the SysInfo pointer in the
+     * top of IRAM. See SYSINFO_PTR_ADDR.
+     *
+     * Apple's firmware sizes its SDRAM in 0x13bc. It starts from a value the
+     * image itself carries -- 0x1f4 does "mov fp, #0x700", whose nibble 2
+     * indexes the table at 0x16d8 to 0x02000000, the right answer for a 5G --
+     * and then throws it away in favour of the byte count it reads from
+     * SysInfo + 0xe0. With no SysInfo the pointer is null, 0x13e8 reads
+     * [0x000000e0] instead, which after the remap is the word 0x00000100 out
+     * of the firmware's own vector table, and 256 bytes rounds down to a bank
+     * of zero. All four banks then read back as empty, 0x40006020 comes to
+     * zero, and the assert at 0xda0 -- "end of image and bss must fit in RAM",
+     * line 231 -- fails with 0x00a0e294 > 0. The firmware prints that itself
+     * once semihosting is on:
+     *
+     *     Type: _sys_exit
+     *     : FFFFFFFF   x4      <- the four bank sizes, "empty"
+     *     : 4001FF18           <- the tag address it was working from
+     *     : 00001424           <- lr, inside 0x13bc after "bl 0xc90"
+     *     : 0000027C           <- lr, inside reset after "bl 0x13bc"
+     *
+     * So we answer the one question the firmware asks: how much DRAM is there.
+     * The value is DRAM_MEM_SIZE rather than a constant, because it is a fact
+     * about this machine and not a number picked to make an assert pass.
+     *
+     * The magic is written too, and that was not obvious: leaving it at zero
+     * gets the firmware past the RAM assert on its own, because 0x13e8
+     * dereferences the pointer before 0x1400 checks the magic. It then dies a
+     * little later, and the reason turns out to be the same block. 0x140c
+     * publishes the pointer in 0x4000608c only when the magic matched, 0x1658
+     * carries that word into DRAM, 0x281224 refuses to install the block
+     * without it, and 0x265164 ends up reading the hardware id out of a bss
+     * object nobody filled in. With the id reading zero, 0x2653a4's jump table
+     * answers "no such machine", 0x111c58 returns a null driver, and 0x2668e4
+     * takes a data abort dereferencing it. So the magic is not decoration; it
+     * is the switch that turns the block on, and there is no way to hand the
+     * firmware its hardware id without it.
+     *
+     * Only the four fields listed at SYSINFO_MAGIC_OFF are written. The rest
+     * of the block stays at the zeros IRAM comes up with: the serial number,
+     * the FireWire GUID, the board name and the image revisions are all
+     * unknown to us, and a plausible-looking invention is worse than a zero
+     * because it cannot be told apart from a fact. When a disassembly shows
+     * who reads one of them and what for, that field gets filled in then.
+     */
+    uint32_t sysinfo[] = {
+        [SYSINFO_LENGTH_OFF / 4]     = cpu_to_le32(SYSINFO_BLOCK_SIZE),
+        [SYSINFO_HW_REV_OFF / 4]     = cpu_to_le32(nms->hw_revision),
+        [SYSINFO_SDRAM_SIZE_OFF / 4] = cpu_to_le32(DRAM_MEM_SIZE),
+    };
+    uint32_t sysinfo_tag = cpu_to_le32(SYSINFO_MAGIC);
+    uint32_t sysinfo_ptr = cpu_to_le32(SYSINFO_BLOCK_ADDR);
+
+    QEMU_BUILD_BUG_ON(sizeof(sysinfo) > SYSINFO_BLOCK_SIZE);
+    cpu_physical_memory_write(SYSINFO_BLOCK_ADDR, sysinfo, sizeof(sysinfo));
+    cpu_physical_memory_write(SYSINFO_TAG_ADDR, &sysinfo_tag,
+                              sizeof(sysinfo_tag));
+    cpu_physical_memory_write(SYSINFO_PTR_ADDR, &sysinfo_ptr,
+                              sizeof(sysinfo_ptr));
+
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
                           "pp502x.cache-ctl", 0x1000);
