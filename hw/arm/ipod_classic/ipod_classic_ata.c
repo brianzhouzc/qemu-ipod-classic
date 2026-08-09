@@ -1,11 +1,11 @@
 /*
  * S5L8702 ATA controller.
  *
- * PIO only. The two DMA descriptor pairs (TBUF/SBUF at 0x3c..0x50 with
- * ATA_XFR_NUM) store and read back but move nothing; see the note in
- * ipod_classic_ata_write(). Apple's retailOS identifies the disk over PIO
- * before it ever sets a DMA descriptor up, so this is enough to get the boot
- * past its storage probe, and going further needs a disk image we do not have.
+ * PIO and DMA. The task file goes through QEMU's IDE core; the DMA engine is
+ * the SoC's own, a flat buffer rather than a scatter list, and it is driven
+ * from the go bit in ATA_COMMAND. Apple's retailOS identifies the disk over
+ * PIO and then reads every sector with CMD_READ_DMA, so both paths are needed
+ * before the boot gets past storage.
  *
  * See include/hw/arm/ipod_classic/ipod_classic_ata.h for the bridge protocol,
  * which is the part of this block that is not obvious.
@@ -14,6 +14,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "exec/address-spaces.h"
+#include "sysemu/dma.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "sysemu/blockdev.h"
@@ -23,6 +25,24 @@
 static int ata_ioport(hwaddr offset)
 {
     return (offset - S5L8702_ATA_PIO_DTR) / 4;
+}
+
+/*
+ * Set ATATRACE=1 to get every register access on stderr. This block is driven
+ * by a guest we cannot single-step and whose source we do not have, so reading
+ * the order it touches things in is how its protocol was worked out in the
+ * first place -- ATA_PIO_READY is left out because it is polled in a tight
+ * loop and would bury everything else. Checked once: getenv on every MMIO
+ * access is not free.
+ */
+static bool ata_trace(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("ATATRACE") != NULL;
+    }
+    return on;
 }
 
 static void ipod_classic_ata_update_irq(IPodClassicATAState *s)
@@ -44,11 +64,104 @@ static void ipod_classic_ata_set_irq(void *opaque, int n, int level)
     ipod_classic_ata_update_irq(s);
 }
 
+/*
+ * The go bit. By the time this runs the guest has programmed the buffer and
+ * the IDE core has already handed us the callback it wants run when the
+ * transfer is set up, so this is where the cursor is loaded and the core is
+ * let go. Doing it any earlier would read a buffer address the guest has not
+ * written yet -- see the sequence in the header.
+ */
+static void ipod_classic_ata_dma_go(IPodClassicATAState *s)
+{
+    bool is_write = s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE;
+
+    s->dma_cur = is_write ? s->reg[S5L8702_ATA_SBUF_START / 4]
+                          : s->reg[S5L8702_ATA_TBUF_START / 4];
+    /* ATA_XFR_NUM holds the byte count minus one. */
+    s->dma_left = s->reg[S5L8702_ATA_XFR_NUM / 4] + 1;
+    s->reg[S5L8702_ATA_XFR_CNT / 4] = 0;
+
+    if (s->dma_cb) {
+        BlockCompletionFunc *cb = s->dma_cb;
+
+        s->dma_cb = NULL;
+        cb(ide_bus_active_if(&s->bus), 0);
+    }
+}
+
+static void ipod_classic_ata_dma_start(const IDEDMA *dma, IDEState *is,
+                                       BlockCompletionFunc *cb)
+{
+    IPodClassicATAState *s = container_of(dma, IPodClassicATAState, dma);
+
+    /*
+     * Latch only. The ATA command is written before the buffer address and
+     * before the go bit, so there is nothing to transfer yet.
+     */
+    s->dma_cb = cb;
+}
+
+static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
+                                                int32_t limit)
+{
+    IPodClassicATAState *s = container_of(dma, IPodClassicATAState, dma);
+    IDEState *is = ide_bus_active_if(&s->bus);
+    uint32_t len = MIN((uint32_t)limit, s->dma_left);
+
+    /*
+     * One flat buffer, so one entry. If the guest asked for fewer bytes than
+     * the ATA command will produce, the short count goes back to the core,
+     * which treats it as the error it is instead of writing past the end.
+     */
+    qemu_sglist_init(&is->sg, DEVICE(s), 1, &address_space_memory);
+    if (len) {
+        qemu_sglist_add(&is->sg, s->dma_cur, len);
+        s->dma_cur += len;
+        s->dma_left -= len;
+        s->reg[S5L8702_ATA_XFR_CNT / 4] += len;
+    }
+
+    return is->sg.size;
+}
+
+static int ipod_classic_ata_dma_rw_buf(const IDEDMA *dma, bool is_write)
+{
+    /* Only the PIO fallback paths use this, and they do not come through. */
+    return 0;
+}
+
+static void ipod_classic_ata_dma_set_inactive(const IDEDMA *dma, bool more)
+{
+    IPodClassicATAState *s = container_of(dma, IPodClassicATAState, dma);
+
+    s->dma_cb = NULL;
+}
+
+static void ipod_classic_ata_dma_reset(const IDEDMA *dma)
+{
+    IPodClassicATAState *s = container_of(dma, IPodClassicATAState, dma);
+
+    s->dma_cb = NULL;
+    s->dma_cur = 0;
+    s->dma_left = 0;
+}
+
+static const IDEDMAOps ipod_classic_ata_dma_ops = {
+    .start_dma    = ipod_classic_ata_dma_start,
+    .prepare_buf  = ipod_classic_ata_dma_prepare_buf,
+    .rw_buf       = ipod_classic_ata_dma_rw_buf,
+    .set_inactive = ipod_classic_ata_dma_set_inactive,
+    .reset        = ipod_classic_ata_dma_reset,
+};
+
 static uint64_t ipod_classic_ata_read(void *opaque, hwaddr offset,
                                       unsigned size)
 {
     IPodClassicATAState *s = opaque;
 
+    if (ata_trace() && offset != S5L8702_ATA_PIO_READY) {
+        fprintf(stderr, "ATA RD +0x%02x\n", (unsigned)offset);
+    }
     switch (offset) {
     case S5L8702_ATA_CONTROL:
         /*
@@ -110,6 +223,10 @@ static void ipod_classic_ata_write(void *opaque, hwaddr offset,
 {
     IPodClassicATAState *s = opaque;
 
+    if (ata_trace()) {
+        fprintf(stderr, "ATA WR +0x%02x = 0x%08x\n", (unsigned)offset,
+                (unsigned)value);
+    }
     switch (offset) {
     case S5L8702_ATA_SWRST:
         s->reg[offset / 4] = value;
@@ -146,15 +263,20 @@ static void ipod_classic_ata_write(void *opaque, hwaddr offset,
         ide_ioport_write(&s->bus, ata_ioport(offset), value);
         break;
 
-    case S5L8702_ATA_XFR_NUM:
-        /*
-         * The start of a DMA transfer on real silicon. Nothing here moves a
-         * byte, so say so rather than accept it silently: a guest that got
-         * this far would wait for a completion that never comes.
-         */
-        qemu_log_mask(LOG_UNIMP, "%s: DMA is not modelled (XFR_NUM = 0x%"
-                      PRIx64 ")\n", __func__, value);
+    case S5L8702_ATA_COMMAND:
         s->reg[offset / 4] = value;
+        if (value & S5L8702_ATA_COMMAND_START) {
+            ipod_classic_ata_dma_go(s);
+        }
+        if (value & S5L8702_ATA_COMMAND_STOP) {
+            /*
+             * Written after every transfer, successful or not, so this is a
+             * "the engine is idle now" statement rather than an abort. The
+             * cursor is already spent by then; clearing it is what makes a
+             * stop after a timeout safe.
+             */
+            s->dma_left = 0;
+        }
         break;
 
     case S5L8702_ATA_PIO_READY:
@@ -191,6 +313,9 @@ static void ipod_classic_ata_reset(DeviceState *dev)
     s->rdata = 0;
     s->rdata_valid = false;
     s->intrq = false;
+    s->dma_cb = NULL;
+    s->dma_cur = 0;
+    s->dma_left = 0;
 }
 
 static void ipod_classic_ata_realize(DeviceState *dev, Error **errp)
@@ -199,6 +324,14 @@ static void ipod_classic_ata_realize(DeviceState *dev, Error **errp)
 
     ide_bus_init_output_irq(&s->bus,
                             qemu_allocate_irq(ipod_classic_ata_set_irq, s, 0));
+
+    /*
+     * After ide_bus_init_output_irq, not before: the last thing it does is
+     * bus->dma = &ide_dma_nop, so claiming the bus any earlier is silently
+     * undone and every DMA command is accepted and then ignored.
+     */
+    s->dma.ops = &ipod_classic_ata_dma_ops;
+    s->bus.dma = &s->dma;
 
     memory_region_init_io(&s->iomem, OBJECT(s), &ipod_classic_ata_ops, s,
                           TYPE_IPOD_CLASSIC_ATA, S5L8702_ATA_MEM_SIZE);

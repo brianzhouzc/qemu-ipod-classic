@@ -82,6 +82,37 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicATAState, IPOD_CLASSIC_ATA)
 #define S5L8702_ATA_CONTROL_CLOCKDOWN  (1u << 1)
 
 /*
+ * The DMA engine. Rockbox writes the whole sequence out in
+ * storage_ata-6g.c:851-880, and Apple's driver was traced doing the same
+ * thing register for register, which is what makes the bit meanings safe:
+ *
+ *     <ATA command 0xc8 to ATA_PIO_CSD>
+ *     ATA_TBUF_START = buffer;            (ATA_SBUF_START when writing)
+ *     ATA_TBUF_SIZE  = bytes;
+ *     ATA_XFR_NUM    = bytes - 1;
+ *     ATA_CFG |= dma_flags; ATA_CFG &= ~(BIT(7) | BIT(8));
+ *     ATA_IRQ = BITRANGE(0, 4);
+ *     ATA_IRQ_MASK = BIT(0);
+ *     ATA_COMMAND = BIT(0);               -- and only now does it move
+ *     <wait for the interrupt>
+ *     ATA_COMMAND = BIT(1);               -- stop
+ *
+ * The order is what shapes the model. The buffer address is programmed AFTER
+ * the ATA command, so start_dma cannot know where the data goes; all it can do
+ * is latch the callback the IDE core hands it, and the write of the go bit is
+ * what fires it. (The PP502x on the 5G needs the same split for the opposite
+ * reason -- there the address comes first and the go bit still comes last.)
+ *
+ * CFG bit 4 chooses the direction: set means the source buffer, i.e. a write
+ * to the disk. VERIFIED from Rockbox, which sets it on the write path and
+ * clears it on the read path, and consistent with the trace, where Apple's
+ * read leaves it clear (ATA_CFG = 0x64c).
+ */
+#define S5L8702_ATA_COMMAND_START      (1u << 0)
+#define S5L8702_ATA_COMMAND_STOP       (1u << 1)
+#define S5L8702_ATA_CFG_WRITE          (1u << 4)
+
+/*
  * INFERRED: bit 0 of ATA_IRQ is the device's INTRQ, gated by ATA_IRQMASK.
  * Nothing states the bit layout. Rockbox never reads ATA_IRQ, and Apple only
  * ever writes it back to itself ("ATA_IRQ = ATA_IRQ" at 0x08325f14), which
@@ -98,12 +129,18 @@ struct IPodClassicATAState {
 
     MemoryRegion iomem;
     IDEBus bus;
+    IDEDMA dma;
     qemu_irq irq;
 
     uint32_t reg[S5L8702_ATA_MEM_SIZE / 4];  /* the plain ones, 0x00..0x50 */
     uint32_t rdata;
     bool rdata_valid;
     bool intrq;
+
+    /* The transfer in flight: where it is going and how much is left. */
+    BlockCompletionFunc *dma_cb;
+    uint32_t dma_cur;
+    uint32_t dma_left;
 };
 
 void ipod_classic_ata_init_drive(DeviceState *dev, DriveInfo *hd);
