@@ -132,6 +132,88 @@ Resuelto desde que se escribió esta página:
   `0x000000`-`0x735a00` y el bootloader va detrás, en `entryOffset`.
 - **El mapa de registros del PP5022C**: en 07, con qué está modelado y qué no.
 
+## Volcar la flash ROM del aparato
+
+No hace falta compilar nada: **Rockbox ya lo trae**. La entrada existe desde
+antes de la v3.0, así que cualquier build de `ipodvideo` sirve.
+
+`apps/debug_menu.c`:
+
+```c
+#elif defined(CPU_PP) && !(CONFIG_STORAGE & STORAGE_SD)
+static bool dbg_save_roms(void)
+{
+    int fd = creat("/internal_rom_000000-0FFFFF.bin", 0666);
+    if(fd >= 0) {
+        write(fd, (void *)0x20000000, FLASH_SIZE);
+        close(fd);
+    }
+    return false;
+}
+```
+
+Aplica a este aparato: `ipodvideo.h` define `CONFIG_STORAGE STORAGE_ATA`
+(no SD), `CONFIG_CPU PP5022` (o sea `CPU_PP`) y `FLASH_SIZE 0x100000`. El mod
+iFlash no lo rompe, porque `CONFIG_STORAGE` es una constante de compilación, no
+depende del medio físico.
+
+### Procedimiento
+
+1. Expulsa el iPod del PC y arranca **Rockbox** (no el firmware de Apple).
+2. MENU → **System** → **Debug (Keep Out!)**.
+3. El **primer** elemento de la lista es **`Dump ROM contents`**. Selecciónalo.
+4. **No avisa de nada**: ni confirmación, ni barra, ni splash. Espera un par de
+   segundos y sal con LEFT.
+5. Conecta el USB para que monte la FAT32.
+6. En la **raíz** aparece `internal_rom_000000-0FFFFF.bin`, de exactamente
+   **1.048.576 bytes**.
+
+Avisos, todos verificados en el código: no comprueba el retorno de `write()`
+ni si queda espacio, y si `creat()` falla se calla y no pasa nada. Si el
+fichero no aparece, es por eso. Se escribe siempre con el mismo nombre en `/`,
+así que reejecutarlo sobrescribe.
+
+**Comprobación de que el volcado es bueno**: en el offset `0xFFE00` deben verse
+los bytes ASCII `hslf` (que es `flsh` en little-endian). Si está todo a ceros,
+ha fallado.
+
+### Formato de la ROM
+
+Directorio en `0xFFE00` (los últimos 512 bytes del MB), entradas de `0x28`
+bytes, terminadas cuando el magic deja de ser `flsh`:
+
+| Offset | Campo |
+|---|---|
+| `+0x00` | magic `flsh` |
+| `+0x04` | id de imagen: `disk`, `diag`, `logo`, `scan`, **`vmcs`** |
+| `+0x0C` | offset dentro de la flash |
+| `+0x10` | longitud |
+| `+0x14` | dirección de carga |
+| `+0x1C` | checksum (suma simple de bytes) |
+| `+0x20` | versión; byte alto `0xb0` = iPod Video |
+
+Lo confirman dos fuentes independientes que coinciden: `flash_get_section()` en
+`firmware/target/arm/ipod/video/lcd-video.c` (que lee la ROM en vivo desde
+`0x20000000`) y `utils/ipod/flashsplit/flashsplit.c` (que trocea un volcado).
+`flashsplit` produce `diskmode`, `diagmode`, `logo`, `diskscan` y `vmcs`, y debe
+imprimir `ipod model: ipvd`.
+
+### Para qué lo queremos
+
+**No para el bloqueo actual.** El retailOS muere antes de mirar la flash (ver
+[07-pp502x-hardware.md](07-pp502x-hardware.md)); el obstáculo es el segundo
+núcleo. Pero la sección **`vmcs`** es el firmware del Broadcom, que es lo que
+`lcd-video.c` busca cuando el BCM no viene ya encendido — hoy lo esquivamos
+poniendo `GPO32_VAL` bit 14 a mano. Con el volcado real podríamos modelar esa
+ruta en vez de cortocircuitarla, y tendríamos además `diskmode` y `diagmode`,
+que son imágenes arrancables independientes y objetivos mucho más pequeños que
+el retailOS entero.
+
+Lo que **no** vale: `ipodpatcher` solo lee la partición de firmware del disco,
+no la NOR. El `getflash` de iPodLinux decodifica el actualizador `aupd` que
+Apple deja en el disco, que es la imagen que Apple *escribiría*, no una lectura
+del chip (y su SVN está muerto).
+
 ## Pendiente
 
 - **Los dos núcleos.** `core_thread_init()` despierta al COP y se duerme
