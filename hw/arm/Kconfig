@@ -704,6 +704,9 @@ config IPOD_CLASSIC_6G
      # I2C0 carries the PCF50635 power management unit, which the retailOS
      # talks to before anything else.
      select I2C
+     # The disk is a standard ATA task file behind the SoC's own bridge, so we
+     # drive QEMU's IDE core ourselves.
+     select IDE_QDEV
      # The S5L8702 shares its clock, GPIO, I2C, SPI, SHA1 and USB blocks with
      # the S5L8720, so we borrow those device models rather than duplicating
      # them. This pulls in the iPod Touch 2G sources that define them.

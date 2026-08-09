@@ -19,6 +19,7 @@
 #include "exec/address-spaces.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
+#include "sysemu/blockdev.h"
 #include "hw/irq.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/reset.h"
@@ -256,11 +257,9 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.sha1",     SHA1_MEM_BASE,     0x100000 },
     { "s5l8702.miu",      MIU_MEM_BASE,      0x100000 },
     { "s5l8702.dmac0",    DMAC0_MEM_BASE,    0x100000 },
-    { "s5l8702.lcd",      LCD_MEM_BASE,      0x100000 },
     { "s5l8702.usb-otg",  USBOTG_MEM_BASE,   0x100000 },
     { "s5l8702.sm1",      SM1_MEM_BASE,      0x100000 },
     { "s5l8702.usb-hc",   USB_HC_MEM_BASE,   0x100000 },
-    { "s5l8702.ata",      ATA_MEM_BASE,      0x100000 },
     { "s5l8702.usb-fc",   USB_FC_MEM_BASE,   0x100000 },
     { "s5l8702.ata-unk",  ATA_UNK_MEM_BASE,  0x100000 },
     { "s5l8702.sdci",     SDCI_MEM_BASE,     0x100000 },
@@ -312,6 +311,112 @@ static const MemoryRegionOps ipod_classic_io_floor_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 8,
+};
+
+/*
+ * The block at 0x3C100000, which no source we have names.
+ *
+ * Rockbox does not know it exists on this chip: the one 0x3C100000 in
+ * s5l87xx.h is LCD_BASE, and it sits under "#if CONFIG_CPU==S5L8700", so it
+ * describes a different SoC. freemyipod's model has nothing there either.
+ * Everything below is from Apple's own code.
+ *
+ * Exactly three instructions in the whole 9.9 MB image reference this base --
+ * found by scanning for the literal word 0x3C100000 and then for every
+ * pc-relative LDR that resolves to one of those words, so the list is complete
+ * rather than merely what turned up:
+ *
+ *   0x08031d9c  str r0,[r1,#8]     seed  = sum of seven bytes from 0x08295294
+ *                                        + TECNT + the previous seed
+ *   0x08327738  str #0,[r1]        writes ZERO to +0
+ *   0x08327760  "while (!([+0] & 7)) ; return [+4]"
+ *
+ * Read in context: 0x08327714 takes a critical section and then writes that
+ * zero; 0x08031d30 calls it, seeds +8, draws twenty words through 0x08327760
+ * discarding nineteen, and releases the section via 0x08327750. Drawing and
+ * throwing away the first outputs of a freshly seeded generator is an RNG
+ * idiom, and the seed is stirred with a free-running timer count (0x08015748
+ * is a veneer to 0x22001EC4, which is "return TECNT"). Nothing else fits: no
+ * fresh input is written between the twenty reads, so a hash or checksum unit
+ * would return the same word each time and the loop would have no purpose.
+ *
+ * The identity of the block is therefore INFERRED, and its name and any other
+ * registers are UNDETERMINED. The three-register contract above is VERIFIED.
+ *
+ * One consequence of that contract is worth spelling out, because getting it
+ * wrong is a silent hang. There is no enable bit. No instruction anywhere
+ * writes a non-zero value to +0; the only write is the zero at 0x08327738, and
+ * it happens BEFORE the twenty reads, not after them. So "+0 reads ready only
+ * once the guest has enabled the block" deadlocks on the very first draw --
+ * 0x08327760 spins with no timeout and no escape. The ready bits have to be
+ * set on their own, which is what the model does.
+ *
+ * The generator is a plain 32-bit LCG seeded from what the guest wrote, so a
+ * given boot produces the same sequence twice. Reproducibility is worth more
+ * here than unpredictability; the firmware only wants variety.
+ */
+#define S5L8702_RNG_MEM_BASE   0x3c100000
+#define S5L8702_RNG_MEM_SIZE   0x10
+#define S5L8702_RNG_STATUS     0x00   /* read: ready in [2:0]. Written with 0. */
+#define S5L8702_RNG_DATA       0x04
+#define S5L8702_RNG_SEED       0x08
+
+typedef struct {
+    uint32_t seed;
+    uint32_t state;
+} S5L8702RNGState;
+
+static uint64_t ipod_classic_rng_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    S5L8702RNGState *s = opaque;
+
+    switch (offset) {
+    case S5L8702_RNG_STATUS:
+        /*
+         * 0x08327760 spins on "& 7" with no timeout, and nothing ever enables
+         * the block, so a word is always available. Which of the three bits
+         * means what is UNDETERMINED: the firmware only tests them together.
+         */
+        return 7;
+    case S5L8702_RNG_DATA:
+        s->state = s->state * 1103515245u + 12345u;
+        return s->state;
+    case S5L8702_RNG_SEED:
+        return s->seed;
+    default:
+        qemu_log_mask(LOG_UNIMP, "s5l8702.rng: read of +0x%" HWADDR_PRIx "\n",
+                      offset);
+        return 0;
+    }
+}
+
+static void ipod_classic_rng_write(void *opaque, hwaddr offset, uint64_t value,
+                                   unsigned size)
+{
+    S5L8702RNGState *s = opaque;
+
+    switch (offset) {
+    case S5L8702_RNG_STATUS:
+        /* Only ever written with zero, and readiness does not depend on it. */
+        break;
+    case S5L8702_RNG_SEED:
+        s->seed = value;
+        s->state = value;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "s5l8702.rng: write of 0x%" PRIx64
+                      " to +0x%" HWADDR_PRIx "\n", value, offset);
+        break;
+    }
+}
+
+static const MemoryRegionOps ipod_classic_rng_ops = {
+    .read = ipod_classic_rng_read,
+    .write = ipod_classic_rng_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
 };
 
 static void ipod_classic_machine_init(MachineState *machine)
@@ -392,6 +497,42 @@ static void ipod_classic_machine_init(MachineState *machine)
                        s5l8702_get_irq(nms, S5L8702_I2C0_IRQ));
     i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_PMU,
                             S5L8702_PMU_I2C_ADDR);
+
+    /*
+     * The disk. -drive if=ide,file=... attaches one; with none the controller
+     * still answers, which is what lets the retailOS find out there is no
+     * disk instead of spinning on ATA_PIO_READY for ever.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_ATA);
+    nms->ata = IPOD_CLASSIC_ATA(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, ATA_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_ATA_IRQ));
+    ipod_classic_ata_init_drive(dev, drive_get(IF_IDE, 0, 0));
+
+    /*
+     * The LCD command port. Both drivers we have spin on its status bits with
+     * no timeout, so an unimplemented window here is not a zero read: it is a
+     * hang. See ipod_classic_lcd.c.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_LCD);
+    nms->lcd = IPOD_CLASSIC_LCD(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, LCD_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_LCD_IRQ));
+
+    /*
+     * The random number generator at 0x3C100000. See the long note above it:
+     * the retailOS draws from this before it finishes bringing up storage, and
+     * an unmapped block there is not a zero read but a spin with no timeout.
+     */
+    MemoryRegion *rng_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(rng_mr, NULL, &ipod_classic_rng_ops,
+                          g_new0(S5L8702RNGState, 1), "s5l8702.rng",
+                          S5L8702_RNG_MEM_SIZE);
+    memory_region_add_subregion(sysmem, S5L8702_RNG_MEM_BASE, rng_mr);
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),
