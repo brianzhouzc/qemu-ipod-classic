@@ -51,13 +51,24 @@ static uint32_t bank_pending(const IPodVideoINTCBank *b)
 static void ipod_video_intc_update(IPodVideoINTCState *s)
 {
     bool irq = false;
+    bool cop_irq = false;
 
+    /*
+     * Each core has its own enable mask over the same set of raw lines, which
+     * is how the firmware hands a device to one core or the other.
+     */
     for (int i = 0; i < INTC_NUM_BANKS; i++) {
-        if (bank_pending(&s->bank[i]) & s->bank[i].cpu_enabled) {
+        uint32_t pending = bank_pending(&s->bank[i]);
+
+        if (pending & s->bank[i].cpu_enabled) {
             irq = true;
+        }
+        if (pending & s->bank[i].cop_enabled) {
+            cop_irq = true;
         }
     }
     qemu_set_irq(s->irq, irq);
+    qemu_set_irq(s->cop_irq, cop_irq);
 }
 
 static void ipod_video_intc_set_irq(void *opaque, int n, int level)
@@ -175,6 +186,7 @@ static void ipod_video_intc_init(Object *obj)
                           TYPE_IPOD_VIDEO_INTC, INTC_NUM_BANKS * INTC_BANK_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+    sysbus_init_irq(sbd, &s->cop_irq);
     qdev_init_gpio_in(DEVICE(obj), ipod_video_intc_set_irq,
                       INTC_NUM_BANKS * 32);
 }

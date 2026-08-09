@@ -27,6 +27,7 @@ struct IPodVideoINTCState {
 
     MemoryRegion iomem;
     qemu_irq irq;           /* to the CPU */
+    qemu_irq cop_irq;       /* to the COP */
     IPodVideoINTCBank bank[INTC_NUM_BANKS];
 };
 

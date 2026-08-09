@@ -365,27 +365,106 @@ igual, sacrificando solo lo que Rockbox hubiera programado en el segundo
 núcleo. El retailOS no es tan indulgente: sin el COP no calcula ni el tamaño de
 la RAM.
 
-### Lo que haría falta
+### El COP, modelado
 
-Modelar el segundo núcleo de verdad:
+Hecho. `hw/arm/ipod_video/ipod_video.c` crea ahora **dos** ARM:
 
-- Un segundo ARM en la máquina, `max_cpus = 2`.
-- `PROCESSOR_ID` (`0x60000000`) devolviendo `0x55` o `0xaa` **según qué núcleo
-  lee**, no una constante.
-- `CPU_CTL` / `COP_CTL` (`0x60007000` / `+0x04`) con dormir y despertar reales.
-- El buzón de `0x60001000` (`MBX_MSG_STAT` / `SET` / `CLR`), hoy sin modelar.
-- Los bancos por núcleo del controlador de interrupciones: los registros
-  `COP_INT_EN` y compañía ya existen en el mapa, pero el modelo solo enruta al
-  CPU.
+- `PROCESSOR_ID` (`0x60000000`) responde según **quién pregunta**, mirando
+  `current_cpu->cpu_index`: `0x55` al núcleo 0, `0xaa` al 1. Antes era una
+  constante.
+- `CPU_CTL` / `COP_CTL` (`0x60007000` / `+0x04`) duermen y despiertan de
+  verdad. Escribir el bit 31 hace `cs->halted = 1` más
+  `cpu_interrupt(CPU_INTERRUPT_HALT)`; escribir sin él lo revierte y da un
+  `qemu_cpu_kick`. Leer devuelve el bit 31 desde el estado real del núcleo.
+  Eso soporta las tres operaciones que usa el firmware: dormirse
+  (`str 0x80000000`), despertar al otro (lectura, `bic` del bit 31, escritura)
+  y preguntar si duerme (`lsr #31`).
+- El controlador de interrupciones tiene ahora **dos salidas**, y cada banco
+  aplica su propia máscara: `cpu_enabled` al núcleo 0 y `cop_enabled` al 1. Los
+  registros `COP_INT_EN` ya existían en el mapa; ahora hacen algo.
+- Ambos núcleos salen de reset en el mismo vector, como en el hierro.
 
-### Lo que NO hace falta, y me equivoqué al suponerlo
+**Funciona, y se puede comprobar.** Con `info registers` sobre el núcleo 1
+durante el arranque del retailOS: `R02 = 0xaa` (leyó bien su identidad),
+`R14 = 0x258` (volvió por la rama del COP), pila en IRAM, y PC parado en
+`0xa057c`, justo después de:
 
-Antes de trazar esto planteé como hipótesis que el problema fuese la **flash
-ROM en blanco**, porque el retailOS es el firmware nativo de esa ROM y nosotros
-le damos 1 MB de ceros con una sola palabra dentro. Esa hipótesis **no se
-sostiene**: el firmware no llega ni a mirar la flash antes de morir. El
-bloqueo es el segundo núcleo, y se puede atacar sin pedirle ningún volcado al
-usuario.
+```
+a0570: ldr r1, [pc, #16]      ; 0x60007000
+a0574: mov r0, #0x80000000
+a0578: str r0, [r1, #4]       ; COP_CTL = SLEEP
+```
 
-La flash seguirá haciendo falta más adelante —`lcd-video.c` saca de ella el
-firmware del Broadcom, sección `vmcs`— pero no es el obstáculo de ahora.
+O sea que el COP arranca, se reconoce, toma su camino y **se duerme a sí
+mismo** como primer acto, exactamente igual que hace Rockbox en `crt0-pp.S`.
+Que esté detenido ahí es el comportamiento correcto, no un fallo.
+
+**Rockbox no ha regresado.** `navtest.sh` da la misma secuencia que la
+referencia guardada en `assets/nav-baseline`: menú, la barra baja dos ítems,
+SELECT entra. Las diferencias de píxeles bailan un poco (14180 → 14157) porque
+el ticker del título va en otra fase.
+
+### El chip tiene que decir quién es
+
+Segundo arreglo, necesario y encontrado por el camino. `PP_VER1` y `PP_VER2`
+(`0x70000000` / `+0x04`) deletrean el modelo en ocho caracteres ASCII. El orden
+lo da `debug-pp.c` de Rockbox: los cuatro bytes de `PP_VER2` de mayor a menor
+peso, luego los de `PP_VER1`.
+
+Apple lee **un solo carácter** de todo eso, el sexto:
+
+```
+598: ldr r0, [0x70000000]     ; PP_VER1
+5a4: lsr r0, r0, #24          ; tras lsl #8 -> bits 23:16
+5a8: cmp r0, #0x32            ; '2' -> PP5022
+```
+
+y con la respuesta elige una dirección base distinta:
+
+| carácter 5 | base |
+|---|---|
+| `'6'` | `0x40020000` |
+| `'2'` (nuestro chip) | `0x40020000` |
+| cualquier otra cosa | `0x40018000` |
+
+Devolver cero no era un desconocido inofensivo: era una tercera respuesta que
+el firmware no contempla, y se caía a la base de otro chip. Ahora los registros
+valen `0x50503530` / `0x32324300`, que es **PP5022C**, lo que reporta el
+aparato de la mesa.
+
+### Sigue sin arrancar, y por qué
+
+Con las dos cosas puestas, el retailOS **sigue muriendo en el mismo assert**.
+La estructura de `0x40006000` no cambia: `+0x20` continúa a cero.
+
+Lo que sí cambió es a qué mira. Con la identificación correcta,
+`0x1084` devuelve `0x40020000 + 24 - 0x100 = 0x4001FF18`, y esa dirección está
+**entera a ceros**. `[r4+4]` sigue siendo 0, así que el nibble de memoria sigue
+saliendo 0 y el assert sigue saltando.
+
+O sea que el bloque de parámetros que el firmware espera en lo alto de la IRAM
+no lo escribe nadie. Repasando lo que hay: el propio `osos` no lo toca antes de
+leerlo (solo ha ejecutado ~284 bloques), y el COP está dormido en ese momento
+por diseño.
+
+**Hipótesis principal, dicha como tal**: ese bloque lo deja la **ROM de
+arranque de Apple** en la IRAM antes de saltar al sistema. Es un patrón
+clásico: el cargador de ROM deja un bloque de parámetros arriba del todo y el
+SO lo hereda. Nosotros nos saltamos la ROM por completo.
+
+Ojo con la contabilidad de hipótesis: antes retiré la idea de que la flash
+fuese el problema, y esa retirada **sigue siendo correcta** — el firmware no
+lee la flash antes de morir. Lo de ahora es distinto: no depende de lo que la
+flash *contenga* para leerlo, sino de lo que su ROM *hubiera dejado hecho*. Es
+una razón nueva, no la vieja reciclada.
+
+Si la hipótesis se confirma, hacen falta una de dos cosas:
+
+1. El volcado de la flash, ejecutando la ROM de verdad para que deje el bloque.
+   El procedimiento está en [06-ipod-video-5g.md](06-ipod-video-5g.md).
+2. Sintetizar el bloque nosotros, lo que exige conocer su formato — que se
+   aprendería, precisamente, de la ROM.
+
+Lo que falta por comprobar antes de dar la hipótesis por buena: rastrear si
+algo del `osos` escribe en `0x4001FF00`–`0x40020000` en algún momento, y si el
+CPU debería haber despertado al COP antes de llegar aquí.

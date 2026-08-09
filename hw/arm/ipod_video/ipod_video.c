@@ -53,9 +53,18 @@
  *
  * With only one core modelled it always answers CPU.
  */
+/*
+ * PROCESSOR_ID. Both cores run the same image and the very first thing it does
+ * is read this to find out which one it is, so the answer has to depend on who
+ * is asking rather than being a constant.
+ */
 static uint64_t pp502x_proc_id_read(void *opaque, hwaddr offset, unsigned size)
 {
-    return offset == 0 ? PP_PROC_ID_CPU : 0;
+    if (offset != 0) {
+        return 0;
+    }
+    return (current_cpu && current_cpu->cpu_index == PP_CORE_COP)
+           ? PP_PROC_ID_COP : PP_PROC_ID_CPU;
 }
 
 static void pp502x_proc_id_write(void *opaque, hwaddr offset, uint64_t value,
@@ -77,59 +86,72 @@ static const MemoryRegionOps pp502x_proc_id_ops = {
 /*
  * CPU_CTL and COP_CTL, the two core-control registers.
  *
- * The firmware's first act after identifying itself as the CPU is to wait for
- * the other core to go to sleep, from crt0-pp-bl.S:
+ * Writing the sleep bit puts that core to sleep; writing without it wakes the
+ * core up; reading it back says whether the core is asleep. From Rockbox's
+ * system-target.h for PP502x:
  *
- *     cpu:
- *         ldr  r0, =COP_STATUS
- *     1:  ldr  r1, [r0]
- *         tst  r1, #COPSLEEPING
- *         beq  1b
+ *     sleep_core(core):  mov r0, #0x80000000 ; str r0, [&PROC_CTL(core)]
+ *     wake_core(core):   mov r0, #0          ; str r0, [&PROC_CTL(core)]
  *
- * We model one core, so the COP is asleep and always will be. Reporting that
- * is the honest answer rather than a workaround: a core that never runs is
- * exactly a core that is permanently sleeping. What we cannot do yet is run
- * anything the firmware hands to the COP, so anything that offloads work to it
- * will stall.
+ * and crt0-pp.S has each core mask its own interrupts, the COP put itself to
+ * sleep, and the CPU spin on COP_STATUS until COPSLEEPING appears before it
+ * touches the remap unit.
+ *
+ * This used to answer "the COP is asleep and always will be", which was true
+ * of a machine with one core and was enough for Rockbox. It is not enough for
+ * Apple's firmware, which runs real initialisation on the COP.
  */
+static void pp502x_set_core_halted(IPodVideoMachineState *nms, int core,
+                                   bool halt)
+{
+    CPUState *cs = CPU(nms->cpu[core]);
+
+    if (halt) {
+        cs->halted = 1;
+        cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+    } else {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HALT);
+        cs->halted = 0;
+        qemu_cpu_kick(cs);
+    }
+}
+
+static int pp502x_proc_ctl_core(hwaddr offset)
+{
+    return offset == PP_PROC_CTL_COP ? PP_CORE_COP : PP_CORE_CPU;
+}
+
 static uint64_t pp502x_proc_ctl_read(void *opaque, hwaddr offset, unsigned size)
 {
     IPodVideoMachineState *nms = opaque;
+    int core;
 
-    switch (offset) {
-    case PP_PROC_CTL_CPU:
-        return nms->cpu_ctl;
-    case PP_PROC_CTL_COP:
-        return nms->cop_ctl | PP_PROC_SLEEPING;
-    default:
+    if (offset != PP_PROC_CTL_CPU && offset != PP_PROC_CTL_COP) {
         qemu_log_mask(LOG_UNIMP, "%s: unknown register +0x%" HWADDR_PRIx "\n",
                       __func__, offset);
         return 0;
     }
+
+    core = pp502x_proc_ctl_core(offset);
+    return nms->proc_ctl[core]
+         | (CPU(nms->cpu[core])->halted ? PP_PROC_SLEEPING : 0);
 }
 
 static void pp502x_proc_ctl_write(void *opaque, hwaddr offset, uint64_t value,
                                   unsigned size)
 {
     IPodVideoMachineState *nms = opaque;
+    int core;
 
-    switch (offset) {
-    case PP_PROC_CTL_CPU:
-        nms->cpu_ctl = value;
-        if (value & PP_PROC_SLEEPING) {
-            qemu_log_mask(LOG_UNIMP, "%s: the CPU asked to sleep, which is not "
-                          "modelled; it will keep running\n", __func__);
-        }
-        break;
-    case PP_PROC_CTL_COP:
-        /* Waking a core that does not exist has no effect. */
-        nms->cop_ctl = value;
-        break;
-    default:
+    if (offset != PP_PROC_CTL_CPU && offset != PP_PROC_CTL_COP) {
         qemu_log_mask(LOG_UNIMP, "%s: unknown register +0x%" HWADDR_PRIx
                       " (wrote 0x%" PRIx64 ")\n", __func__, offset, value);
-        break;
+        return;
     }
+
+    core = pp502x_proc_ctl_core(offset);
+    nms->proc_ctl[core] = value & ~PP_PROC_SLEEPING;
+    pp502x_set_core_halted(nms, core, value & PP_PROC_SLEEPING);
 }
 
 static const MemoryRegionOps pp502x_proc_ctl_ops = {
@@ -623,6 +645,29 @@ static const MemoryRegionOps pp502x_clock_ops = {
 #define PP_GPO32_VAL        0x80
 #define PP_GPO32_BCM_POWER  0x4000
 
+/*
+ * PP_VER1 and PP_VER2 spell out which chip this is, as eight ASCII characters.
+ * Rockbox's debug-pp.c shows the order: the four bytes of PP_VER2 from most
+ * significant down, then the four of PP_VER1.
+ *
+ *     char pp_version[] = { (PP_VER2 >> 24) & 0xff, ... (PP_VER1) & 0xff };
+ *
+ * The device on the desk reports PP5022C. Apple's firmware cares about exactly
+ * one of those characters -- the sixth, the second digit of the part number:
+ *
+ *     598: ldr r0, [0x70000000]   ; PP_VER1
+ *     5a4: lsr r0, r0, #24        ; after lsl #8: bits 23:16, i.e. char 5
+ *     5a8: cmp r0, #0x32          ; '2' -> PP5022
+ *
+ * and picks a different base address in IRAM depending on the answer. Reading
+ * back zero is not a harmless unknown here: it is a third answer the firmware
+ * has no case for, so it falls through to a base meant for another chip.
+ */
+#define PP_VER1_OFF         0x00
+#define PP_VER2_OFF         0x04
+#define PP5022C_VER1        0x32324300   /* '2' '2' 'C' '\0' */
+#define PP5022C_VER2        0x50503530   /* 'P' 'P' '5' '0'  */
+
 static uint64_t pp502x_dev_ctl_read(void *opaque, hwaddr offset, unsigned size)
 {
     IPodVideoMachineState *nms = opaque;
@@ -666,10 +711,14 @@ static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
 static void ipod_video_cpu_reset(void *opaque)
 {
     IPodVideoMachineState *nms = IPOD_VIDEO_MACHINE((MachineState *)opaque);
-    CPUState *cs = CPU(nms->cpu);
 
-    cpu_reset(cs);
-    cpu_set_pc(cs, nms->reset_pc);
+    /* Both cores come out of reset at the same vector, as on the hardware. */
+    for (int i = 0; i < PP_NUM_CORES; i++) {
+        CPUState *cs = CPU(nms->cpu[i]);
+
+        cpu_reset(cs);
+        cpu_set_pc(cs, nms->reset_pc);
+    }
 }
 
 /*
@@ -786,12 +835,16 @@ static void ipod_video_machine_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     Object *cpuobj;
 
-    cpuobj = object_new(machine->cpu_type);
-    nms->cpu = ARM_CPU(cpuobj);
-    object_property_set_link(cpuobj, "memory", OBJECT(sysmem), &error_abort);
-    object_property_set_bool(cpuobj, "realized", true, &error_fatal);
-    nms->nsas = cpu_get_address_space(CPU(nms->cpu), ARMASIdx_NS);
-    object_unref(cpuobj);
+    for (int i = 0; i < PP_NUM_CORES; i++) {
+        cpuobj = object_new(machine->cpu_type);
+        nms->cpu[i] = ARM_CPU(cpuobj);
+        object_property_set_link(cpuobj, "memory", OBJECT(sysmem),
+                                 &error_abort);
+        object_property_set_bool(cpuobj, "realized", true, &error_fatal);
+        object_unref(cpuobj);
+    }
+    nms->nsas = cpu_get_address_space(CPU(nms->cpu[PP_CORE_CPU]),
+                                      ARMASIdx_NS);
 
     MemoryRegion *dram = allocate_ram(sysmem, "dram", DRAM_MEM_BASE,
                                       DRAM_MEM_SIZE);
@@ -860,7 +913,11 @@ static void ipod_video_machine_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(nms->intc), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(nms->intc), 0, INTC_MEM_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 0,
-                       qdev_get_gpio_in(DEVICE(nms->cpu), ARM_CPU_IRQ));
+                       qdev_get_gpio_in(DEVICE(nms->cpu[PP_CORE_CPU]),
+                                        ARM_CPU_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(nms->intc), 1,
+                       qdev_get_gpio_in(DEVICE(nms->cpu[PP_CORE_COP]),
+                                        ARM_CPU_IRQ));
 
     /*
      * The cache arrays. These are not registers, they are the cache's own
@@ -932,6 +989,10 @@ static void ipod_video_machine_init(MachineState *machine)
      * reproduced here.
      */
     nms->dev_regs[PP_GPO32_VAL / 4] = PP_GPO32_BCM_POWER;
+
+    /* Identify the chip, or Apple's firmware picks another chip's addresses. */
+    nms->dev_regs[PP_VER1_OFF / 4] = PP5022C_VER1;
+    nms->dev_regs[PP_VER2_OFF / 4] = PP5022C_VER2;
 
     MemoryRegion *cache_ctl = g_new(MemoryRegion, 1);
     memory_region_init_io(cache_ctl, NULL, &pp502x_cache_ctl_ops, nms,
@@ -1013,7 +1074,10 @@ static void ipod_video_machine_class_init(ObjectClass *klass, void *data)
 
     mc->desc = "Apple iPod 5th generation (Video), PortalPlayer PP502x";
     mc->init = ipod_video_machine_init;
-    mc->max_cpus = 1;
+    /* Two ARM7TDMI cores, CPU and COP, both running the same image. */
+    mc->max_cpus = PP_NUM_CORES;
+    mc->min_cpus = PP_NUM_CORES;
+    mc->default_cpus = PP_NUM_CORES;
     /*
      * The real cores are ARM7TDMI, which is ARMv4T, and QEMU has no model for
      * it. arm926 is ARMv5TE: a superset, so v4T firmware runs unchanged, and

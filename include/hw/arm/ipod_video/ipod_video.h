@@ -112,6 +112,15 @@
 #define PP_PROC_ID_COP      0xaa
 
 /*
+ * The two cores, in the order QEMU creates them, so cpu_index doubles as the
+ * core number. Both start at the same reset vector and the firmware sorts
+ * itself out by reading PROCESSOR_ID.
+ */
+#define PP_CORE_CPU         0
+#define PP_CORE_COP         1
+#define PP_NUM_CORES        2
+
+/*
  * CPU_CTL / COP_CTL bits. Bit 31 doubles as the "this core is asleep" status
  * and as the request to put it to sleep; crt0-pp-bl.S spins on the COP's until
  * it is set before touching anything else.
@@ -127,7 +136,7 @@ typedef struct {
 typedef struct {
     MachineState parent;
     AddressSpace *nsas;
-    ARMCPU *cpu;
+    ARMCPU *cpu[PP_NUM_CORES];
     /*
      * The ROM loader copies the whole osos image to DRAM_START and jumps to
      * DRAM_START + entryOffset, which is where ipodpatcher put the Rockbox
@@ -135,8 +144,9 @@ typedef struct {
      */
     uint32_t entry_offset;
     hwaddr reset_pc;
-    uint32_t cpu_ctl;
-    uint32_t cop_ctl;
+    /* CPU_CTL and COP_CTL, indexed by core. The sleep bit is not stored
+     * here: it is read back from the core's own halted state. */
+    uint32_t proc_ctl[PP_NUM_CORES];
     uint32_t timer1_cfg;
     uint32_t timer2_cfg;
     uint32_t hw_revision;
