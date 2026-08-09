@@ -19,10 +19,18 @@
  * the write pointer at BCMA_CMDPARAM plus the row offset, and is made visible
  * by writing BCMCMD_LCD_UPDATE to BCMA_COMMAND.
  *
- * What is modelled: the pointer/data/ready protocol, the chip's address space
- * as plain memory, and the two update commands, which push the framebuffer to
- * a QEMU console. What is not: TV out, YUV blitting, sleep, and the firmware
- * upload the real chip needs before it will do anything.
+ * What is modelled: the pointer/data/ready protocol, the bootstrap handshake,
+ * the chip's address space as plain memory, and the two update commands, which
+ * push the framebuffer to a QEMU console.
+ *
+ * What is not: TV out, YUV blitting, sleep, and above all the firmware the
+ * real chip runs. Both guests upload a ~200 KB VMCS image into the chip's SRAM
+ * and then wait for it to answer -- Rockbox at lcd-video.c:589-595, Apple at
+ * 0x287868 and 0x2878b0. Here that image lands in plain memory and nothing
+ * executes it, so those answers never come. Rockbox does not care, because it
+ * skips the whole bootstrap when GPO32 bit 14 says the chip is already
+ * powered, which this machine arranges. Apple's firmware does the bootstrap
+ * unconditionally.
  */
 
 #include "qemu/osdep.h"
@@ -43,9 +51,26 @@
 #define BCM_REG_ALT_RD_ADDR 6
 #define BCM_REG_ALT_CONTROL 7
 
-/* CONTROL bits the firmware spins on. */
-#define BCM_CONTROL_WR_READY  0x02
-#define BCM_CONTROL_RD_READY  0x10
+/*
+ * CONTROL bits the firmware spins on. All four mean "the chip is ready", and
+ * they are read as a halfword.
+ *
+ * The two boot bits are the bootstrap handshake, and Rockbox's bcm_init()
+ * names them by how it uses them -- lcd-video.c:559-560, and again at 579-580
+ * before the firmware upload:
+ *
+ *     while (BCM_ALT_CONTROL & 0x80);        -- wait while busy
+ *     while (!(BCM_ALT_CONTROL & 0x40));     -- wait until ready
+ *
+ * Apple's retailOS runs the same two loops, at 0x2876d0 and 0x2876dc. The
+ * difference is that Rockbox skips the whole bootstrap when GPO32 bit 14 says
+ * the chip is already powered, and the retailOS does not: it brings the chip
+ * up itself every time. That is why this only became visible now.
+ */
+#define BCM_CONTROL_WR_READY   0x02
+#define BCM_CONTROL_RD_READY   0x10
+#define BCM_CONTROL_BOOT_READY 0x40
+#define BCM_CONTROL_BOOT_BUSY  0x80
 
 /* Addresses inside the chip. */
 #define BCMA_COMMAND    0x001F8
@@ -60,26 +85,55 @@
 #define BCMCMD_LCD_UPDATE       BCM_CMD(0)
 #define BCMCMD_LCD_UPDATERECT   BCM_CMD(5)
 
-static void bcm_mem_write32(IPodVideoBCMState *s, uint32_t addr, uint32_t value)
+/*
+ * The data port is as wide as the access: Rockbox always uses BCM_DATA32 and
+ * writes whole words, but Apple's firmware writes the odd halfword through it
+ * too -- 0x287ca8 pushes the last 1..255 bytes of a block two at a time. A
+ * halfword write that stored four bytes would trample the two after it.
+ */
+static void bcm_mem_write(IPodVideoBCMState *s, uint32_t addr, uint32_t value,
+                          unsigned size)
 {
-    if (addr + 4 > BCM_MEM_SIZE) {
+    if (addr + size > BCM_MEM_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: write past the end of the chip's memory (0x%x)\n",
                       __func__, addr);
         return;
     }
-    stl_le_p(s->mem + addr, value);
+    if (size == 2) {
+        stw_le_p(s->mem + addr, value);
+    } else {
+        stl_le_p(s->mem + addr, value);
+    }
 }
 
-static uint32_t bcm_mem_read32(IPodVideoBCMState *s, uint32_t addr)
+static uint32_t bcm_mem_read(IPodVideoBCMState *s, uint32_t addr, unsigned size)
 {
-    if (addr + 4 > BCM_MEM_SIZE) {
+    if (addr + size > BCM_MEM_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: read past the end of the chip's memory (0x%x)\n",
                       __func__, addr);
         return 0;
     }
-    return ldl_le_p(s->mem + addr);
+    return size == 2 ? lduw_le_p(s->mem + addr) : ldl_le_p(s->mem + addr);
+}
+
+/*
+ * The address registers are 16 bits wide, and a 32-bit address goes in as two
+ * halfwords, low first -- 0x287c28 and 0x287c2c in Apple's firmware:
+ *
+ *     strh r9, [r8]          ; BCM_WR_ADDR = addr
+ *     lsr  r0, r9, #16
+ *     strh r0, [r8]          ; BCM_WR_ADDR = addr >> 16
+ *
+ * so the register behaves as a shift register loaded from the top. Rockbox
+ * only ever writes the whole word at once through BCM_WR_ADDR32, which is why
+ * simply assigning the value worked until now and would have silently uploaded
+ * the video firmware to the wrong place.
+ */
+static uint32_t bcm_addr_shift(uint32_t reg, uint32_t value, unsigned size)
+{
+    return size == 2 ? (reg >> 16) | (value << 16) : value;
 }
 
 static void bcm_run_command(IPodVideoBCMState *s, uint32_t cmd)
@@ -106,7 +160,7 @@ static uint64_t ipod_video_bcm_read(void *opaque, hwaddr offset, unsigned size)
     switch (offset >> 16) {
     case BCM_REG_DATA:
     case BCM_REG_ALT_DATA:
-        value = bcm_mem_read32(s, s->rd_addr);
+        value = bcm_mem_read(s, s->rd_addr, size);
         s->rd_addr += size;
         return value;
 
@@ -117,8 +171,12 @@ static uint64_t ipod_video_bcm_read(void *opaque, hwaddr offset, unsigned size)
 
     case BCM_REG_CONTROL:
     case BCM_REG_ALT_CONTROL:
-        /* Never busy: there is no bus behind this to be slow. */
-        return BCM_CONTROL_WR_READY | BCM_CONTROL_RD_READY;
+        /*
+         * Never busy, always ready: there is no bus behind this to be slow and
+         * no bootstrap for it to be part-way through.
+         */
+        return BCM_CONTROL_WR_READY | BCM_CONTROL_RD_READY
+             | BCM_CONTROL_BOOT_READY;
 
     case BCM_REG_WR_ADDR:
     case BCM_REG_ALT_WR_ADDR:
@@ -139,7 +197,7 @@ static void ipod_video_bcm_write(void *opaque, hwaddr offset, uint64_t value,
     switch (offset >> 16) {
     case BCM_REG_DATA:
     case BCM_REG_ALT_DATA:
-        bcm_mem_write32(s, s->wr_addr, value);
+        bcm_mem_write(s, s->wr_addr, value, size);
         /*
          * A command only takes effect once it lands in BCMA_COMMAND, so watch
          * for a write there rather than scanning the whole address space.
@@ -152,12 +210,12 @@ static void ipod_video_bcm_write(void *opaque, hwaddr offset, uint64_t value,
 
     case BCM_REG_WR_ADDR:
     case BCM_REG_ALT_WR_ADDR:
-        s->wr_addr = value;
+        s->wr_addr = bcm_addr_shift(s->wr_addr, value, size);
         break;
 
     case BCM_REG_RD_ADDR:
     case BCM_REG_ALT_RD_ADDR:
-        s->rd_addr = value;
+        s->rd_addr = bcm_addr_shift(s->rd_addr, value, size);
         break;
 
     case BCM_REG_CONTROL:
