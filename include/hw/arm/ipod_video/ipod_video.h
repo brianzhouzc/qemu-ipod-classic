@@ -144,6 +144,8 @@ typedef struct {
      */
     uint32_t entry_offset;
     hwaddr reset_pc;
+    /* Answer ARM semihosting calls; Apple's firmware panics through them. */
+    bool semihosting;
     /* CPU_CTL and COP_CTL, indexed by core. The sleep bit is not stored
      * here: it is read back from the core's own halted state. */
     uint32_t proc_ctl[PP_NUM_CORES];

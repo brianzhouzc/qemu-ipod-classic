@@ -42,6 +42,7 @@
 #include "sysemu/blockdev.h"
 #include "hw/qdev-properties.h"
 #include "ui/console.h"
+#include "semihosting/semihost.h"
 
 /*
  * PROCESSOR_ID, the very first thing the firmware touches. Both cores run the
@@ -800,6 +801,16 @@ static void ipod_video_set_entry(Object *obj, Visitor *v, const char *name,
     nms->entry_offset = value;
 }
 
+static bool ipod_video_get_semihosting(Object *obj, Error **errp)
+{
+    return IPOD_VIDEO_MACHINE(obj)->semihosting;
+}
+
+static void ipod_video_set_semihosting(Object *obj, bool value, Error **errp)
+{
+    IPOD_VIDEO_MACHINE(obj)->semihosting = value;
+}
+
 static bool ipod_video_get_remap(Object *obj, Error **errp)
 {
     return IPOD_VIDEO_MACHINE(obj)->force_remap;
@@ -821,6 +832,26 @@ static void ipod_video_instance_init(Object *obj)
         "having set the mapping up first.");
 
     IPOD_VIDEO_MACHINE(obj)->hw_revision = IPOD_VIDEO_HW_REVISION;
+
+    /*
+     * Apple's firmware is built against ARM's own C library and keeps its
+     * semihosting-based panic printer in the shipped image. 0xe9b98 loads
+     * r0 = 4 (SYS_WRITE0) and executes "svc 0x123456"; the string table just
+     * above it holds "Type: ", "undefined instruction", "data abort",
+     * "_sys_exit", "CPU ", "Task", which is what an ARM C library prints when
+     * it dies. With semihosting off that SVC is a plain supervisor call into a
+     * vector table the firmware has not installed yet, and the machine dies
+     * silently; with it on the firmware tells us what went wrong and dumps its
+     * registers. Costs nothing when nothing panics, so it is on by default.
+     */
+    IPOD_VIDEO_MACHINE(obj)->semihosting = true;
+    object_property_add_bool(obj, "semihosting", ipod_video_get_semihosting,
+                             ipod_video_set_semihosting);
+    object_property_set_description(obj, "semihosting",
+        "Answer ARM semihosting calls (SVC 0x123456). Apple's retailOS prints "
+        "its panic messages through them, so this turns a black screen into a "
+        "diagnosis. Turn it off to see the firmware take the SVC vector "
+        "instead.");
 
     object_property_add(obj, "entry", "uint32", ipod_video_get_entry,
                         ipod_video_set_entry, NULL, NULL);
@@ -846,6 +877,10 @@ static void ipod_video_machine_init(MachineState *machine)
     IPodVideoMachineState *nms = IPOD_VIDEO_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     Object *cpuobj;
+
+    if (nms->semihosting) {
+        qemu_semihosting_enable();
+    }
 
     for (int i = 0; i < PP_NUM_CORES; i++) {
         cpuobj = object_new(machine->cpu_type);
