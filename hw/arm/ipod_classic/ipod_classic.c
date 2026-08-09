@@ -18,6 +18,7 @@
 #include "elf.h"
 #include "exec/address-spaces.h"
 #include "hw/misc/unimp.h"
+#include "hw/qdev-properties.h"
 #include "hw/irq.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/reset.h"
@@ -273,7 +274,6 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.ecc",      ECC_MEM_BASE,      0x100000 },
     { "s5l8702.wheel",    WHEEL_MEM_BASE,    0x100000 },
     { "s5l8702.usb-phy",  USBPHYS_MEM_BASE,  0x100000 },
-    { "s5l8702.i2c0",     I2C0_MEM_BASE,     0x100000 },
     { "s5l8702.wdt",      WDT_MEM_BASE,      0x100000 },
     { "s5l8702.i2s",      I2S_MEM_BASE,      0x100000 },
     { "s5l8702.spdif",    SPDIF_MEM_BASE,    0x100000 },
@@ -376,6 +376,22 @@ static void ipod_classic_machine_init(MachineState *machine)
                        s5l8702_get_irq(nms, S5L8702_TIMER_IRQ));
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
                        s5l8702_get_irq(nms, S5L8702_TIMER32_IRQ));
+
+    /*
+     * I2C0, and the PCF50635 power management unit on it. Apple's retailOS
+     * talks to the PMU before it does anything else, and 0x08325a20 waits on
+     * the result with a retry loop and no way out, so this is what the boot
+     * hangs on when it is missing.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_I2C);
+    nms->i2c0 = IPOD_CLASSIC_I2C(dev);
+    qdev_prop_set_uint32(dev, "reset-con", S5L8702_I2C_BOOTROM_CON);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, I2C0_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_I2C0_IRQ));
+    i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_PMU,
+                            S5L8702_PMU_I2C_ADDR);
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

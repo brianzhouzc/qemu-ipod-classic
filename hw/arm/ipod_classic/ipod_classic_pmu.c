@@ -1,0 +1,204 @@
+/*
+ * NXP PCF50635 power management unit, at I2C address 0xe6 (7-bit 0x73).
+ *
+ * The first chip Apple's retailOS talks to. 0x08325a20 starts the transfer and
+ * then blocks on RTXC event 61 with nothing but a retry loop behind it, so an
+ * iPod classic with nothing on I2C0 boots as far as its idle task and stays
+ * there for ever -- which is exactly where this machine stopped before this
+ * file existed.
+ *
+ * The bus protocol is a register-pointer device: a write starts with the
+ * register number and the pointer advances after every byte; a read carries on
+ * from wherever the pointer was left. That the pointer survives the end of a
+ * transaction is not a guess -- Rockbox's i2c_rd() sends the register number in
+ * one transaction and reads in a second one (i2c-s5l8702.c, i2c_wr_internal
+ * with len 0 followed by i2c_rd_internal), and Apple's driver does the same.
+ *
+ * Register numbers are from Rockbox's firmware/export/pcf5063x.h, with the
+ * three undocumented ones (INT6 0x85, INT6M 0x86, GPIOSTAT 0x87) from
+ * firmware/target/arm/s5l8702/ipod6g/pmu-target.h.
+ *
+ * WHAT IS MODELLED
+ *
+ *   - The register file, which is what most of this chip is to a driver:
+ *     regulator voltages, enables, interrupt masks and standby control get
+ *     written and, when read back, have to read back.
+ *   - The A/D converter. ADCC1 bit 0 starts a conversion; ADCS1/ADCS2/ADCS3
+ *     return a 10-bit result with ADCRDY set. See the note on the value below.
+ *   - The interrupt status registers INT1..INT5 and INT6, which are
+ *     read-to-clear on the real chip and therefore must not be a plain
+ *     register file: a driver that reads them expects the bits to go away.
+ *
+ * WHAT IS NOT
+ *
+ *   - The RTC. It reads back whatever was written, which is wrong, and is
+ *     flagged here because on the 5G an absent RTC had a visible side effect:
+ *     Rockbox decided an alarm had gone off on every boot.
+ *   - Charging, the ON/OFF controller and the regulators. Writing them changes
+ *     nothing, because there is no voltage in here for a voltage to mean.
+ *   - The chip's interrupt output. Nothing is wired to it yet.
+ *
+ * ASSUMED, and marked as such because nothing derives them:
+ *
+ *   - VERSION (0x00) and VARIANT (0x01). No dump of a real PCF50635 exists in
+ *     any of our sources, and neither Rockbox nor iPodLinux reads them. They
+ *     answer zero. If the firmware turns out to compare them against something
+ *     the disassembly will say what, and then they get a real value.
+ *   - The battery reading, 844 out of 1023. Through Rockbox's own conversion
+ *     (pmu-6g.c: raw * 2000 / 1023 + 2250) that is 3900 mV, an ordinary
+ *     charged-but-not-full lithium cell. Nothing in our sources says what a
+ *     real one reads; the number is chosen to be unremarkable.
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "hw/i2c/i2c.h"
+#include "migration/vmstate.h"
+#include "hw/arm/ipod_classic/ipod_classic_pmu.h"
+
+static void pmu_start_adc(IPodClassicPMUState *s)
+{
+    uint32_t raw = S5L8702_PMU_ADC_BATTERY_RAW;
+
+    s->reg[PCF5063X_REG_ADCS1] = (raw >> 2) & 0xff;
+    s->reg[PCF5063X_REG_ADCS2] = 0;
+    s->reg[PCF5063X_REG_ADCS3] = PCF5063X_ADCS3_ADCRDY | (raw & 0x03);
+}
+
+static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
+{
+    uint8_t val = s->reg[addr];
+
+    switch (addr) {
+    case PCF5063X_REG_INT1:
+    case PCF5063X_REG_INT2:
+    case PCF5063X_REG_INT3:
+    case PCF5063X_REG_INT4:
+    case PCF5063X_REG_INT5:
+    case PCF50635_REG_INT6:
+        /* Read to clear, which is what makes an interrupt line drop. */
+        s->reg[addr] = 0;
+        break;
+    default:
+        break;
+    }
+
+    return val;
+}
+
+static void pmu_reg_write(IPodClassicPMUState *s, uint8_t addr, uint8_t val)
+{
+    switch (addr) {
+    case PCF5063X_REG_INT1:
+    case PCF5063X_REG_INT2:
+    case PCF5063X_REG_INT3:
+    case PCF5063X_REG_INT4:
+    case PCF5063X_REG_INT5:
+    case PCF50635_REG_INT6:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: INT%d is read-only\n", __func__,
+                      addr == PCF50635_REG_INT6 ? 6 : addr - 1);
+        return;
+    case PCF5063X_REG_ADCC1:
+        s->reg[addr] = val;
+        if (val & PCF5063X_ADCC1_ADCSTART) {
+            pmu_start_adc(s);
+        }
+        return;
+    default:
+        s->reg[addr] = val;
+        return;
+    }
+}
+
+static int ipod_classic_pmu_event(I2CSlave *i2c, enum i2c_event event)
+{
+    IPodClassicPMUState *s = IPOD_CLASSIC_PMU(i2c);
+
+    switch (event) {
+    case I2C_START_SEND:
+        /* The next byte is the register number, not data. */
+        s->addr_pending = true;
+        break;
+    case I2C_START_RECV:
+    case I2C_FINISH:
+    case I2C_NACK:
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+static uint8_t ipod_classic_pmu_recv(I2CSlave *i2c)
+{
+    IPodClassicPMUState *s = IPOD_CLASSIC_PMU(i2c);
+    uint8_t val = pmu_reg_read(s, s->addr);
+
+    s->addr++;
+    return val;
+}
+
+static int ipod_classic_pmu_send(I2CSlave *i2c, uint8_t data)
+{
+    IPodClassicPMUState *s = IPOD_CLASSIC_PMU(i2c);
+
+    if (s->addr_pending) {
+        s->addr = data;
+        s->addr_pending = false;
+    } else {
+        pmu_reg_write(s, s->addr, data);
+        s->addr++;
+    }
+    return 0;
+}
+
+static void ipod_classic_pmu_reset(DeviceState *dev)
+{
+    IPodClassicPMUState *s = IPOD_CLASSIC_PMU(dev);
+
+    memset(s->reg, 0, sizeof(s->reg));
+    s->addr = 0;
+    s->addr_pending = false;
+    pmu_start_adc(s);
+}
+
+static const VMStateDescription vmstate_ipod_classic_pmu = {
+    .name = TYPE_IPOD_CLASSIC_PMU,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, IPodClassicPMUState),
+        VMSTATE_UINT8_ARRAY(reg, IPodClassicPMUState, S5L8702_PMU_NUM_REGS),
+        VMSTATE_UINT8(addr, IPodClassicPMUState),
+        VMSTATE_BOOL(addr_pending, IPodClassicPMUState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void ipod_classic_pmu_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
+
+    dc->desc = "NXP PCF50635 power management unit";
+    dc->reset = ipod_classic_pmu_reset;
+    dc->vmsd = &vmstate_ipod_classic_pmu;
+    k->event = ipod_classic_pmu_event;
+    k->recv = ipod_classic_pmu_recv;
+    k->send = ipod_classic_pmu_send;
+}
+
+static const TypeInfo ipod_classic_pmu_info = {
+    .name          = TYPE_IPOD_CLASSIC_PMU,
+    .parent        = TYPE_I2C_SLAVE,
+    .instance_size = sizeof(IPodClassicPMUState),
+    .class_init    = ipod_classic_pmu_class_init,
+};
+
+static void ipod_classic_pmu_register_types(void)
+{
+    type_register_static(&ipod_classic_pmu_info);
+}
+
+type_init(ipod_classic_pmu_register_types)

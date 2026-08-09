@@ -701,6 +701,9 @@ config IPOD_CLASSIC_6G
      select PL192
      select UNIMP
      select PTIMER
+     # I2C0 carries the PCF50635 power management unit, which the retailOS
+     # talks to before anything else.
+     select I2C
      # The S5L8702 shares its clock, GPIO, I2C, SPI, SHA1 and USB blocks with
      # the S5L8720, so we borrow those device models rather than duplicating
      # them. This pulls in the iPod Touch 2G sources that define them.

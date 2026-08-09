@@ -17,6 +17,8 @@
 #include "cpu.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/arm/ipod_classic/ipod_classic_clk.h"
+#include "hw/arm/ipod_classic/ipod_classic_i2c.h"
+#include "hw/arm/ipod_classic/ipod_classic_pmu.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 
@@ -193,6 +195,7 @@ typedef struct {
     PL192State *vic1;
     IPodClassicClkState *clock0;
     IPodClassicTimerState *timer;
+    IPodClassicI2CState *i2c0;
     Clock *sysclk;
     bool semihosting;
     /*
