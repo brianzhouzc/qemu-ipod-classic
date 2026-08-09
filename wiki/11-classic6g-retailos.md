@@ -21,6 +21,20 @@ saberlo). Las trazas son reproducibles con las órdenes del final.
 Con `-drive if=ide` el arranque es limpio: cero excepciones, cero reinicios.
 Sin disco entra en un ciclo de caída y reinicio (§4).
 
+Reproducido en auditoría independiente (agosto de 2026), con estas cifras:
+con disco, 35 s de `-d int` dan 27 166 `Taking exception 5 [IRQ]` y **nada
+más**; `PC = 0x22003b20`, `SP = 0x22010b70`, modo SVC; `0x22003b1c` es
+`mcr p15,0,r0,c7,c0,4` y `0x22003b30` es `b 0x22003b0c`, comprobado en el
+desensamblado. Sin disco, 25 s dan 23 *Data Abort*, 23 llamadas de semihosting
+y 23 `SWRCON`. El DMA de ATA entrega de verdad: con una imagen que lleva
+`55 aa` en `0x1FE`, `pmemsave 0x0be5d3e0` la encuentra ahí después del
+arranque.
+
+Y la advertencia que va con el hito 3: **«llegar al bucle idle» no es
+«arrancar»**. Todas las tareas de aplicación siguen bloqueadas, no se dibuja
+nada, y el camino *sin* disco llega más lejos en la interfaz antes de morirse
+(§4). Un sistema quieto no es necesariamente un sistema que funciona.
+
 ---
 
 ## 1. La imagen tiene dos regiones de enlace
@@ -66,12 +80,19 @@ apareció":
 
 | Sitio | Qué hace |
 |---|---|
-| `0x08031d9c` | `str r0,[r1,#8]` — semilla: siete bytes de estado + `TECNT` + la semilla anterior |
+| `0x08031d9c` | `str r0,[r1,#8]` — semilla: siete bytes de estado + `TECNT` + la palabra de `0x3C700008` |
 | `0x08327738` | `str #0,[r1]` — escribe **cero** en `+0` |
 | `0x08327760` | `while (!([+0] & 7)) ; return [+4]` |
 
+> **Corrección (auditoría).** El tercer sumando **no** es «la semilla
+> anterior», como decía la primera versión de esta página. El literal de
+> `0x08031de0` es `0x3C700000`, o sea `TIMER_BASE`, y `+0x08` es `TADATA0`.
+> La semilla se mezcla con **dos** lecturas de temporizador independientes, y
+> nadie vuelve a leer nunca `+4` ni `+8` de este bloque: el registro de
+> semilla es de sólo escritura desde el punto de vista del huésped.
+
 En contexto: `0x08327714` toma una sección crítica y escribe ese cero;
-`0x08031d30` la llama, siembra `+8`, saca veinte palabras por `0x08327760`
+`0x08031d30` siembra `+8`, saca veinte palabras por `0x08327760`
 descartando diecinueve, y suelta la sección en `0x08327750`. Sembrar un
 generador y tirar sus primeras salidas es un idiotismo de RNG, y la semilla se
 mezcla con un contador libre (`0x08015748` es un *veneer* a `0x22001EC4`, que
@@ -95,6 +116,18 @@ subir solos.
 Es el patrón 1 de [09-historia-5g.md](09-historia-5g.md) — *el bit de estado
 que nunca llega* — con un agravante: aquí el bit parecía tener un habilitador
 y no lo tiene.
+
+### Cuánto pesa de verdad este bloque (medido en la auditoría)
+
+**Con disco enganchado, el retailOS no toca `0x3C100000` ni una vez**:
+`0x08327760` no aparece en un log de `-d in_asm` de ese arranque. El bloque
+sólo se alcanza en el camino **sin** disco, una vez por intento de arranque, y
+el sitio de siembra `0x08031d9c` no se ejecuta en ninguno de los dos — así que
+el estado del generador arranca siempre de cero.
+
+O sea: quitar el falso bit de habilitación desbloqueó de verdad un giro
+infinito **en el estado del árbol de aquel momento**, pero el bloque no está
+en el camino que hoy lleva al bucle idle. No se le puede acreditar el hito 3.
 
 ---
 
@@ -127,11 +160,22 @@ nunca. Es el muro que se comió 48 millones de lecturas en una traza de 45 s.
 de LCD, antes de tocar nada que Rockbox nombre. Los dos son `INDETERMINADO`,
 pero la ventana tiene que cubrirlos o se caen al suelo de E/S de la máquina.
 
-### Los píxeles no pasan por aquí
+### Por dónde pasan los píxeles: `INDETERMINADO`
 
-Medido, no supuesto: **una** palabra de píxel llega a `LCD_WDATA` por escritura
-de CPU en 45 segundos. El framebuffer va por DMA. Modelar el panel sin la ruta
-de DMA no dibuja nada.
+Lo medido es esto y sólo esto: en un arranque entero llega **una** palabra de
+píxel a `LCD_WDATA` por escritura de CPU. Lo que la primera versión de esta
+página concluía de ahí — «el framebuffer va por DMA» — **no se sigue**, y la
+auditoría lo rebaja a `INDETERMINADO`.
+
+La explicación alternativa es al menos igual de buena: el retailOS emite
+`0x2A`/`0x2B`/`0x2C` (fijar ventana y «escribir en memoria») y **se cae en la
+instrucción siguiente**, en el código de dibujo de `0x0815b1b8` (§4). Es decir,
+puede que no haya píxeles por MMIO porque nunca llega a empujarlos, no porque
+vayan por otra ruta. Para decidirlo hay que llegar antes a un dibujado que no
+aborte.
+
+(El modelo sólo anuncia la **primera** escritura de píxel, no las cuenta; para
+repetir la medida hay que instrumentar `ipod_classic_lcd.c` a mano.)
 
 Cuando el retailOS dibuja (ver §4, ocurre en el camino de error) emite
 `0x2A`, `0x2B`, `0x2C` — *column address set*, *page address set*, *memory
@@ -261,17 +305,30 @@ Lo que sí hace antes de dormirse:
   externas, y el ATA.
 - Dos lecturas por DMA, las dos en **LBA 0**: ocho sectores y luego sesenta y
   cuatro. Los bytes llegan (verificado, §5). Después, nada más.
-- Sondea `WHEELINT` (`0x3C200014`) unas tres veces por segundo — un sondeo
-  periódico, no un giro.
+- Sondea `WHEELINT` (`0x3C200014`) unas **120 veces por segundo** — medido en
+  la auditoría con dos carreras de 20 s y 50 s: 3071 y 6770 lecturas, o sea
+  123/s en régimen. (La primera versión de esta página decía «tres veces por
+  segundo»; era falso por un factor de 40.) Sigue sin ser un giro bloqueante —
+  un giro son millones — y sigue demostrando lo mismo: **hay tareas corriendo
+  además de la idle**, que es la mejor prueba de que el planificador vive.
 
 ### Lo que NO se ejecuta, y esto es el dato importante
 
 | Dirección | Qué es | ¿Se ejecuta? |
 |---|---|---|
-| `0x08057160` / `0x08057198` | el parser de la partición de firmware: comprueba `]ih[` en el offset `0x100` de lo que leyó | **no, nunca** |
+| `0x0805712c` | el parser de la partición de firmware: en `0x08057198` compara `]ih[` (`0x5B68695D`, verificado en `0x080572d4`) con el offset `0x100` de lo que leyó | **no, nunca** |
 | `0x0815b1b8` | el código de UI que dibuja texto (el que caía sin disco) | **no** |
 | `0x08239658` | la construcción del objeto de cadena | **no** |
 | `0x08236130` | la búsqueda de recursos | sí, una vez |
+
+> **Corrección (auditoría).** La primera versión de esta tabla medía el parser
+> por `grep -c '^0x08057160'`, y **esa medida no valía**: `0x08057160` es
+> `add r0,sp,#4` en mitad de una función, no una entrada, así que un log de
+> `-d in_asm` habría dado cero aunque el código corriera en cada arranque (ver
+> §8). La entrada real de la función es `0x0805712c` — `push {r1..fp,lr}` —, y
+> medida por ahí la conclusión **se mantiene**: cero, con disco y sin él. Las
+> otras tres direcciones sí son entradas de función (`push` como primera
+> instrucción), así que ésas siempre fueron válidas.
 
 O sea: **el bloqueo está aguas arriba tanto del parseo de la partición de
 firmware como del dibujado**, y no es el almacenamiento, porque el
@@ -286,7 +343,7 @@ almacenamiento funciona.
 | "El disco es demasiado pequeño" | Con 64 MB, 289 MB, 512 MB y 80 GB: las mismas dos lecturas |
 | "Está bloqueado en el DMA de ATA" | Lo estuvo, y ya no: las transferencias terminan y el huésped acusa la interrupción |
 | "Está bloqueado en el LCD" | Lo estuvo, y ya no; ahora sólo toca el bloque dos veces y para |
-| "El click wheel lo tiene parado" | Lo sondea 3 veces/s desde una tarea periódica; no es un giro bloqueante |
+| "El click wheel lo tiene parado" | Lo sondea ~123 veces/s desde una tarea periódica (medido: 3071 lecturas en 20 s, 6770 en 50 s); no es un giro bloqueante |
 
 ### Lo siguiente que hay que averiguar
 
@@ -341,8 +398,20 @@ toda la sesión — `-d in_asm` y buscar su dirección:
 
 ```bash
 ./qemu-system-arm ... -d in_asm -D /tmp/asm.log
-grep -c '^0x08057160' /tmp/asm.log     # 0 = nunca se tradujo, luego nunca corrió
+grep -c '^0x0805712c' /tmp/asm.log     # 0 = ningún bloque empezó ahí
 ```
+
+> **Y aquí está la trampa, que costó una medida falsa.** En esta compilación
+> `-d in_asm` no desensambla (no hay capstone): imprime **una sola línea de
+> dirección por bloque de traducción**, la del principio, seguida de
+> `OBJD-T: <bytes>`. Comprobado: `0x22003b1c` — el `wfi` del bucle idle, que se
+> ejecuta miles de veces — sale **cero** veces, porque su bloque empieza en
+> `0x22003b0c`.
+>
+> Luego `grep -c '^0xDIRECCION'` sólo responde «¿corrió esto?» si la dirección
+> es **entrada de bloque**: destino de un `bl`/`b`, o el `push` con el que
+> empieza una función. Para cualquier otra da cero siempre y no significa nada.
+> Antes de usarlo, desensambla la dirección y comprueba que hay un prólogo.
 
 ---
 
@@ -355,10 +424,18 @@ grep -c '^0x08057160' /tmp/asm.log     # 0 = nunca se tradujo, luego nunca corri
 - **`grep -c '^0xDIRECCION'` sobre un log de `in_asm`** responde "¿esto llegó a
   correr?" en un segundo, y esa pregunta reordenó toda la investigación: sin
   ella habríamos seguido arreglando el parser de la partición de firmware, que
-  nunca se ejecuta.
+  nunca se ejecuta. **Pero sólo vale para entradas de bloque** — ver el aviso
+  del §7. La primera versión de esta página lo aplicó a una dirección de en
+  medio de una función y sacó un cero que no significaba nada; dio la casualidad
+  de que la conclusión era correcta por otro camino. Es exactamente el error de
+  método que avisa [09-historia-5g.md](09-historia-5g.md): comprobar la
+  herramienta antes de creerse la medida.
 - **Un puntero nulo no siempre falla.** En esta máquina VA 0 está mapeado por
   el propio firmware, así que `ldr r1,[r0]` con `r0 = 0` devuelve una palabra
   de la tabla de vectores y la caída ocurre más tarde y en otro sitio. `DFAR`
   con pinta de instrucción ARM (`0xEAxxxxxx`) es la pista.
-- **Contar antes de modelar.** "Los píxeles van por MMIO" se descartó contando:
-  una palabra en 45 segundos.
+- **Contar es necesario, pero no basta.** "Una palabra de píxel en 45 s" es un
+  hecho; "luego el framebuffer va por DMA" era una inferencia con al menos otra
+  explicación igual de buena (que el firmware se cae antes de empujar píxeles),
+  y se coló como si fuese medida. Cuando una cuenta sale casi cero, la primera
+  hipótesis a descartar es "no llegó a intentarlo".

@@ -11,8 +11,9 @@
  * be written down with confidence. The panel is a different matter: which
  * controller is fitted is chosen at runtime from GPIO PDAT(6) bits [5:4], we
  * do not model GPIO yet, and guessing a command set would be inventing with
- * the appearance of rigour. Pixel writes are counted and reported once rather
- * than logged per word, because the boot pushes them by the hundred thousand.
+ * the appearance of rigour. Only the FIRST pixel write is reported, not every
+ * one, because a driver that gets going pushes them by the hundred thousand;
+ * the log therefore says "at least one", never how many.
  *
  * See include/hw/arm/ipod_classic/ipod_classic_lcd.h for the register map and
  * where every bit comes from.
@@ -77,8 +78,9 @@ static void ipod_classic_lcd_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (offset >= S5L8702_LCD_WDATA && offset <= S5L8702_LCD_WDATA_LAST) {
         /*
-         * Pixel data. Dropped -- see the file header. Counted so that the log
-         * says how much was thrown away instead of saying nothing at all.
+         * Pixel data. Dropped -- see the file header. The first one is
+         * announced so the log does not stay silent about it; the rest are
+         * not, so this says nothing about how many arrive.
          */
         static uint64_t dropped;
         if (++dropped == 1) {

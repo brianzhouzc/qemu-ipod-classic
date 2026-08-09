@@ -327,12 +327,19 @@ static const MemoryRegionOps ipod_classic_io_floor_ops = {
  * rather than merely what turned up:
  *
  *   0x08031d9c  str r0,[r1,#8]     seed  = sum of seven bytes from 0x08295294
- *                                        + TECNT + the previous seed
+ *                                        + TECNT + the word at 0x3C700008
  *   0x08327738  str #0,[r1]        writes ZERO to +0
  *   0x08327760  "while (!([+0] & 7)) ; return [+4]"
  *
+ * The third addend is NOT a previous seed read back from this block, which is
+ * what an earlier version of this comment said: the literal at 0x08031de0 is
+ * 0x3C700000, i.e. TIMER_BASE, and +0x08 is TADATA0. The seed is stirred with
+ * two independent timer reads, and nothing ever reads +4 or +8 of this block
+ * back -- so the seed register here is write-only as far as the guest is
+ * concerned.
+ *
  * Read in context: 0x08327714 takes a critical section and then writes that
- * zero; 0x08031d30 calls it, seeds +8, draws twenty words through 0x08327760
+ * zero; 0x08031d30 seeds +8, draws twenty words through 0x08327760
  * discarding nineteen, and releases the section via 0x08327750. Drawing and
  * throwing away the first outputs of a freshly seeded generator is an RNG
  * idiom, and the seed is stirred with a free-running timer count (0x08015748
@@ -354,6 +361,12 @@ static const MemoryRegionOps ipod_classic_io_floor_ops = {
  * The generator is a plain 32-bit LCG seeded from what the guest wrote, so a
  * given boot produces the same sequence twice. Reproducibility is worth more
  * here than unpredictability; the firmware only wants variety.
+ *
+ * Measured, so that nobody credits this block with more than it does: with a
+ * disk attached the retailOS never touches 0x3C100000 at all -- 0x08327760
+ * does not appear in a -d in_asm log of that boot. The block is only reached
+ * on the diskless path, where it is called once per boot attempt, and the
+ * seeding site 0x08031d9c never runs in either, so s->seed stays zero.
  */
 #define S5L8702_RNG_MEM_BASE   0x3c100000
 #define S5L8702_RNG_MEM_SIZE   0x10
