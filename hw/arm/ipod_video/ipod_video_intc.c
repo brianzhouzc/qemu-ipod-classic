@@ -11,9 +11,10 @@
  * writing ones to CPU_INT_DIS disables them -- with the current mask readable
  * back through CPU_INT_EN_STAT.
  *
- * Only the CPU's outputs are wired. The COP is not modelled, so its masks are
- * kept and reported faithfully but its interrupt line goes nowhere; nothing
- * runs there to take it.
+ * Both cores' outputs are wired -- see the two sysbus_connect_irq calls in
+ * ipod_video_machine_init. (This used to say the COP was not modelled and its
+ * line went nowhere. That stopped being true when the second core went in, and
+ * the stale comment outlived it by several rounds of debugging.)
  */
 
 #include "qemu/osdep.h"

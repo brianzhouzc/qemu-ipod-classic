@@ -7,14 +7,20 @@
  * unimplemented device, so -d unimp reports what the firmware reaches for
  * next.
  *
- * Not modelled yet, and worth knowing before reading anything into a run:
+ * Both cores are created and both are wired to the interrupt controller, and
+ * the remap unit at 0xf000f000 is modelled coarsely; an older version of this
+ * comment said neither was, and was wrong for long enough to send two
+ * investigations down the wrong path.
  *
- *   - The second core. The PP502x has two ARM7TDMI cores, CPU and COP,
- *     controlled through CPU_CTL/COP_CTL at 0x60007000. Only one is created
- *     here, so firmware that waits on the other will hang.
- *   - The remap unit at 0xf000f000. Rockbox's application aliases DRAM to
- *     address 0 through it; the bootloader stage runs from DRAM_START and does
- *     not need it.
+ * Not modelled, and worth knowing before reading anything into a run:
+ *
+ *   - I2C at 0x7000c000, and everything on that bus. This is where Apple's
+ *     retailOS spends its time once it has booted: it talks to the PCF50605
+ *     power management chip at address 0x08 and gets nothing back. Rockbox
+ *     survives it because its driver reads whatever the data registers happen
+ *     to hold and carries on.
+ *   - The Broadcom's firmware upload path. GPO32 bit 14 is faked as already
+ *     set so the panel counts as powered.
  *
  * See wiki/07-pp502x-hardware.md.
  */
@@ -349,11 +355,40 @@ static const MemoryRegionOps pp502x_cache_ctl_ops = {
  * that jump lands in the blank flash window and the CPU NOP-sleds upward until
  * it falls out of the map.
  *
- * Modelled coarsely: programming MMAP0 at all switches DRAM in at address 0.
- * The registers encode a logical base, a physical base and masks, none of
- * which is decoded here, so a guest asking for anything other than the usual
- * whole-of-DRAM-at-zero mapping will not get what it asked for.
+ * Each window is a pair of registers. The top byte of each is a base address:
+ * the logical one in MMAPn_LOGICAL, the physical one in MMAPn_PHYSICAL. The
+ * low half of the logical register is a mask saying which address bits have to
+ * match, and the low half of the physical register carries permission flags --
+ * Rockbox names four of them, MMAP_PHYS_READ/WRITE/DATA/CODE_MASK.
+ *
+ * The mask field is decoded here only as far as reading it: mask bit k covers
+ * address bit k+16, which follows from Rockbox's crt0-pp.S using 0x3e00 for a
+ * 32 MB window and 0x3c00 for a 64 MB one -- dropping bit 9 doubles the window,
+ * so bit 9 is address bit 25. It is not enforced. What is decoded is the pair
+ * of base bytes, which is enough to tell which window puts DRAM at zero.
+ *
+ * That distinction matters, because it used to be got right by accident. The
+ * old rule was "any write to MMAP0 switches DRAM in", and the two firmwares
+ * disagree about which window does the job:
+ *
+ *   Rockbox  MMAP0  logical 0x00003e00  physical 0x10000f84   <- this one
+ *   Apple    MMAP0  logical 0x00003bf0  physical 0x00003a88
+ *            MMAP1  logical 0x00003a00  physical 0x10000f84   <- this one
+ *            MMAP2  logical 0x20003800  physical 0x00003f88   flash at 0x20000000
+ *
+ * Apple's MMAP0 maps low addresses to physical zero, which is not the remap at
+ * all; the window that matters is MMAP1, and it only worked because the write
+ * to MMAP0 tripped the old rule first. Both firmwares write the logical half
+ * before the physical one, but the pair is re-examined on either write so the
+ * order does not matter.
+ *
+ * Still coarse: a matching pair switches the whole of DRAM in at zero rather
+ * than the window the mask describes, nothing is ever switched back out, and
+ * the permission flags are ignored. A guest asking for anything other than the
+ * usual whole-of-DRAM-at-zero mapping will not get what it asked for.
  */
+#define PP_MMAP_BASE_MASK   0xff000000
+
 static uint64_t pp502x_mmap_read(void *opaque, hwaddr offset, unsigned size)
 {
     IPodVideoMachineState *nms = opaque;
@@ -365,14 +400,21 @@ static void pp502x_mmap_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     IPodVideoMachineState *nms = opaque;
+    unsigned pair;
 
     if (offset >= sizeof(nms->mmap_regs)) {
         return;
     }
     nms->mmap_regs[offset / 4] = value;
 
-    /* MMAP0 is the pair at +0x00 and +0x04. */
-    if (offset <= 0x04 && value != 0 && !nms->dram_remapped) {
+    if (nms->dram_remapped) {
+        return;
+    }
+
+    /* Each window is two consecutive words, logical first. */
+    pair = (offset / 4) & ~1u;
+    if ((nms->mmap_regs[pair] & PP_MMAP_BASE_MASK) == 0 &&
+        (nms->mmap_regs[pair + 1] & PP_MMAP_BASE_MASK) == DRAM_MEM_BASE) {
         nms->dram_remapped = true;
         memory_region_set_enabled(nms->dram_remap, true);
         /* Bit 26 is not decoded, so the twin window moves with it. */
@@ -669,12 +711,30 @@ static const MemoryRegionOps pp502x_clock_ops = {
 #define PP_VER1_OFF         0x00
 #define PP_VER2_OFF         0x04
 /*
- * Apple's firmware compares these eight bytes against "PP5020A " and
- * "PP5022A " -- the literals at 0x27ead4 and 0x27eae0 in the retailOS -- and
- * returns 7, 8 or 0. Its caller at 0xf1c then does cmp r0, #4 and picks where
- * its global variables live: 0x40018000 if it recognised the chip, 0x40007ffc
- * if it did not. Spelling anything else here sends it to the wrong base, where
- * every global reads back zero, including the RAM size its assert checks.
+ * Where the globals live, and by whom. This was attributed to the wrong
+ * routine when the fix first went in.
+ *
+ * 0x27ea8c does compare these eight bytes against "PP5020A " and "PP5022A "
+ * -- the literals at 0x27ead4 and 0x27eae0 -- and returns 7, 8 or 0, and its
+ * caller at 0xf0c does turn that into a base of 0x40018000 or 0x40007ffc. But
+ * that path is dead in this build: 0xf0c starts by loading the literal at
+ * 0xf34, which is 0x4001c8fc, finds it non-zero and returns through the popne
+ * at 0xf1c without ever making the comparison.
+ *
+ * The routine that actually picks the base is 0x1084, and it does not look at
+ * the string at all -- it calls 0x598, which reads one byte:
+ *
+ *     598: mov r0, #0x70000000
+ *     59c: ldr r0, [r0]          ; PP_VER1
+ *     5a0: lsl r0, r0, #8
+ *     5a4: lsr r0, r0, #24       ; bits 23:16, the sixth character
+ *     5a8: cmp r0, #0x32         ; '2' -> PP5022
+ *
+ * and then returns 0x40020000 + N - 0x100 for a PP5022 or 0x40018000 + N -
+ * 0x100 otherwise. So the correction to these registers is still needed and
+ * still for the same reason -- reading back zero is a third answer the
+ * firmware has no case for -- but it is that single character that decides it,
+ * not the whole string.
  *
  * Rockbox's debug screen renders this device as PP5022C, which is where the
  * earlier value came from. The firmware wants the 'A' form, and the real

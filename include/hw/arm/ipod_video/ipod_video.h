@@ -28,7 +28,19 @@
  * directory carries in its addr field for every image.
  */
 #define DRAM_MEM_BASE       0x10000000
-#define DRAM_MEM_SIZE       0x04000000   /* 64 MB, what this unit reports */
+/*
+ * 64 MB, which is what this unit reports -- and which two other sources
+ * contradict. Apple's own firmware carries 32 MB as its built-in default
+ * (0x1f4 does "mov fp, #0x700", and nibble 2 of that indexes the table at
+ * 0x16d8 to 0x02000000), and iPodLinux's ipodhw.c lists mem_size 0x02000000
+ * for hw_ver 0xb. Left at 64 MB deliberately: Rockbox boots on it and must not
+ * be disturbed, both figures clear the firmware's "image plus bss must fit"
+ * assert at 0xda0 (0x00a0e294), and the SysInfo block below reports whatever
+ * this says rather than a number of its own, so the machine stays self
+ * consistent either way. Worth revisiting when something is seen to size a
+ * buffer off 0x40006020.
+ */
+#define DRAM_MEM_SIZE       0x04000000
 
 /*
  * Address bit 26 is not decoded by the SDRAM controller: DRAM answers both
