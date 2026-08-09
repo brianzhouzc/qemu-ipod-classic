@@ -30,7 +30,9 @@ Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
 | Base | Bloque | Modelo |
 |---|---|---|
 | `0x00000000` | flash NOR mientras arranca; después DRAM (remapeada por MMAP0) | ventana en blanco con la revisión de HW en `+0x405c` |
-| `0x10000000` | **`DRAM_START`**, 64 MB. Coincide con el `addr` del directorio de firmware | RAM |
+| `0x04000000` | la ventana baja **otra vez, con el bit 26 puesto** — gemelas de la NOR y de la DRAM remapeada | alias, ver abajo |
+| `0x10000000` | **`DRAM_START`**, 64 MB (cifra discutida, ver abajo). Coincide con el `addr` del directorio de firmware | RAM |
+| `0x14000000` | DRAM con el **bit 26** puesto | alias permanente |
 | `0x20000000` | la misma NOR ya remapeada (`hwcompat.h` lee la revisión en `0x2000405c`) | alias |
 | `0x30000000` | **Broadcom BCM2722**, el que manda al panel. Ocho registros separados 64 KB, dos puertos independientes | `ipod_video_bcm.c` |
 | `0x40000000` | IRAM | RAM |
@@ -39,7 +41,7 @@ Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
 | `0x60004000` | Controlador de interrupciones. Banco bajo en `+0x000`, **banco alto en `+0x100`** | `ipod_video_intc.c` |
 | `0x60005000` | Timers. `TIMER1_CFG` `+0x00`, **`USEC_TIMER` `+0x10`** | sí |
 | `0x60006000` | Reloj y alimentación. `DEV_RS` `+0x04`, `DEV_EN` `+0x0c`, `CLOCK_SOURCE` `+0x20`, `PLL_CONTROL` `+0x34`, **`PLL_STATUS` `+0x3c`** | sí |
-| `0x60007000` | Control de núcleos. `CPU_CTL` `+0x00`, `COP_CTL` `+0x04` | parcial: el CPU no duerme de verdad |
+| `0x60007000` | Control de núcleos. `CPU_CTL` `+0x00`, `COP_CTL` `+0x04` | sí: **los dos núcleos duermen y despiertan de verdad** |
 | `0x60008000` | **DMA, bloque A** — maestro aquí, canales en `0x60009000`. No lo nombra ninguna fuente pública; solo el firmware de Apple, que lo usa para subir el firmware del Broadcom | `ipod_video_dma.c` |
 | `0x6000a000` | **DMA, bloque B** — maestro aquí, canales en `0x6000b000`. Es el que documenta `pp5020.h` y el que usa Rockbox para el audio | `ipod_video_dma.c` |
 | `0x6000c000` | Caché. `CACHE_CTL` con `VECT_REMAP` (`0x0010`) y `READY` (`0x4000`) | sí |
@@ -47,15 +49,40 @@ Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
 | `0x70000000` | **Control de dispositivo**. `PP_VER1` `+0x00`, `DEV_INIT1` `+0x10`, `DEV_INIT2` `+0x20`, **`+0x28` sin nombre en `pp5020.h`**, `DEV_TIMING1` `+0x34`, `GPO32_VAL` `+0x80`, `GPO32_ENABLE` `+0x84` | sí |
 | `0x70002800` | I2S | no |
 | `0x70003000` | LCD | no, el panel va por el Broadcom |
-| `0x70006000` | **UART serie 0**, 16550 con stride de 4 | `hw/char/serial.c` de QEMU |
+| `0x70006000` | **UART serie 0**, 16550 con stride de 4 | `hw/char/serial.c` de QEMU, **con la IRQ sin conectar** |
 | `0x7000c000` | I2C **y** click wheel comparten ventana: I2C en `+0x00`, rueda en `+0x100`, `+0x104` y `+0x140` | `ipod_video_i2c.c` + `ipod_video_pcf50605.c`, y la rueda en `ipod_video.c` |
 | `0xc3000000` | **IDE**. Temporizaciones `+0x00`, `IDE0_CFG` `+0x28`, task file `+0x1e0`, control `+0x3f8`, DMA `+0x400` | `ipod_video_ide.c` |
-| `0xc5000000` | USB | no |
+| `0xc5000000` | USB | no, `create_unimplemented_device` |
+| `0x90000000` / `0x94000000` | DRAM con el **bit 31** puesto (la vista sin caché), y su combinación con el bit 26 | alias, ver abajo |
 | `0xf0000000` | **Arrays de la caché**: datos `+0`, espejo `+0x2000`, estado CPU `+0x4000`, estado COP `+0x6000`, flush `+0x8000`, invalidate `+0xc000` | RAM |
-| `0xf000f000` | Unidad de remapeo `MMAP0..7` (pares lógico/físico) más `CACHE_MASK` `+0x40` | sí |
+| `0xf000f000` | Unidad de remapeo `MMAP0..7` (pares lógico/físico) más `CACHE_MASK` `+0x40` | sí, salvo el campo `mask`, que **no se aplica** |
 
 > El UART es 16550 de verdad, así que QEMU ya lo tenía. Fue la primera pieza
 > gratis del port.
+
+### Los alias, en una sola vista
+
+Cinco regiones que son la misma memoria vista desde otra dirección. El bit 26 y
+el bit 31 se explican al final de este documento; aquí queda dónde están.
+
+| Dirección | Es | Por qué existe |
+|---|---|---|
+| `0x04000000` | la ventana baja (NOR o DRAM remapeada) con el bit 26 | el retailOS forma direcciones con ese bit en su scatter-load |
+| `0x14000000` | DRAM con el bit 26 | igual |
+| `0x90000000` | DRAM con el bit 31 | la vista **sin caché**; el retailOS marca así todos sus buffers salvo los de IRAM |
+| `0x94000000` | DRAM con los dos bits | consecuencia de los dos anteriores |
+| `0x20000000` | la NOR remapeada | `hwcompat.h` la lee ahí |
+
+La ventana de la dirección 0 **no** tiene gemela del bit 31, y es una decisión
+razonada: todo puntero etiquetado que se ha visto es de la forma `0x9xxxxxxx`
+(`ipod_video.c:1039-1050`).
+
+> **La talla de la DRAM es una cuestión abierta.** El modelo pone **64 MB**
+> porque es lo que Rockbox lee del silicio del aparato real, pero **dos fuentes
+> dicen 32**: el default interno del propio firmware de Apple (`fp = 0x700`) y
+> la tabla de iPodLinux para `hw_ver 0xb`. Las dos cifras pasan el assert del
+> retailOS y la máquina es autoconsistente con cualquiera de ellas. El
+> razonamiento está en `ipod_video.h:31-43`. No está resuelto.
 
 ### Números de IRQ
 
@@ -74,6 +101,13 @@ Banco bajo (0..31) y banco alto (32..63); el alto se encadena por `HI_IRQ`.
 | 32..34 | `GPIO0/1/2_IRQ` |
 | 36, 37 | `SER0_IRQ`, `SER1_IRQ` |
 | **40** | `I2C_IRQ`, **y también el click wheel** |
+
+> **Cuidado**: esta tabla es el hardware, no el modelo. Las **únicas** líneas
+> que el modelo levanta son **0, 1, 23, 26, 27, 30 (sintética) y 40**. Las
+> demás están mapeadas en el controlador pero nadie las conduce: la del UART se
+> pasa como `NULL` a `serial_mm_init`, y el GPIO, el buzón, el I2S y el USB no
+> generan interrupciones. `PP_SER0_IRQ` está definida y no se usa en ningún
+> `.c`.
 
 #### `HI_IRQ` no es una fuente, es un resumen
 
@@ -263,7 +297,7 @@ el `DMA_IRQ` que documenta Rockbox para ese mismo bloque. Índice 28 →
 | Offset | Nombre | Función |
 |---|---|---|
 | `+0x00` | `CMD` | control y cuenta |
-| `+0x04` | `STATUS` | cuenta restante, `INTR` (30), `BUSY` (31). **Leerlo limpia la interrupción** |
+| `+0x04` | `STATUS` | cuenta restante, `INTR` (30), `BUSY` (31). **Leerlo limpia la interrupción**. *Del modelo sólo sale `INTR`*: nunca escribe cuenta restante ni `BUSY`, así que `MASTER_STATUS` siempre lee 0 |
 | `+0x10` | `RAM_ADDR` | dirección en memoria; es la que avanza |
 | `+0x14` | descriptor del lado memoria (`FLAGS` en Rockbox) | |
 | `+0x18` | `PER_ADDR` | puerto del periférico; **no avanza** |
@@ -354,6 +388,7 @@ Direcciones dentro del chip que importan:
 | Dirección | Qué es |
 |---|---|
 | `0x00000000` | `BCMA_SRAM_BASE`, donde se sube el firmware `vmcs` |
+| `0x000001F0` | `BCMA_HANDSHAKE`. El retailOS escribe `{1, 0xA5A5}` y espera leer `{2, 0xA5A5}`; el modelo lo implementa (`ipod_video_bcm.c:98,417-424`) |
 | `0x000001F8` | `BCMA_COMMAND`, el buzón |
 | `0x000001FC` | `BCMA_STATUS`; **es donde el VideoCore publica la base de su interfaz de host**, no un registro de estado |
 | `0x000E0000` | `BCMA_CMDPARAM`, donde **Rockbox** escribe los píxeles. Apple no lo usa jamás |
@@ -416,8 +451,16 @@ dieciséis (`0x28861c` compone, `0x2872fc` lee).
 | `+0x00` | magia **`0xF1A55A1F`** (`0x2886a0`; `0x287360` rechaza la respuesta sin ella) |
 | `+0x04` | secuencia por canal, bit 31 forzado a 0 |
 | `+0x08` | opcode en la petición, **código de resultado** en la respuesta |
-| `+0x0c` (u16) | longitud real de la carga útil; `0xFFFF` = flujo terminado en NUL |
+| `+0x0c` (u16) | longitud real de la carga útil; `0xFFFF` = flujo terminado en NUL. **El modelo no lo implementa**, ver abajo |
 | `+0x0e` (u16) | siempre cero. Sin determinar |
+
+> **`0xFFFF` no está implementado.** `ipod_video_vc.c:537-543` toma la longitud
+> literal y calcula `padded = (len + 15) & ~15`. Con `len = 0xFFFF` eso da
+> `0x10000`, mucho mayor que el anillo (`VC_RING_LEN` = `0x800`), así que la
+> comprobación de espacio nunca se satisface y **el mensaje se queda bloqueado
+> en el anillo para siempre**. Hoy no se alcanza porque el retailOS manda
+> longitudes reales, pero si alguien se apoya en esta fila, que sepa que
+> describe el protocolo, no el modelo.
 
 El timbre host → VideoCore es **la media palabra `0x0031` a `BCM_CONTROL`**
 (`0x287ba4`: `mov r0,#49` y `strh`), no `0x10000400`, que solo aparece en el
@@ -444,7 +487,16 @@ sigue **sin identificar**.
 del propio firmware: `vmcs.bin` registra veinte órdenes con `gencmd_register`,
 sus nombres en un bloque contiguo en el offset `0xBE24`, y sus plantillas de
 respuesta en `0xBFF8` (`value=%d`) y `0xC004` en adelante (`error=%d
-error_msg="…"`). El retailOS manda cinco en el arranque:
+error_msg="…"`).
+
+**El modelo acepta 25, no 20**: los veinte de `0xBE24` más cinco subcomandos de
+`power_management` sacados de `vmcs.bin:0xF98C` (`pm_set_policy`,
+`pm_get_status`, `pm_show_stats`, `pm_start_logging`, `pm_stop_logging`),
+porque el retailOS los manda sueltos como si fueran órdenes de primer nivel
+(`ipod_video_vc.c:247-259`). Eso es lo que explica que `pm_set_policy min`
+aparezca en la lista de abajo.
+
+El retailOS manda cinco en el arranque:
 
 ```
 set_vll_dir /Resources/VideoCore/Library
@@ -618,11 +670,23 @@ Cómo se detectó: `bootloader/ipod.c` dice que `"portalplayer"` está en
 
 ## La otra vía: el retailOS de Apple
 
-Todo lo anterior es la vía de Rockbox, que ya arranca hasta el menú (ver
-[04-roadmap.md](04-roadmap.md)). El firmware original de Apple es una vía
-aparte, y ahora sabemos exactamente por qué no arranca.
+> ### ⚠ SUPERADO — el retailOS **sí arranca**
+>
+> Todo lo que sigue, hasta la sección *"Resuelto: quién escribe la global
+> 28"*, es el **registro histórico** de un diagnóstico que empezaba con la
+> premisa *"ahora sabemos exactamente por qué no arranca"*. Esa premisa dejó de
+> ser cierta: desde los commits `5b5af8966` y `662d0fb83` el retailOS arranca,
+> **dibuja su interfaz y se navega con la rueda y los botones**.
+>
+> Se conserva porque documenta hipótesis que resultaron falsas, y eso evita que
+> alguien las vuelva a plantear. Pero **no se lea como estado actual**. Para el
+> estado: [04-roadmap.md](04-roadmap.md). Para la cronología completa con las
+> hipótesis retiradas: [09-historia-5g.md](09-historia-5g.md).
 
-### El síntoma
+Todo lo anterior es la vía de Rockbox. El firmware original de Apple es una vía
+aparte, y en su momento se creyó saber exactamente por qué no arrancaba.
+
+### El síntoma (histórico)
 
 Con `-M iPod-Video,entry=0` la pantalla se queda negra (0 píxeles encendidos) y
 solo se traducen 266 bloques, frente a ~3700 de Rockbox. La secuencia de
@@ -716,7 +780,12 @@ b74:   movne r0, #0           ; no -> 0
 b78:   moveq r0, #1
 ```
 
-### La causa raíz: el retailOS necesita los dos núcleos
+### La causa raíz: el retailOS necesita los dos núcleos — HIPÓTESIS RETIRADA
+
+> **Retirada por el commit `9d823ec76`**: se modeló el COP y **no arregló
+> nada**. Era hardware real y el modelo se quedó, pero no era la causa. Además,
+> el párrafo de abajo describe un modelo que ya no existe: hoy la máquina crea
+> **dos** ARM (`max_cpus = min_cpus = 2`) y los dos duermen de verdad.
 
 `0x95024` **solo hace su trabajo si corre en el COP**. En el CPU sale
 inmediatamente sin tocar nada.
@@ -803,14 +872,32 @@ y con la respuesta elige una dirección base distinta:
 
 | carácter 5 | base |
 |---|---|
-| `'6'` | `0x40020000` |
 | `'2'` (nuestro chip) | `0x40020000` |
 | cualquier otra cosa | `0x40018000` |
 
+> Una versión anterior de esta tabla incluía una fila `'6' → 0x40020000`. **No
+> he podido verificarla** en ningún comentario del código ni en el
+> desensamblado citado; el código sólo documenta `cmp r0, #0x32`. Se retira
+> hasta que alguien la respalde.
+
 Devolver cero no era un desconocido inofensivo: era una tercera respuesta que
-el firmware no contempla, y se caía a la base de otro chip. Ahora los registros
-valen `0x50503530` / `0x32324300`, que es **PP5022C**, lo que reporta el
-aparato de la mesa.
+el firmware no contempla, y se caía a la base de otro chip.
+
+**Corrección (2026-08-09).** Este documento decía que los registros valen
+`0x50503530` / `0x32324300`, o sea **`PP5022C`**, "lo que reporta el aparato de
+la mesa". Es **falso**. El código pone (`ipod_video.c:746-747`):
+
+```c
+#define PP5022C_VER1        0x32324120   /* '2' '2' 'A' ' ' */
+#define PP5022C_VER2        0x50503530   /* 'P' 'P' '5' '0'  */
+```
+
+que deletrea **`"PP5022A "`**, no `PP5022C`. Es contraintuitivo y por eso
+conviene dejarlo escrito: el aparato real *es* un PP5022C y Rockbox lo muestra
+así en su pantalla de debug —de ahí salió el valor antiguo—, pero el firmware
+de Apple sólo conoce las formas `"PP5020A "` y `"PP5022A "`, así que los
+registros tienen que decir la forma `A`. El cambio lo hizo el commit
+`0763f94eb` y este documento no se actualizó entonces.
 
 ### Sigue sin arrancar, y por qué
 
@@ -895,7 +982,22 @@ RAM porque la global 28 vale cero, y el assert de la línea 231 salta. Lo que
 falta es encontrar quién debería escribirla.
 
 
-## El retailOS de Apple: dónde se para exactamente (2026-08-08)
+## El retailOS de Apple: dónde se para exactamente (2026-08-08) — SUPERADO
+
+> **Toda esta sección es una hipótesis retirada.** Se retiró en el commit
+> `d06ce3123`: `0xe9b98` **no es la primera llamada al sistema del firmware**,
+> es el **impresor de panics de la biblioteca C de ARM**, y la IRAM vacía era
+> **consecuencia, no causa** — los manejadores los instala el propio `osos` en
+> `0x2a0`, unos 150 bloques *después* del punto de muerte. La premisa sostuvo
+> tres commits.
+>
+> El párrafo de más abajo sobre "139 literales de `0x40000000`" también es
+> falso: era una búsqueda de bytes crudos que encontraba tablas de coma
+> flotante (`0x40000000` es la palabra alta del double `2.0`). Decodificando
+> las instrucciones que de verdad cargan un literal, `findlit.py` reduce los
+> 139 a **1** (commit `b9786a0bb`).
+>
+> Se conserva como registro del error. Ver [09-historia-5g.md](09-historia-5g.md).
 
 Con la cadena del chip corregida (ver el commit de `PP_VER1`), el firmware pasa
 el assert del tamaño de RAM y llega mucho más lejos. Se para aquí, y la traza
@@ -1008,3 +1110,51 @@ corrección importante: **antes de eso, dejar hablar al firmware**. El impresor
 de pánico llevaba tres commits siendo interpretado como "la primera llamada al
 sistema". Diez segundos de semihosting habrían dicho `Type: _sys_exit` y cuatro
 bancos de memoria vacíos.
+
+
+## Supuestos del modelo que no son datos
+
+Añadido el 2026-08-09 tras auditar el código contra este documento. El árbol
+marca sus supuestos con `ASSUMED` / `INFERRED` / `UNDETERMINED` en mayúsculas
+junto al valor, pero varios de los más antiguos —los de infraestructura— no
+habían llegado nunca a la wiki. Están aquí para que nadie los tome por medidas.
+
+| Supuesto | Qué se eligió | Fundamento |
+|---|---|---|
+| **Tamaño de la DRAM** | 64 MB | Lo que Rockbox lee del silicio. **Dos fuentes dicen 32** (el default del propio firmware de Apple y la tabla de iPodLinux). Cuestión abierta, ver el mapa de memoria |
+| **Tamaño de la IRAM** | 128 KB (`0x20000`) | **Derivado, no inventado**: el firmware de Apple sitúa sus globales en `IRAM_END - 0x100 + N` y usa `0x40020000` como `IRAM_END` para un PP5022 (`0x40018000` para el PP5020, o sea 96 KB). El comentario de `ipod_video.h:116-119` lo llamaba "deliberadamente generoso" citando el script de enlazado de Rockbox; eso es anterior a este hallazgo |
+| **Dónde va el bloque SysInfo** | `0x4001fe00` | **Elección nuestra.** El par {tag, puntero} de `0x4001ff18`/`+4` sí está documentado por iPodLinux y confirmado por el firmware, pero **a dónde apunta el puntero no lo sabe nadie**: no existe volcado de la ROM. Se eligieron los 256 bytes justo debajo del buzón porque están libres de todo lo que el firmware usa temprano |
+| **`BCM_VC_DONE = 1` como respuesta a un comando terminado** | reutilizar el 1 | El 1 está **derivado** para el *handshake de arranque* (`0x288080` hace `cmp r0,#1`). Reutilizarlo como acuse de cualquier comando terminado es una **elección**, marcada `ASSUMED` en `ipod_video_bcm.c:176-183` |
+| **Código de resultado del I²C cuando nadie contesta** | `1` | **Marcador de posición.** Se sabe que los bits 2:0 son un código y que 0 es éxito; los valores 1..6 están sin determinar. El modelo devuelve un 1 inventado en el NAK (`ipod_video_i2c.c:78-84`) |
+| **Conversión del ADC del PCF50605** | instantánea | El chip real tarda un tiempo que no está documentado. El firmware gira sobre el bit de "listo", así que contestar al momento funciona, pero no es lo que hace el hardware (`ipod_video_pcf50605.c:53-58`) |
+| **Sólo se escriben 4 campos del bloque SysInfo** | los demás a cero | Decisión **deliberada**: `sysinfo_t` de iPodLinux pone `sdram_size` en `+0x80` y este firmware lo lee en `+0xe0`, dentro de un pad que iPodLinux nunca decodificó. Rellenarlo desde ahí sería *"inventar con apariencia de rigor"* |
+
+Los supuestos del Broadcom y del VideoCore (base de la interfaz de host,
+tamaño de la SDRAM del chip, opcodes 1/2/4/9/16, canal tipo 7) sí están
+documentados, en [04-roadmap.md](04-roadmap.md).
+
+## Diferencias entre el modelo y el hardware que conviene tener presentes
+
+No son supuestos: son sitios donde el modelo **a sabiendas** no reproduce el
+hardware, y donde apoyarse en este documento sin leer el código lleva a error.
+
+- **`TIMERn_VAL` lee 0**, no la cuenta restante.
+- **El controlador de interrupciones no modela prioridad ni FIQ**; las FIQ
+  devuelven siempre 0. Sí modela `FORCED_SET`/`FORCED_CLR`.
+- **El GPIO no genera interrupciones**, y `INPUT_VAL` devuelve `0xffffffff`
+  fijo: las entradas son activas a baja, así que un cero significaría "todos
+  los botones pulsados, hold incluido".
+- **El DMA ignora las líneas de petición del periférico** (`WAIT_REQ` deja el
+  canal quieto) y toma el ancho de acceso sólo del descriptor del lado
+  periférico; el del lado memoria no se mira.
+- **La rueda nunca se "despega"**: `wheel_touched` se pone y no se limpia.
+- **El campo `mask` del remap no se aplica**: entra siempre la DRAM entera y
+  los flags de permiso se ignoran.
+- **El IDE no es migrable** y su estado de DMA no se guarda; el resto de
+  dispositivos sí tienen `VMStateDescription`.
+- **El BCM arranca con el VideoCore ya en marcha**, la misma ficción que
+  `GPO32` bit 14, para que Rockbox no intente el bootstrap.
+- **El `rect` de `LCD_UPDATERECT` se ignora** y se repinta la pantalla entera.
+- `I2S_MEM_BASE`, `LCD_MEM_BASE`, `SER1_MEM_BASE`, `PP_SER0_IRQ`,
+  `IDE_TASKFILE_OFF` e `IDE_CONTROL_OFF` están **definidas y no se usan**: son
+  documentación dentro de la cabecera, no modelo.

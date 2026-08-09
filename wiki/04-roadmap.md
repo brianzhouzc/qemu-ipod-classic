@@ -29,9 +29,12 @@ Rockbox extraído del aparato real recorre esta secuencia:
 7. Llega al **controlador IDE** (`+0x1fc`), buscando `rockbox.ipod` en la FAT32
 
 Modelado hasta ahora: DRAM, IRAM, ventana de flash NOR con la revisión de
-hardware, `PROCESSOR_ID`, `CPU_CTL`/`COP_CTL`, `USEC_TIMER`, UART 16550,
-controlador de interrupciones, IDE, click wheel, GPIO, caché, remap, BCM/LCD,
-reloj/PLL y control de dispositivo.
+hardware, **los dos núcleos ARM** (CPU y COP, que duermen y despiertan de
+verdad), `PROCESSOR_ID`, `CPU_CTL`/`COP_CTL`, `USEC_TIMER`, UART 16550,
+controlador de interrupciones, IDE con DMA ATA, click wheel, GPIO, caché,
+remap (con los alias del bit 26 y del bit 31), **los dos bloques de DMA del
+PP502x**, **el I²C y el PCF50605**, el BCM2722 con **la interfaz de host del
+VideoCore**, reloj/PLL, control de dispositivo y **semihosting de ARM**.
 
 ### El bootloader ya pinta en la pantalla emulada
 
@@ -194,10 +197,13 @@ diferencia pequeña de píxeles **no prueba nada**. Solo vale la barra movida.
 
 ### Lo que sigue sin modelar
 
-- **El COP.** `core_thread_init()` despierta al segundo núcleo y se duerme
-  esperándolo; como nuestro `sleep_core` no duerme, el CPU sigue y arranca
-  igual, pero todo lo que Rockbox programe en el COP no se ejecuta.
+> **Corregido el 2026-08-09**: esta lista abría con *"El COP: como nuestro
+> `sleep_core` no duerme, el CPU sigue y arranca igual"*. Dejó de ser cierto en
+> el commit `9d823ec76`: hay **dos** núcleos ARM y los dos se duermen y
+> despiertan de verdad. El buzón CPU-COP de `0x60001000` sí sigue sin modelar.
+
 - **Audio.** El I²S y el códec no están; la reproducción no suena.
+- **El buzón CPU-COP** de `0x60001000`, que cae en el suelo de `-d unimp`.
 - **Escritura por DMA.** Solo se ha ejercitado la lectura. El camino de
   escritura está implementado pero no probado.
 - **La rueda no genera "untouch"**: una vez tocada se queda tocada.
@@ -564,9 +570,10 @@ está el porqué.
 
 `navtest.sh` contra `assets/nav-baseline`: **sin regresión**. La barra sigue
 bajando (12 312 y 12 114 px de diferencia por paso de rueda), SELECT sigue
-entrando (31 597 px), y frente a la referencia guardada las siete capturas
-difieren 120 px (el reloj de la barra de estado) salvo la última, 1 590 px (los
-contadores de la pantalla de grabación, que corren solos).
+entrando (31 597 px), y frente a la referencia guardada las capturas difieren
+un par de cientos de píxeles (el reloj de la barra de estado) salvo la última,
+que sale idéntica. *(La cifra exacta del reloj no es un invariante; ver la nota
+al final de la sección "El retailOS dibuja, y se navega".)*
 
 ### Los cuatro muros de esta sesión
 
@@ -864,8 +871,21 @@ Capturas en `assets/apple/`, reproducibles con
 idénticas entre sí — la pantalla se pinta y se queda.
 
 `navtest.sh` contra `assets/nav-baseline`: **sin regresión**. Seis fotogramas
-difieren 225–227 px (el reloj de la barra de estado) y el séptimo 1 590 px (los
-contadores de la pantalla de grabación, que corren solos), igual que antes.
+difieren un par de cientos de píxeles (el reloj de la barra de estado) y el
+séptimo **0**, byte a byte idéntico.
+
+> **Corregido el 2026-08-09, ejecutándolo.** Aquí ponía que el séptimo
+> fotograma difiere 1 590 px "por los contadores de la pantalla de grabación".
+> Medido hoy: el séptimo es *Now Playing*, no lleva reloj, y sale **byte a
+> byte idéntico** a la línea base. El propio mensaje del commit `5b5af8966` ya
+> decía "0 in the seventh".
+>
+> Y sobre los otros seis: **la cifra exacta no es un invariante**. En este
+> documento aparece como 120 y como 225–227, en el commit `5b5af8966` como 201,
+> y una ejecución del 2026-08-09 dio 266. Todas son el reloj, y cambian con los
+> dígitos que cambien entre una captura y otra. Lo estable —y lo único que hay
+> que comprobar— es **la forma**: seis fotogramas con un par de cientos de
+> píxeles de diferencia y el séptimo a cero.
 
 ### El hallazgo que da la vuelta al diagnóstico anterior
 
@@ -1044,6 +1064,12 @@ contra la que validar cada periférico que modelemos.
 
 ## Hitos
 
+> **Estos hitos son los del iPod classic 6G (S5L8702)**, que fue el objetivo
+> original. H3 en adelante están parados: no por falta de plan, sino porque el
+> firmware del Classic está cifrado y no hay nada real que arrancar. El trabajo
+> que sí llegó a alguna parte es el del iPod Video, y no sigue esta numeración
+> — su recorrido es todo lo anterior de este documento.
+
 ### H0 — Infraestructura ✅
 - [x] Clonar `devos50/qemu-ios`, crear rama `ipod_classic_6g`
 - [x] Compilar el baseline (`arm-softmmu`) en WSL
@@ -1170,6 +1196,27 @@ una bootrom esta se queda con la dirección.
 Este hito depende de material que ahora mismo no tenemos. Se replantea cuando
 lleguemos.
 
-## Estado actual
+## Estado actual (2026-08-09)
 
-En H0 completo, empezando H1.
+> **Corregido.** Aquí ponía *"En H0 completo, empezando H1"*, que era la última
+> línea del documento y llevaba unos 50 commits sin tocarse. Contradecía a la
+> tabla de hitos de este mismo fichero (H0, H1 y H2 están ✅) y a la tabla de
+> estado de la cabecera.
+
+**iPod Video 5G (`iPod-Video`, PP5022C)** — es la máquina que arranca software
+real, y va muy por delante de lo que describen los hitos H0–H7:
+
+- **Rockbox** arranca hasta el menú y se navega con la rueda.
+- **El retailOS de Apple** arranca, dibuja su interfaz y se navega: pantalla de
+  idioma → menú principal → submenú de *Videos* → atrás.
+- Lo que falta: **audio** (ni I²S ni códec), **USB**, y ejecutar de verdad el
+  firmware del VideoCore, del que hoy sólo se modela el protocolo.
+
+**iPod classic 6G (`iPod-Classic`, S5L8702)** — H0, H1 y H2 completos: ejecuta
+código, con timers y una ruta de interrupción verificados de extremo a extremo
+contra tests bare-metal. **No arranca firmware real** y no lo hará mientras el
+`osos` siga cifrado con una clave que vive en el silicio. H3–H7 siguen abiertos
+y son reaprovechables si aparece un `osos` descifrado; ver también
+[08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md), porque
+`freemyipod/qemu` ya tiene un modelo del S5L8702 bastante más completo que el
+nuestro.

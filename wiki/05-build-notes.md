@@ -15,10 +15,17 @@ dos copias.
 
 ```bash
 sudo apt install -y libsdl2-dev libssl-dev libglib2.0-dev libpixman-1-dev \
-                    ninja-build python3-venv
+                    ninja-build python3-venv \
+                    dosfstools mtools
 ```
 
 Ya instaladas: glib 2.80.0, pixman 0.42.2, SDL2 2.30.0, OpenSSL 3.0.13.
+Verificadas el 2026-08-09, junto con gcc 13.3.0, Python 3.12.3, ninja 1.11.1 y
+meson 1.3.2 (en `build/pyvenv/`).
+
+`dosfstools` y `mtools` **no** son de QEMU: los necesita `mkdisk.sh` para
+construir la FAT32 de la imagen de disco. `python3` lo usan `navtest.sh`,
+`appletest.sh`, `fwtool.py`, `extract-vc.py` y el propio `mkdisk.sh`.
 
 ## Trampa: finales de línea CRLF
 
@@ -39,6 +46,37 @@ git rm --cached -r . -q
 git reset --hard
 ```
 
+### La trampa no está cerrada del todo
+
+`core.autocrlf=false` impide que **git** convierta, pero **no impide que un
+editor de Windows escriba CRLF**. Contados el 2026-08-09, **tres ficheros
+versionados estaban al 100 % en CRLF**, violando el `.editorconfig` del propio
+repo (línea 16: `end_of_line = lf`):
+
+| Fichero | Situación |
+|---|---|
+| `hw/arm/meson.build` | **De QEMU upstream.** Era LF hasta `fb7c1039a` y pasó a CRLF en `5b5af8966`. Resultado: **añadir una sola línea a la lista de fuentes produjo un diff de 77 insertions + 77 deletions**. **Convertido a LF**; verificado que el contenido no cambia |
+| `hw/arm/ipod_video/ipod_video.c` | Nuestro. 1384 líneas. Se deja como está |
+| `include/hw/arm/ipod_video/ipod_video.h` | Nuestro. 364 líneas. Se deja como está |
+
+El caso que duele es el primero: es un fichero upstream, así que cualquier
+rebase o diff contra QEMU arrastra ese ruido. Los dos nuestros son cosméticos y
+se dejan para no meter un diff de 1.700 líneas de puro espacio en blanco en
+mitad de otro trabajo; si se convierten algún día, que sea en un commit propio
+y sólo de eso.
+
+> **Para contarlos, `grep -c $'\r'` no vale** en Git Bash: da falsos positivos.
+> Esto sí:
+>
+> ```bash
+> for f in $(git ls-files); do
+>   n=$(tr -cd '\r' < "$f" | wc -c)
+>   [ "$n" -gt 0 ] && echo "$n CR  $f"
+> done
+>
+> sed -i 's/\r$//' <fichero>   # convertir
+> ```
+
 ## Trampa 2: symlinks de git en Windows
 
 El árbol de QEMU tiene 7 symlinks, todos en `subprojects/libvduse` y
@@ -57,11 +95,21 @@ ignore):
 ```bash
 cd /mnt/c/Desarrollo/qemu-ios
 git ls-files -s | awk '$1=="120000"{print $4}' | while read -r p; do
+  # Ya convertido (skip-worktree): no tocarlo. Ver el aviso de abajo.
+  [ "$(git ls-files -v -- "$p" | cut -c1)" = "S" ] && continue
   tgt=$(cat "$p"); real="$(dirname "$p")/$tgt"
   rm -rf "$p"; cp -r "$real" "$p"
 done
 git ls-files -s | awk '$1=="120000"{print $4}' | xargs git update-index --skip-worktree
 ```
+
+> **Aviso: esto se ejecuta UNA vez, sobre un clon recién hecho.** El snippet
+> original **no era idempotente y volver a lanzarlo borraba los ficheros**.
+> Comprobado el 2026-08-09 sobre una copia: una vez convertidos, `cat "$p"` ya
+> no devuelve la ruta destino sino los 14 KB de código C, así que `cp` falla
+> con *"File name too long"*… **pero el `rm -rf` de la misma línea sí se
+> ejecuta**. Y como están en `skip-worktree`, `git checkout` tampoco los
+> restaura. La guarda `[ ... ] = "S"` de arriba es lo que lo evita.
 
 Estos subproyectos (vhost-user/VDUSE) no tienen nada que ver con emular un iPod;
 solo estorban.
@@ -105,10 +153,29 @@ wsl -d Ubuntu-24.04 -e bash -c 'cd /mnt/c/Desarrollo/qemu-ios && mkdir -p build 
                --disable-werror --enable-pie'
 
 # Compilar
-wsl -d Ubuntu-24.04 -e bash -c 'cd /mnt/c/Desarrollo/qemu-ios/build && make -j10'
+wsl -d Ubuntu-24.04 -e bash -c 'cd /mnt/c/Desarrollo/qemu-ios/build && ninja qemu-system-arm'
 ```
 
 El binario queda en `build/qemu-system-arm`.
+
+`make -j10` también funciona —delega en ninja—, pero añade unos 8 s de
+`meson introspect`; `ninja qemu-system-arm` es la vía directa.
+
+### Cuánto tarda, y una trampa que parece un build roto
+
+Medido el 2026-08-09 en este equipo, sobre un `build/` limpio:
+
+| Operación | Tiempo |
+|---|---|
+| `configure` + `ninja` **desde cero** | **16 min** (configure ~3, ninja ~13) |
+| `ninja` sin nada que hacer, **en caliente** | 21 s |
+| `ninja` sin nada que hacer, **primera vez tras editar desde Windows** | **6 min** |
+| Recompilar un `.c` y enlazar | ~3 min |
+
+> **Ese "no-op" de seis minutos no es un build roto: es el filesystem.** WSL
+> tiene que hacer `stat` de todo el árbol a través de 9p, y la primera pasada
+> tras haber tocado ficheros desde Windows es lentísima. La segunda baja a 20 s.
+> Sin saber esto es fácil concluir que algo va mal.
 
 ## Referencia de Rockbox
 
@@ -143,8 +210,27 @@ S5L8702 en `assets/ref/s5l8702_macros.h`.
   el binario se compila con `--enable-sdl`, y `-display help` lista los
   backends disponibles.
 - Con `remap=on` la DRAM aparece en 0 desde el reset, que es lo que hace falta
-  para cargar directamente una `rockbox.ipod` (está enlazada para la dirección
-  0 y normalmente depende de que el bootloader monte el mapeo antes).
+  para cargar directamente la aplicación de Rockbox (está enlazada para la
+  dirección 0 y normalmente depende de que el bootloader monte el mapeo antes).
+  Llega al menú en ~20 s en vez de 28.
+
+  > **Corregido**: aquí ponía "cargar directamente una `rockbox.ipod`". **No
+  > sirve tal cual**: hay que quitarle antes su cabecera de 8 bytes (checksum
+  > más el target id `"ipvd"`). Probado el 2026-08-09 — con la cabecera puesta
+  > la pantalla se queda negra, 0 píxeles. Lo que arranca es
+  > `assets/images-5g/rockbox_app.bin`, que es `rockbox.ipod[8:]`.
+
+### Propiedades de la máquina
+
+`entry`, `remap` y `semihosting` se registran en `instance_init`, así que **no
+aparecen en `-M iPod-Video,help`**, que sólo lista las propiedades de clase.
+Quien no lea el fuente o esta wiki no las encuentra.
+
+| Propiedad | Por defecto | Qué hace |
+|---|---|---|
+| `entry` | `0` | Offset dentro del `osos` donde empieza la ejecución |
+| `remap` | `off` | DRAM en la dirección 0 desde el reset |
+| `semihosting` | `on` | Contesta al semihosting de ARM; es como el retailOS imprime sus panics |
 
 ### Teclas
 
@@ -163,19 +249,44 @@ El teclado está mapeado al click wheel:
 La primera pulsación de rueda después de cambiar de sentido no mueve nada:
 Rockbox reinicia su acumulador al invertir la dirección.
 
-### Prueba automática de navegación
+### Pruebas automáticas de navegación
 
-```bash
-./tools/ipod_video/navtest.sh
-```
-
-Arranca, sale de *Now Playing* con MENU, gira la rueda, selecciona, y va
-capturando la pantalla en cada paso a `assets/nav/*.png`, informando de cuántos
+Hay dos, una por firmware. Las dos capturan a `assets/` e informan de cuántos
 píxeles cambia cada fotograma respecto al anterior.
 
-**Cuidado al interpretar esas cifras.** La pantalla *Now Playing* se anima sola
-(el título se desplaza), así que una diferencia de ~2.000 píxeles no prueba
-nada. Solo cuenta la barra de selección movida, que son ~14.000.
+```bash
+./tools/ipod_video/navtest.sh     # Rockbox, ~55 s
+./tools/ipod_video/appletest.sh   # el retailOS de Apple, ~3 min
+```
+
+`navtest.sh` arranca, sale de *Now Playing* con MENU, gira la rueda y
+selecciona. `appletest.sh` hace dos arranques del retailOS: uno que fotografía
+la pantalla a 10, 20, 40, 60, 90 y 120 s para probar que la interfaz sale y se
+queda, y otro que recorre idioma → menú principal → *Videos* → atrás.
+
+**Cuidado al interpretar las cifras.** La pantalla *Now Playing* de Rockbox se
+anima sola (el título se desplaza), así que una diferencia de ~2.000 píxeles no
+prueba nada. Sólo cuenta la barra de selección movida, que son ~14.000, o una
+pantalla nueva, que pasa de 18.000. Un puñado de píxeles es el reloj o el icono
+de batería.
+
+> **Ninguno de los dos scripts es una aserción: son generadores de
+> evidencia.** Los dos cierran la invocación de QEMU con `|| true` y su
+> post-proceso en Python no comprueba nada. Verificado: si no se genera ningún
+> PPM, el bucle no imprime nada **y el script sale con código 0**. Un QEMU que
+> muera al arrancar da un "pase" silencioso. Hay que mirar las cifras, o
+> ponerles un umbral.
+
+> **Los fotogramas de Rockbox no son reproducibles bit a bit** contra una línea
+> base guardada, porque su barra de estado lleva reloj: cambian un par de
+> cientos de píxeles según la hora. Los del retailOS **sí** lo son, porque no
+> dibuja reloj.
+
+El `-semihosting-config enable=on,target=native` que lleva `appletest.sh`
+dentro es **redundante**: la máquina activa el semihosting por su cuenta.
+Comprobado quitándolo — la captura sale con el mismo hash. El comentario del
+script sigue siendo buen consejo (sin semihosting los panics son silenciosos),
+pero el flag no hace falta.
 
 ### Sacar una captura sin ventana
 

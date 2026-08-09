@@ -45,7 +45,16 @@ que leerla en crudo: empieza en `63 × 512 = 0x7E00` y ocupa `160587 × 512 =
 82.220.544` bytes.
 
 `tools/ipod_video/dump-firmware.ps1` automatiza el volcado (requiere
-administrador; abre el disco en solo lectura).
+administrador; abre el disco en solo lectura, busca el disco por modelo y se
+niega si hay más de un candidato o si es el disco de sistema).
+
+> **Trampa del propio script**, verificada el 2026-08-09: la comprobación final
+> que busca el magic `]ih[` en el offset `0x100` **falla siempre sobre su
+> propia salida**, y no es que el volcado esté mal. El volcado empieza en el
+> sector 0, que es el MBR, así que el `]ih[` está en `0x7e00 + 0x100 = 0x7f00`;
+> en `0x100` hay bytes del MBR. Por eso el script produce también
+> `ipod-video-fwpart.bin`, que es el volcado **sin** los 63 sectores de
+> cabecera — y es ese, no el completo, el que hay que darle a `fwtool.py`.
 
 ## Contenido de la partición de firmware
 
@@ -120,10 +129,19 @@ emulador: el bootloader de Rockbox, `rockbox.ipod`, y el `retailOS` de Apple.
 ## Estado
 
 Este aparato es el que arranca. Con su propio volcado del `osos` y una imagen
-de disco construida con `tools/ipod_video/mkdisk.sh`, el emulador llega hasta
-el menú de Rockbox y se navega con la rueda. Ver [04-roadmap.md](04-roadmap.md)
-para el recorrido y [07-pp502x-hardware.md](07-pp502x-hardware.md) para los
-registros.
+de disco construida con `tools/ipod_video/mkdisk.sh`, el emulador arranca **los
+dos** firmwares:
+
+- **Rockbox**, hasta el menú, navegable con la rueda.
+- **El retailOS de Apple**, que dibuja su interfaz y se navega: pantalla de
+  idioma → menú principal → submenú de *Videos* → atrás.
+
+> Esta sección decía sólo *"llega hasta el menú de Rockbox"*. Se corrige: el
+> retailOS también arranca desde los commits `5b5af8966` y `662d0fb83`.
+
+Ver [04-roadmap.md](04-roadmap.md) para el recorrido,
+[07-pp502x-hardware.md](07-pp502x-hardware.md) para los registros y
+[09-historia-5g.md](09-historia-5g.md) para cómo se averiguó cada cosa.
 
 Resuelto desde que se escribió esta página:
 
@@ -200,14 +218,21 @@ imprimir `ipod model: ipvd`.
 
 ### Para qué lo queremos
 
-**No para el bloqueo actual.** El retailOS muere antes de mirar la flash (ver
-[07-pp502x-hardware.md](07-pp502x-hardware.md)); el obstáculo es el segundo
-núcleo. Pero la sección **`vmcs`** es el firmware del Broadcom, que es lo que
-`lcd-video.c` busca cuando el BCM no viene ya encendido — hoy lo esquivamos
-poniendo `GPO32_VAL` bit 14 a mano. Con el volcado real podríamos modelar esa
-ruta en vez de cortocircuitarla, y tendríamos además `diskmode` y `diagmode`,
-que son imágenes arrancables independientes y objetivos mucho más pequeños que
-el retailOS entero.
+**No hace falta para arrancar ninguno de los dos firmwares**: los dos arrancan
+hoy sin volcado de la ROM.
+
+> Aquí ponía *"el obstáculo es el segundo núcleo"*. **Esa hipótesis se retiró**
+> en el commit `9d823ec76`, que modeló el COP y no arregló nada. La cadena
+> completa está en [09-historia-5g.md](09-historia-5g.md).
+
+Sigue siendo interesante por dos motivos. La sección **`vmcs`** es el firmware
+del Broadcom, que es lo que `lcd-video.c` busca cuando el BCM no viene ya
+encendido — hoy lo esquivamos poniendo `GPO32_VAL` bit 14 a mano; con el
+volcado real podríamos modelar esa ruta en vez de cortocircuitarla. (El
+`vmcs.bin` en sí **ya lo tenemos** sin volcar la NOR: `extract-vc.py` lo saca
+del FAT16 incrustado en la partición de firmware del disco.) Y tendríamos
+`diskmode` y `diagmode`, que son imágenes arrancables independientes y
+objetivos mucho más pequeños que el retailOS entero.
 
 Lo que **no** vale: `ipodpatcher` solo lee la partición de firmware del disco,
 no la NOR. El `getflash` de iPodLinux decodifica el actualizador `aupd` que
@@ -216,10 +241,17 @@ del chip (y su SVN está muerto).
 
 ## Pendiente
 
-- **Los dos núcleos.** `core_thread_init()` despierta al COP y se duerme
-  esperándolo. Como nuestro `sleep_core` no duerme de verdad, el CPU sigue y
-  arranca igual, pero el COP nunca ejecuta nada, así que lo que Rockbox le
-  programe se queda sin hacer. El buzón de `0x60001000` tampoco está modelado.
-- **Audio.** Ni I2S ni códec: no suena.
-- **El firmware de Apple**, que es una vía aparte y sigue atascada en una
-  llamada al sistema con la pila de supervisor sin inicializar.
+> **Corregido el 2026-08-09.** Esta lista tenía dos entradas que ya no son
+> ciertas: *"los dos núcleos… nuestro `sleep_core` no duerme de verdad"*
+> (resuelto en `9d823ec76`: hay dos ARM y los dos duermen y despiertan de
+> verdad) y *"el firmware de Apple sigue atascado en una llamada al sistema con
+> la pila de supervisor sin inicializar"* (esa hipótesis se **retiró** en
+> `d06ce3123` — no era una llamada al sistema, era el impresor de panics de la
+> libc de ARM — y hoy el retailOS arranca y se navega).
+
+- **Audio.** Ni I2S ni códec: no suena, en ninguno de los dos firmwares.
+- **USB.** Sin modelar.
+- **El buzón CPU-COP** de `0x60001000`.
+- **Ejecutar el firmware del VideoCore.** El `vmcs.bin` real se sube al chip
+  emulado por DMA, pero sólo se modela el *protocolo*: nadie ejecuta esa
+  imagen.
