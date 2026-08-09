@@ -31,6 +31,39 @@
 #define DRAM_MEM_SIZE       0x04000000   /* 64 MB, what this unit reports */
 
 /*
+ * Address bit 26 is not decoded by the SDRAM controller: DRAM answers both
+ * with it clear and with it set, so every DRAM address has a twin 0x04000000
+ * higher. Apple's firmware relies on this and Rockbox never touches it, which
+ * is why it took until now to notice.
+ *
+ * VERIFIED, from the firmware's own scatter-load table at 0x84040..0x840a8 in
+ * apple_retailos.bin. Sources and destinations there run in one contiguous
+ * sweep that crosses the bit:
+ *
+ *   src 0x006c9a64 + len 0x0004c734 = 0x00716198, and the next src is
+ *   0x0471619c -- 0x00716198 + 4 with bit 26 stuck on.
+ *   dst 0x1493690c + len 0x0004c734 = 0x14983040, the next dst.
+ *
+ * A discontinuity of exactly 0x04000000 in the middle of a run of consecutive
+ * file offsets is not an address change; it is the same address wearing a flag.
+ * The firmware also builds such addresses at runtime rather than loading them
+ * whole: 0xdb8 does "bic r0, r2, #0xfc000000" then 0xdbc "orr r0, r0,
+ * #0x14000000".
+ *
+ * INFERRED: what the bit means to the hardware. The PP502x remap unit's mask
+ * field says the same thing indirectly -- MMAP1 is programmed at 0x228 with
+ * logical 0x00003a00 / physical 0x10000f84, and comparing that against the
+ * masks Rockbox's crt0-pp.S uses (0x3e00 for a 32 MB window, 0x3c00 for 64 MB)
+ * puts mask bit k over address bit k+16, so bits 26 and 27 of a logical
+ * address are passed through to the physical bus untouched. Something below
+ * has to be ignoring bit 26, and the only candidate is the memory controller.
+ * Whether it also means uncached, unbuffered or nothing at all is not known,
+ * and nothing here depends on the answer: an alias behaves identically either
+ * way as long as there is no cache to be coherent with.
+ */
+#define DRAM_ALIAS_BIT      0x04000000
+
+/*
  * IRAMORIG in Rockbox's app-pp.lds. That script only claims 0xc000 for the
  * application, which is a budget rather than the size of the hardware; the
  * real figure is not confirmed, so this is deliberately generous.
@@ -159,6 +192,8 @@ typedef struct {
     uint32_t cache_ctl;
     MemoryRegion *vect_remap;
     MemoryRegion *dram_remap;
+    /* The bit-26 twin of dram_remap, switched in with it. */
+    MemoryRegion *dram_remap_alias;
     bool dram_remapped;
     bool force_remap;
     uint32_t mmap_regs[1024];

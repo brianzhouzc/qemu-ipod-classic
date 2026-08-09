@@ -375,6 +375,8 @@ static void pp502x_mmap_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset <= 0x04 && value != 0 && !nms->dram_remapped) {
         nms->dram_remapped = true;
         memory_region_set_enabled(nms->dram_remap, true);
+        /* Bit 26 is not decoded, so the twin window moves with it. */
+        memory_region_set_enabled(nms->dram_remap_alias, true);
     }
 }
 
@@ -931,6 +933,41 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_add_subregion_overlap(sysmem, 0, nms->dram_remap, 2);
     memory_region_set_enabled(nms->dram_remap, nms->force_remap);
     nms->dram_remapped = nms->force_remap;
+
+    /*
+     * The bit-26 twins of the two DRAM windows -- see DRAM_ALIAS_BIT.
+     *
+     * Apple's firmware reads its own image through 0x0471619c and writes its
+     * RW data through 0x1493690c, both of which are ordinary DRAM addresses
+     * with bit 26 set. Rockbox never forms one, which is why a machine that
+     * runs Rockbox to its menu still could not get retailOS past its first
+     * scatter-load: 0x84390 (ldrcc r3, [r0], #4 inside __scatterload_copy)
+     * took a data abort on its very first read.
+     *
+     * The high twin is permanent because DRAM at DRAM_MEM_BASE is permanent.
+     * The low one follows dram_remap, because what lives at address 0 -- and
+     * therefore at 0x04000000 -- depends on whether the remap has happened.
+     * Before it does, the flash window at 0 has a twin too, at a lower
+     * priority so the DRAM alias covers it once enabled.
+     */
+    MemoryRegion *dram_alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(dram_alias, NULL, "dram-bit26", dram, 0,
+                             DRAM_MEM_SIZE);
+    memory_region_add_subregion(sysmem, DRAM_MEM_BASE | DRAM_ALIAS_BIT,
+                                dram_alias);
+
+    MemoryRegion *rom_alias_lo = g_new(MemoryRegion, 1);
+    memory_region_init_alias(rom_alias_lo, NULL, "flash-rom-bit26", rom, 0,
+                             FLASH_ROM_MEM_SIZE);
+    memory_region_add_subregion_overlap(sysmem, DRAM_ALIAS_BIT,
+                                        rom_alias_lo, 1);
+
+    nms->dram_remap_alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(nms->dram_remap_alias, NULL, "dram-remap-bit26",
+                             dram, 0, DRAM_MEM_SIZE);
+    memory_region_add_subregion_overlap(sysmem, DRAM_ALIAS_BIT,
+                                        nms->dram_remap_alias, 2);
+    memory_region_set_enabled(nms->dram_remap_alias, nms->force_remap);
 
     MemoryRegion *rom_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
