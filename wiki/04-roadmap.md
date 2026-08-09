@@ -10,7 +10,7 @@ el sistema original de Apple se movió allí.
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
-| `iPod-Video` | PP5022C | **Rockbox se navega entero; el retailOS de Apple arranca del todo y se queda subiendo el firmware del chip de vídeo por DMA** |
+| `iPod-Video` | PP5022C | **Rockbox se navega entero; el retailOS de Apple arranca del todo, sube el firmware del chip de vídeo y lo pone en marcha, pero no dibuja: la UI la pinta el VideoCore** |
 
 El trabajo del Classic sigue intacto y es reaprovechable si algún día
 conseguimos un `osos` descifrado.
@@ -546,6 +546,258 @@ justo del Broadcom para fingirlas (y entonces hay que averiguar qué protocolo
 de comandos espera el retailOS, que no tiene por qué ser el de Rockbox), o se
 busca la ruta por la que Rockbox se salta el arranque del chip y se mira si el
 retailOS tiene una equivalente.
+
+## El firmware del Broadcom sube, y el chip contesta (2026-08-09)
+
+Hecho lo de arriba: **el retailOS termina toda la puesta en marcha del chip de
+vídeo**. Sube los 201 376 bytes del blob `vmcs` por DMA, arranca el VideoCore,
+recibe las dos respuestas que esperaba, descubre la interfaz del chip y sigue.
+Noventa segundos de ejecución con `-d guest_errors`: **el log sale vacío**. Ni
+un pánico, ni un acceso rechazado, ni un registro sin modelar nuevo. Y el disco
+trabaja de verdad — 460 `READ DMA EXT` de 64 sectores, unos 14 MB leídos, más
+78 escrituras.
+
+**La pantalla sigue negra.** Capturas a los 10, 20, 40, 60 y 90 s:
+**0 píxeles encendidos en las cinco, 0,00 %**. Eso ya no es un fallo del
+arranque; es que el retailOS no dibuja donde nuestra consola mira, y más abajo
+está el porqué.
+
+`navtest.sh` contra `assets/nav-baseline`: **sin regresión**. La barra sigue
+bajando (12 312 y 12 114 px de diferencia por paso de rueda), SELECT sigue
+entrando (31 597 px), y frente a la referencia guardada las siete capturas
+difieren 120 px (el reloj de la barra de estado) salvo la última, 1 590 px (los
+contadores de la pantalla de grabación, que corren solos).
+
+### Los cuatro muros de esta sesión
+
+| # | Muro | Cómo se encontró | Arreglo |
+|---|---|---|---|
+| 1 | la tarea dormía para siempre tras pedir el DMA | ya estaba acotado | `pp502x-dma`, los **dos** bloques |
+| 2 | `Invalid write at addr 0x0, size 1, region 'ipod-video.bcm2722'` | el propio log de QEMU, en cuanto el DMA empezó a mover datos | el puerto del BCM acepta accesos de un byte |
+| 3 | bucles sobre el bit 0 de `0x10000C00` y sobre `BCMA_COMMAND` | 7,9 millones de lecturas de `0x10000c00` en `-d guest_errors` | el chip contesta como si su firmware corriera |
+| 4 | data abort en `0xa0bd0` leyendo `0xEA00007A` | el firmware lo imprime por semihosting, y el PC salió parcheando `memory_region_access_valid` para volcar el estado del guest | publicar la interfaz del VideoCore en vez de un puntero nulo |
+
+#### 1. El motor de DMA, y que son dos bloques
+
+El aviso que traíamos —"los registros que toca ya se ven en `-d unimp` como
+`0x6000b000/20/40/60`"— **era una pista falsa**. Esos son del bloque que
+documenta `pp5020.h`, y aparecían solo porque una rutina de apagado del arranque
+barre *todos* los canales de *los dos* bloques limpiando el bit 31.
+
+La subida del Broadcom va por un **segundo bloque de DMA que `pp5020.h` no
+menciona**: maestro en `0x60008000`, canales en `0x60009000`. `grep -rn
+"60008000\|60009000" assets/rockbox/` da cero resultados; lo documenta
+únicamente el firmware de Apple, que carga esa base en `0x1da198` y le cuelga
+dos canales.
+
+Los dos bloques son idénticos registro a registro. El mapa completo, con la
+procedencia de cada bit, está en
+[07-pp502x-hardware.md](07-pp502x-hardware.md).
+
+**Los números de interrupción no son una conjetura, y esto importa** porque sin
+la línea correcta el modelo mueve los datos y la tarea se queda dormida igual.
+`0x1d98d0` registra los dos manejadores:
+
+```
+mov r1, #27 ; r2 = 0x2680c4 (b 0x1d9c40, manejador del bloque B) ; registrar
+mov r1, #28 ; r2 = 0x2680c0 (b 0x1d9be0, manejador del bloque A) ; registrar
+```
+
+27 y 28 son índices de la tabla de interrupciones **del propio firmware**, no
+líneas de hardware. La tabla se construye en `0x1fcaa0`, entrada *n* en
+`objeto+0x208+4n`:
+
+```
+0x1fcc38   entrada 26 = -1 (no existe), entrada 27 = 26
+0x1fcc44   entrada 28 = 27
+```
+
+O sea **bloque B → IRQ 26** y **bloque A → IRQ 27**. Que el índice 27 caiga
+exactamente sobre el `DMA_IRQ = 26` que documenta Rockbox para el bloque que sí
+conoce es la comprobación que hace fiable al par. Y la máquina en marcha está de
+acuerdo: `CPU_INT_EN_STAT` (`0x60004020`) lee `0xcc002017`, con las líneas 26 y
+27 habilitadas y la 28 no.
+
+Una cosa **inferida** y hay que decirlo: que la dirección del periférico sea un
+puerto y no un rango, o sea que solo `RAM_ADDR` avance. No lo dice ninguna
+fuente; es la única lectura compatible con los dos usos reales, el FIFO del I²S
+de Rockbox y el puerto de datos del Broadcom de Apple.
+
+Y una que **no** se modela: las líneas de petición del periférico. Un canal con
+`WAIT_REQ` puesto está esperando a que un periférico pida datos, y aquí no hay
+ninguno que pida, así que se deja quieto. Eso es justo lo que mantiene la ruta
+de audio de Rockbox comportándose igual que cuando estos registros eran un
+`create_unimplemented_device`.
+
+#### 2. El puerto del Broadcom acepta bytes sueltos
+
+En cuanto el DMA empezó a mover datos, las cuatro transferencias fallaron en el
+primer acceso. El descriptor que el retailOS programa para la subida deja el
+campo de ancho de acceso a cero, y `pp5020.h:699` deletrea el cero como 8 bits.
+Se comprobó leyendo el registro en marcha: `0x6000901c = 0x02000000`, campo
+30:28 vacío.
+
+Así que el retailOS sube su firmware de vídeo **byte a byte**. El modelo del
+BCM tenía `valid.min_access_size = 2` y los rechazaba. Ahora acepta 1, 2 y 4, y
+guarda exactamente lo que le dan: el contenido que acaba en la SRAM del chip es
+el mismo se escriba como se escriba, porque el puerto avanza su puntero por el
+tamaño del acceso.
+
+#### 3. Las respuestas del chip, y de dónde sale cada una
+
+Ninguna es un número puesto para que pase la comprobación. Las tres están
+fijadas por el código que las interroga:
+
+| Respuesta | Qué la fija |
+|---|---|
+| bit 0 de `0x10000C00` = 1 | los dos drivers prueban **ese bit y ninguno más** (`tst r0,#1` sobre un `ldrh` en `0x287880`, `& 1` en `lcd-video.c:589`) y luego escriben cero encima y no lo vuelven a leer. El resto de la palabra es libre |
+| `BCMA_COMMAND` = **1**, exactamente | tres comprobaciones lo encierran: `bcm_load` gira hasta que sea distinto de cero (`0x2878b4`), su llamante lo trata como entero con signo y falla si es negativo (`0x1affc8`), y la rutina que busca la interfaz hace `cmp r0,#1 / bne <rendirse>` en `0x288080`. No queda ni un grado de libertad |
+| `BCMA_STATUS` = base de la interfaz | `0x288088` la lee, `0x288090` rechaza la nula y `0x28809c` la no alineada |
+
+El arranque del VideoCore es un **flanco, no un nivel**: escribir el bit 31 lo
+suelta y nada lo para, porque el driver borra el registro entero dos escrituras
+después (`lcd-video.c:591`) mientras el núcleo está demostrablemente en marcha,
+y en `0x28805c` vuelve a mandar la secuencia de bootstrap por el puerto
+esperando encontrarlo corriendo todavía. Esa segunda pasada es la que descarta
+la idea de que el bootstrap resetee el chip.
+
+Qué significan por separado los bits 31 y 30 del `0xC0000000`, y qué selecciona
+la media palabra baja del timbre `0xA5A50002`, siguen **sin determinar**. El
+modelo dispara con el bit 31 y con la magia `0xA5A5` respectivamente, que es lo
+único que los drivers permiten deducir.
+
+Tres cosas más que solo enseña el firmware de Apple:
+
+- **Un comando cuenta solo si el puerto de escritura apuntaba al buzón.** Una
+  subida de 200 KB pasea su puntero por encima de `0x1F8` sin que eso sea un
+  comando — y en el chip real tampoco podría serlo, porque lo que pasa por
+  encima es la propia imagen del VideoCore mientras el VideoCore está parado.
+- **Las dos palabras de control se escriben como dos medias palabras**, así que
+  el efecto hay que decidirlo sobre la palabra ya montada y no sobre un acceso.
+  Actuar sobre el primero habría visto `0x0000` donde iba `0xC0000000`.
+- **El puerto primario y el alterno son motores separados**, con sus propios
+  punteros. Rockbox solo usa el primario; el retailOS usa los dos a la vez.
+
+Y un error del modelo que Rockbox nunca podía haber enseñado: al terminar un
+comando se escribía cero en `BCMA_STATUS`, un registro que **ningún guest lee**
+— y precisamente el que el retailOS usa para sacar el puntero de la interfaz.
+Ahora se sobrescribe `BCMA_COMMAND`, que es lo que hace el chip real y lo que
+los dos drivers vigilan (`lcd-video.c:204-206` y `:500-506`). De rebote Rockbox
+deja de repintar por la vía del *timeout* y pasa a su camino normal.
+
+#### 4. El puntero nulo que el retailOS no tolera
+
+Publicar "no hay interfaz" con un puntero nulo parecía lo honesto: es la
+codificación que el propio driver define (`0x288090: cmp r1,#0 ; beq <error>`).
+**No funciona**, y el fallo es instructivo.
+
+`0x288058` devuelve error, sí. Pero **su único llamante, `0xcff6c`, no mira el
+valor de retorno**: llama a los cuatro enganches de canal y termina con
+`0xcff8c: b 0x28827c`, que desbloquea un mutex que solo se crea en el camino de
+éxito (`0x2880dc`). Con el puntero nulo ese mutex no existe, `0x28827c` hace
+`ldr r0,[r0]` sobre la dirección 0 —que tras el remap es DRAM, así que ni
+siquiera falla ahí— se lleva `0xEA00007A`, la primera palabra de la propia
+imagen del retailOS, y muere dereferenciándola en `0xa0bd0`.
+
+Lo que se publica ahora es la estructura entera **con todos los bytes a cero**,
+que el driver lee como "la interfaz está y no tiene canales": `0x2871d8` carga
+el offset de un canal y `0x2871e0` se lo salta si vale cero. Es la ortografía
+del propio driver para un canal ausente, y es lo honesto porque no ejecutamos el
+VideoCore y detrás de un canal no habría nadie.
+
+**Marcado como SUPUESTO en el código**: dónde se pone esa estructura
+(`0x00180000` de la memoria del chip). La dirección real la elige el firmware
+`vmcs`, que no corremos; nada depende del número, solo de que esté dentro de la
+memoria del chip, alineada a 4, y lejos tanto de la imagen que se sube (0 a
+`0x312a0`) como del framebuffer de Rockbox (`0xE0000`).
+
+### Cómo se localizó el muro 4, que es método reutilizable
+
+El semihosting dio los registros del abort pero no el PC. El truco: **parchear
+temporalmente `memory_region_access_valid()` en `system/memory.c`** para que,
+además del "Invalid read at addr", llame a `cpu_dump_state(current_cpu, stderr, 0)`.
+Sale el estado completo del guest en el instante del acceso rechazado:
+
+```
+R00=ea00007a R13=108c6f24 R14=002893f0 R15=000a0bd0
+```
+
+`R15` es el PC del fallo y `R14` la dirección de retorno, que da el llamante de
+un tirón. Comprobación cruzada gratis: el manejador de abort del firmware
+imprimía `R14 : 000A0BD8`, que es exactamente `PC + 8` — el `R14_abt` del ARM.
+El parche está revertido; se reaplica en diez segundos cuando haga falta.
+
+### Dónde se queda ahora, con precisión
+
+El retailOS está **vivo y trabajando**: estado del BCM en `0x108cbec8` = 3
+("hilos del VideoCore en marcha"), el mutex de la interfaz creado en
+`[0x10831978]`, la base publicada en `[0x10831980] = 0x00180000`, y la tabla de
+offsets de canal espejada en `0x108d3bd4` con los ocho a cero, que es lo que le
+dimos.
+
+**El siguiente muro es la interfaz de host del VideoCore, y es de otra clase.**
+No es un bit que falte: es que en este aparato **la UI la pinta el chip de
+vídeo**, no el PP502x. Las pruebas, todas negativas y todas verificadas:
+
+- `findlit.py` no encuentra **ni una** instrucción que cargue `0x000E0000`
+  (`BCMA_CMDPARAM`, donde Rockbox escribe los píxeles) en siete megabytes.
+- Tampoco ninguna que cargue `0xFFFF0000` (`BCMCMD_LCD_UPDATE`) desde el driver
+  del BCM. La única escritura a `BCMA_COMMAND` de toda la imagen es la del
+  bootstrap, con valor 0.
+- El controlador LCD propio del PP502x (`0x70003000`) tiene **una sola
+  referencia** en la imagen, en la rutina de apagado de periféricos del arranque
+  (`0x1328`). No hay driver.
+
+Lo que hay en su lugar: cuatro canales de anillo sobre la memoria del chip, y el
+VideoCore **tirando** de la memoria del host. `0xf9ca0` (la tarea `VCHR`) atiende
+peticiones y despacha por opcode ASCII: `'H'` (`0xf9ff0`) copia plana
+host→BCM, `'Y'` (`0xfa110`) blit 2D con escalado en coma fija 16.16, `']'`
+(`0xfa1b4`) barrido por líneas. **En los tres casos la dirección de origen en la
+memoria del host viene en el mensaje del VideoCore**, no la elige el PP.
+
+Así que para ver píxeles habría que montar un "VideoCore falso" que hable el
+protocolo de anillo *y* pida los datos. Lo primero es derivable del consumidor;
+lo segundo exige saber qué direcciones pedir.
+
+### La pista más acotada que dejamos
+
+El análisis anterior daba por no localizado el escritor de `[0x1083198C]`, el
+callback que traduce índice de línea a dirección del host. **Está localizado.**
+`findlit.py` sobre `1083198c` da exactamente una instrucción, `0x1c29c4`, y es
+un inicializador estático de C++ con el guardián `tst r0,#1` del ABI de ARM:
+
+```
+1c299c: ldr r0,[0x108315c8] ; ldr r0,[r0,#4] ; tst r0,#1 ; bne fin   <- guardián
+1c29c0: ldr r0, =0x001c2a04     ; el callback
+1c29c4: ldr r1, =0x1083198c     ; la ranura
+1c29cc: str r0, [r1]            ; *** aquí se registra ***
+```
+
+y el callback `0x1c2a04` no es un cálculo, es **una búsqueda en una tabla de
+direcciones por línea** que cuelga de `[0x108315c8 + 8]`:
+
+```
+1c2a10: ldr r4,[r0,#8]      ; el contenedor; si es nulo devuelve 0
+1c2a28: bl 0x29e034         ; iterador: primera entrada
+1c2a3c: bl 0x29e034         ; ultima entrada
+1c2a54: bl 0x29e034         ; entrada de la linea pedida, luego se acota
+1c2a80: ldr r0,[r0]         ; *** la direccion del host de esa linea ***
+```
+
+Quien rellena `[0x108315c8 + 8]` es `0x1c2a90`, y solo lo llaman dos sitios,
+`0x1c7c30` y `0x1c7cd4`, los dos dentro de la misma rutina — y esa rutina manda
+comandos ASCII cuyas cadenas están doce bytes más abajo: `"transitions"`,
+`"push"`, `"alphawipe"`. Es decir, **el callback de líneas es solo para las
+transiciones de pantalla**, y se registra justo antes y se borra (`mov r1,#0 ; b
+0x1c2a90`) justo después.
+
+Con eso, el siguiente paso queda acotado a una pregunta concreta y contestable:
+**poner un punto de ruptura en `0x1c7c30` con el gdbstub y leer el contenedor
+que pasa en `r8`** da, de una sola vez, dónde vive el framebuffer de la UI en la
+DRAM del host y con qué paso de línea. Con eso ya se puede decidir si merece la
+pena montar el anillo o si basta con apuntar la consola de QEMU a esa memoria.
+Lo que no se sabrá por ahí es el formato de los mensajes `'H'`/`'Y'`, que hay que
+sacar de la tabla de saltos de `0xf9e2c` (30 entradas, cinco identificadas).
 
 ## Estrategia (iPod classic 6G)
 

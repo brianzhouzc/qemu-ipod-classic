@@ -32,7 +32,7 @@ Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
 | `0x00000000` | flash NOR mientras arranca; después DRAM (remapeada por MMAP0) | ventana en blanco con la revisión de HW en `+0x405c` |
 | `0x10000000` | **`DRAM_START`**, 64 MB. Coincide con el `addr` del directorio de firmware | RAM |
 | `0x20000000` | la misma NOR ya remapeada (`hwcompat.h` lee la revisión en `0x2000405c`) | alias |
-| `0x30000000` | **Broadcom BCM2722**, el que manda al panel | `ipod_video_bcm.c` |
+| `0x30000000` | **Broadcom BCM2722**, el que manda al panel. Ocho registros separados 64 KB, dos puertos independientes | `ipod_video_bcm.c` |
 | `0x40000000` | IRAM | RAM |
 | `0x60000000` | `PROCESSOR_ID` | sí |
 | `0x60001000` | Buzón CPU-COP (`MBX_MSG_STAT/SET/CLR` en `+0`/`+4`/`+8`) | **no**, cae en el suelo de `-d unimp` |
@@ -40,7 +40,8 @@ Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
 | `0x60005000` | Timers. `TIMER1_CFG` `+0x00`, **`USEC_TIMER` `+0x10`** | sí |
 | `0x60006000` | Reloj y alimentación. `DEV_RS` `+0x04`, `DEV_EN` `+0x0c`, `CLOCK_SOURCE` `+0x20`, `PLL_CONTROL` `+0x34`, **`PLL_STATUS` `+0x3c`** | sí |
 | `0x60007000` | Control de núcleos. `CPU_CTL` `+0x00`, `COP_CTL` `+0x04` | parcial: el CPU no duerme de verdad |
-| `0x6000a000` | DMA genérico | no |
+| `0x60008000` | **DMA, bloque A** — maestro aquí, canales en `0x60009000`. No lo nombra ninguna fuente pública; solo el firmware de Apple, que lo usa para subir el firmware del Broadcom | `ipod_video_dma.c` |
+| `0x6000a000` | **DMA, bloque B** — maestro aquí, canales en `0x6000b000`. Es el que documenta `pp5020.h` y el que usa Rockbox para el audio | `ipod_video_dma.c` |
 | `0x6000c000` | Caché. `CACHE_CTL` con `VECT_REMAP` (`0x0010`) y `READY` (`0x4000`) | sí |
 | `0x6000d000` | GPIO. Por grupo: `ENABLE` `+0x00`, `OUTPUT_EN` `+0x10`, `OUTPUT_VAL` `+0x20`, `INPUT_VAL` `+0x30` | sí |
 | `0x70000000` | **Control de dispositivo**. `PP_VER1` `+0x00`, `DEV_INIT1` `+0x10`, `DEV_INIT2` `+0x20`, **`+0x28` sin nombre en `pp5020.h`**, `DEV_TIMING1` `+0x34`, `GPO32_VAL` `+0x80`, `GPO32_ENABLE` `+0x84` | sí |
@@ -67,7 +68,8 @@ Banco bajo (0..31) y banco alto (32..63); el alto se encadena por `HI_IRQ`.
 | 10 | `IIS_IRQ` |
 | 20 | `USB_IRQ` |
 | **23** | `IDE_IRQ`, el disco |
-| 25, 26 | `FIREWIRE_IRQ`, `DMA_IRQ` |
+| 25, 26 | `FIREWIRE_IRQ`, `DMA_IRQ` — la 26 es la del **bloque B** de DMA |
+| **27** | DMA, **bloque A**. No está en `pp5020.h`; sale de la tabla del retailOS (ver abajo) |
 | 30 | `HI_IRQ`, encadena el banco alto |
 | 32..34 | `GPIO0/1/2_IRQ` |
 | 36, 37 | `SER0_IRQ`, `SER1_IRQ` |
@@ -189,6 +191,165 @@ los ocho altos en `ADCS1` (`0x30`) y los dos bajos en `ADCS2[1:0]` (`0x31`),
 con **`ADCS2` bit 7 = `ADCRDY`** — el bit sobre el que el retailOS gira sin
 timeout. Los valores que devuelve cada entrada y su justificación están en
 [04-roadmap.md](04-roadmap.md).
+
+## El DMA
+
+**Hay dos bloques, no uno**, idénticos registro a registro:
+
+| Bloque | Maestro | Canales | Canales que instancia Apple | IRQ | Fuente |
+|---|---|---|---|---|---|
+| A | `0x60008000` | `0x60009000` + n·`0x20` | 2 | **27** | solo el firmware de Apple (`0x1da198`) |
+| B | `0x6000a000` | `0x6000b000` + n·`0x20` | 4 | **26** | `pp5020.h:621-633` |
+
+`grep -rn "60008000\|60009000" assets/rockbox/` da cero resultados: el bloque A
+no aparece en ninguna fuente pública. La relación entre las dos páginas la dice
+el constructor de canal de Apple, `0x1da2b4`: *base del maestro + 0x1000 +
+canal·0x20*, que es la misma que hay entre `DMA_MASTER_CONTROL` y
+`DMA0_BASE_ADDR` en la cabecera de Rockbox.
+
+La rutina de apagado del arranque barre 4 canales del bloque A y 8 del B, más de
+los que el driver instancia. Es defensiva y no prueba que existan tantos, pero
+el modelo respalda 8 en cada uno para que no se quejen.
+
+### Los números de interrupción
+
+`0x1d98d0` registra los dos manejadores bajo los índices **27** y **28** de la
+tabla de interrupciones del propio firmware, no bajo líneas de hardware. La
+tabla se construye en `0x1fcaa0`, entrada *n* en `objeto+0x208+4n`:
+
+```
+0x1fcc38   entrada 26 = -1 (no existe), entrada 27 = 26
+0x1fcc44   entrada 28 = 27
+```
+
+Índice 27 → manejador `0x1d9c40` (bloque B) → línea **26**, que es exactamente
+el `DMA_IRQ` que documenta Rockbox para ese mismo bloque. Índice 28 →
+`0x1d9be0` (bloque A) → línea **27**. La máquina en marcha lo confirma:
+`CPU_INT_EN_STAT` lee `0xcc002017`, con 26 y 27 puestas y 28 no.
+
+### Registros del maestro
+
+| Offset | Nombre | Qué hace |
+|---|---|---|
+| `+0x00` | `DMA_MASTER_CONTROL` | bit 31 habilita el bloque. Los dos firmwares lo ponen antes de usarlo |
+| `+0x04` | `DMA_MASTER_STATUS` | bit 24+n = canal n activo. **Apple no lo lee nunca** |
+| `+0x08` | `DMA_REQ_STATUS` | `1 << DMA_REQ_xxx`. Solo Rockbox lo toca |
+
+### Registros de canal
+
+| Offset | Nombre | Función |
+|---|---|---|
+| `+0x00` | `CMD` | control y cuenta |
+| `+0x04` | `STATUS` | cuenta restante, `INTR` (30), `BUSY` (31). **Leerlo limpia la interrupción** |
+| `+0x10` | `RAM_ADDR` | dirección en memoria; es la que avanza |
+| `+0x14` | descriptor del lado memoria (`FLAGS` en Rockbox) | |
+| `+0x18` | `PER_ADDR` | puerto del periférico; **no avanza** |
+| `+0x1c` | descriptor del lado periférico (`INCR` en Rockbox) | |
+
+`+0x08` y `+0x0c` no los toca ninguno de los dos firmwares. **Sin determinar.**
+
+Cómo se sabe cuál extremo es cuál: en `0x28e914` Apple cruza los dos punteros al
+cambiar de sentido — para periférico→memoria el primero es `base+0x18` y el
+segundo `base+0x10` (`0x28e984`/`0x28e994`), y para memoria→periférico al revés
+(`0x28e9e8`/`0x28e9f8`) — y el bit 27 de `CMD` va con ellos.
+
+Bits de `CMD` que importan: 15:0 = **bytes − 4** con los dos bajos ignorados
+(por eso el máximo de una transferencia son 64 KB, y por eso Apple trocea su
+subida en pedazos de `0x10000`), 19:16 `REQ_ID`, 24 `WAIT_REQ`, 26 `SINGLE`,
+27 `RAM_TO_PER`, 30 `INTR`, 31 `START`.
+
+La secuencia real, tal como la programa el retailOS para el Broadcom
+(`0x28e248` y `0x28ea14`), con `CMD` valiendo `0xCC00FFFC` en el momento del
+arranque:
+
+```
+MASTER_CONTROL |= 1<<31
+CMD &= ~START            ; parar el canal
+CMD: solo SINGLE puesto  ; init
+CMD |= RAM_TO_PER
+RAM_ADDR = origen ; PER_ADDR = 0x30000000
+CMD = (CMD & 0xffff0000) | (bytes-4)
+leer STATUS              ; limpia cualquier interrupcion pendiente
+CMD |= INTR
+CMD |= START             ; y solo esto mueve algo
+```
+
+**Que leer `STATUS` limpie la interrupción** no es una suposición: es la razón
+del aviso al principio de `pcm-pp.c` —*"DMA status cannot be viewed from outside
+code in control because that can clear the interrupt from outside the handler"*—
+y los dos manejadores dependen de ello (`pcm-pp.c:203`, Apple `0x1d9bf4`).
+
+Y el manejador de Apple **no usa `DMA_MASTER_STATUS` ni el número de canal**:
+recorre su propia lista de canales activos, lee el `STATUS` de cada uno y mira
+el bit 30 (`0x1d9bf8`). Un modelo que ponga ese bit y levante la línea basta.
+
+### Lo inferido y lo que falta
+
+- **Que `PER_ADDR` sea un puerto fijo es INFERIDO.** No lo dice ninguna fuente;
+  es lo único compatible con los dos usos reales, el FIFO del I²S de Rockbox y
+  el puerto de datos del Broadcom de Apple.
+- Bits 26:24 de los dos descriptores: **sin determinar**. Rockbox los llama
+  `ALIGNED`/`UNK26` y él mismo marca los nombres como conjetura; los mapeos de
+  Apple no cuadran entre los dos lados.
+- Si el hardware limpia `START` solo al terminar: **sin determinar**. No
+  limpiarlo es compatible con los dos firmwares — Apple lo apaga a mano cuando
+  se acaba la cadena (`0x1d9ecc`) y Rockbox lee `CMD` de vuelta esperando
+  encontrar su configuración (`pcm-pp.c:161`).
+- **Las líneas de petición del periférico no se modelan.** Un canal con
+  `WAIT_REQ` puesto se deja quieto, porque aquí no hay ningún periférico que
+  pida. Es lo que mantiene la ruta de audio de Rockbox igual que antes.
+
+### Un detalle que costó un ciclo
+
+El retailOS sube el firmware del Broadcom **byte a byte**. El descriptor del
+lado periférico que programa para esa transferencia deja el campo de ancho
+(30:28) a cero, y `pp5020.h:699` deletrea el cero como 8 bits. Comprobado
+leyendo el registro con la máquina en marcha: `0x6000901c = 0x02000000`. El
+modelo del BCM rechazaba accesos de un byte y las cuatro transferencias fallaban
+en el primer acceso.
+
+## El Broadcom BCM2722
+
+El panel no lo maneja el PP502x: lo maneja este chip, que además ejecuta su
+propio procesador —el VideoCore— con un firmware (`vmcs`, 201 376 bytes) que el
+host le sube al arrancar.
+
+| Registro | Dirección | Función |
+|---|---|---|
+| `BCM_DATA` | `0x30000000` | puerto de datos, tan ancho como el acceso |
+| `BCM_WR_ADDR` | `0x30010000` | puntero de escritura, **16 bits**, se carga como dos medias palabras |
+| `BCM_RD_ADDR` | `0x30020000` | puntero de lectura; bit 0 leído = acepta una dirección nueva |
+| `BCM_CONTROL` | `0x30030000` | bit 1 listo para escribir, bit 4 listo para leer, bit 6 arrancado, bit 7 ocupado |
+| `BCM_ALT_*` | `+0x40000` de cada uno | **el mismo juego otra vez**: es un segundo puerto independiente |
+
+Los dos puertos direccionan la misma memoria del chip pero tienen **punteros
+propios**. Rockbox solo usa el primario; el retailOS usa los dos a la vez y mete
+los datos de imagen por el alterno (`0x164524` y `0x165024` pasan puerto 1).
+
+Direcciones dentro del chip que importan:
+
+| Dirección | Qué es |
+|---|---|
+| `0x00000000` | `BCMA_SRAM_BASE`, donde se sube el firmware `vmcs` |
+| `0x000001F8` | `BCMA_COMMAND`, el buzón |
+| `0x000001FC` | `BCMA_STATUS`; **es donde el VideoCore publica la base de su interfaz de host**, no un registro de estado |
+| `0x000E0000` | `BCMA_CMDPARAM`, donde **Rockbox** escribe los píxeles. Apple no lo usa jamás |
+| `0x10000400` | timbre del VideoCore, magia `0xA5A5` en la media palabra alta |
+| `0x10000C00` | arranque del VideoCore: bit 31 escrito lo suelta, bit 0 leído es su acuse |
+| `0x10001400` | lo toca `bcm_powerdown()` de Rockbox; qué hace, sin determinar |
+| `0xC0000000` | SDRAM del chip. Sin modelar |
+
+Las respuestas que el modelo tiene que dar, con lo que fija cada una, están en
+[04-roadmap.md](04-roadmap.md). En resumen: bit 0 de `0x10000C00`,
+`BCMA_COMMAND` valiendo **exactamente 1** (`0x288080` hace `cmp r0,#1`), y una
+estructura de interfaz publicada en `BCMA_STATUS` con todos los canales a cero,
+que es como el driver deletrea "no hay canales" (`0x2871e0`).
+
+**Apple no dibuja por aquí.** No hay ni una instrucción en siete megabytes que
+cargue `0x000E0000` ni `0xFFFF0000` (`BCMCMD_LCD_UPDATE`), y el controlador LCD
+del PP502x (`0x70003000`) tiene una sola referencia en toda la imagen, en la
+rutina de apagado de periféricos del arranque. La UI la pinta el VideoCore,
+tirando de la memoria del host por sus canales de anillo.
 
 ## El click wheel
 
