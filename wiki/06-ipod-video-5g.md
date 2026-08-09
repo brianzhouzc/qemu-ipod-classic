@@ -117,10 +117,27 @@ gcc: arm-elf-eabi-gcc (GCC) 4.9.4
 Eso nos da tres binarios conocidos y funcionando contra los que probar el
 emulador: el bootloader de Rockbox, `rockbox.ipod`, y el `retailOS` de Apple.
 
+## Estado
+
+Este aparato es el que arranca. Con su propio volcado del `osos` y una imagen
+de disco construida con `tools/ipod_video/mkdisk.sh`, el emulador llega hasta
+el menú de Rockbox y se navega con la rueda. Ver [04-roadmap.md](04-roadmap.md)
+para el recorrido y [07-pp502x-hardware.md](07-pp502x-hardware.md) para los
+registros.
+
+Resuelto desde que se escribió esta página:
+
+- **Dónde acaba el bootloader de Rockbox y empieza el firmware de Apple dentro
+  del `osos`**: está en la tabla de 07, byte a byte. El retailOS ocupa
+  `0x000000`-`0x735a00` y el bootloader va detrás, en `entryOffset`.
+- **El mapa de registros del PP5022C**: en 07, con qué está modelado y qué no.
+
 ## Pendiente
 
-- Separar dentro del `osos` dónde acaba el bootloader de Rockbox y dónde
-  empieza el firmware original de Apple.
-- Mapa de registros del PP5022C (iPodLinux y `firmware/target/arm/pp/` de
-  Rockbox).
-- Los dos núcleos ARM7TDMI (CPU + COP) y su mecanismo de mailbox.
+- **Los dos núcleos.** `core_thread_init()` despierta al COP y se duerme
+  esperándolo. Como nuestro `sleep_core` no duerme de verdad, el CPU sigue y
+  arranca igual, pero el COP nunca ejecuta nada, así que lo que Rockbox le
+  programe se queda sin hacer. El buzón de `0x60001000` tampoco está modelado.
+- **Audio.** Ni I2S ni códec: no suena.
+- **El firmware de Apple**, que es una vía aparte y sigue atascada en una
+  llamada al sistema con la pila de supervisor sin inicializar.

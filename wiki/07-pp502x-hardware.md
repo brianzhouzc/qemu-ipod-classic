@@ -24,26 +24,132 @@ principal de este port: el S5L8702 era mononúcleo.
 
 ## Mapa de memoria
 
-| Base | Bloque | Notas |
+Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
+"modelo" dice qué hay en `hw/arm/ipod_video/`.
+
+| Base | Bloque | Modelo |
 |---|---|---|
-| `0x10000000` | **`DRAM_START`** | Coincide con el campo `addr` del directorio de firmware |
-| `0x60004000` | Controlador de interrupciones | `CPU_INT_EN` en `+0x24`, banco alto en `+0x120` |
-| `0x60005000` | Timers | `TIMER1_CFG` en `+0x00`, **`USEC_TIMER` en `+0x10`** |
-| `0x60006000` | Reloj y alimentación | `DEV_EN` `+0x0c`, `CLOCK_SOURCE` `+0x20`, `PLL_CONTROL` `+0x34` |
-| `0x60007000` | Control de núcleos | `CPU_CTL` `+0x00`, `COP_CTL` `+0x04` |
-| `0x6000c000` | Caché | incluye `CACHE_CTL_VECT_REMAP` (`0x0010`) |
-| `0x6000d000` | GPIO | `GPIOA_ENABLE` y siguientes |
-| `0x70006000` | **UART serie 0** | layout **16550**: RBR/THR/IER/FCR/IIR/LCR/MCR/LSR/MSR/SPR/DLL |
+| `0x00000000` | flash NOR mientras arranca; después DRAM (remapeada por MMAP0) | ventana en blanco con la revisión de HW en `+0x405c` |
+| `0x10000000` | **`DRAM_START`**, 64 MB. Coincide con el `addr` del directorio de firmware | RAM |
+| `0x20000000` | la misma NOR ya remapeada (`hwcompat.h` lee la revisión en `0x2000405c`) | alias |
+| `0x30000000` | **Broadcom BCM2722**, el que manda al panel | `ipod_video_bcm.c` |
+| `0x40000000` | IRAM | RAM |
+| `0x60000000` | `PROCESSOR_ID` | sí |
+| `0x60001000` | Buzón CPU-COP (`MBX_MSG_STAT/SET/CLR` en `+0`/`+4`/`+8`) | **no**, cae en el suelo de `-d unimp` |
+| `0x60004000` | Controlador de interrupciones. Banco bajo en `+0x000`, **banco alto en `+0x100`** | `ipod_video_intc.c` |
+| `0x60005000` | Timers. `TIMER1_CFG` `+0x00`, **`USEC_TIMER` `+0x10`** | sí |
+| `0x60006000` | Reloj y alimentación. `DEV_RS` `+0x04`, `DEV_EN` `+0x0c`, `CLOCK_SOURCE` `+0x20`, `PLL_CONTROL` `+0x34`, **`PLL_STATUS` `+0x3c`** | sí |
+| `0x60007000` | Control de núcleos. `CPU_CTL` `+0x00`, `COP_CTL` `+0x04` | parcial: el CPU no duerme de verdad |
+| `0x6000a000` | DMA genérico | no |
+| `0x6000c000` | Caché. `CACHE_CTL` con `VECT_REMAP` (`0x0010`) y `READY` (`0x4000`) | sí |
+| `0x6000d000` | GPIO. Por grupo: `ENABLE` `+0x00`, `OUTPUT_EN` `+0x10`, `OUTPUT_VAL` `+0x20`, `INPUT_VAL` `+0x30` | sí |
+| `0x70000000` | **Control de dispositivo**. `PP_VER1` `+0x00`, `DEV_INIT1` `+0x10`, `DEV_INIT2` `+0x20`, **`+0x28` sin nombre en `pp5020.h`**, `DEV_TIMING1` `+0x34`, `GPO32_VAL` `+0x80`, `GPO32_ENABLE` `+0x84` | sí |
+| `0x70002800` | I2S | no |
+| `0x70003000` | LCD | no, el panel va por el Broadcom |
+| `0x70006000` | **UART serie 0**, 16550 con stride de 4 | `hw/char/serial.c` de QEMU |
+| `0x7000c000` | I2C **y** click wheel comparten ventana: I2C en `+0x00`, rueda en `+0x100`, `+0x104` y `+0x140` | sí |
+| `0xc3000000` | **IDE**. Temporizaciones `+0x00`, `IDE0_CFG` `+0x28`, task file `+0x1e0`, control `+0x3f8`, DMA `+0x400` | `ipod_video_ide.c` |
+| `0xc5000000` | USB | no |
+| `0xf0000000` | **Arrays de la caché**: datos `+0`, espejo `+0x2000`, estado CPU `+0x4000`, estado COP `+0x6000`, flush `+0x8000`, invalidate `+0xc000` | RAM |
+| `0xf000f000` | Unidad de remapeo `MMAP0..7` (pares lógico/físico) más `CACHE_MASK` `+0x40` | sí |
 
-> El UART es compatible 16550, así que QEMU ya lo tiene modelado
-> (`hw/char/serial.c`). Es la primera pieza gratis del port.
+> El UART es 16550 de verdad, así que QEMU ya lo tenía. Fue la primera pieza
+> gratis del port.
 
-### Números de IRQ conocidos
+### Números de IRQ
+
+Banco bajo (0..31) y banco alto (32..63); el alto se encadena por `HI_IRQ`.
 
 | IRQ | Fuente |
 |---|---|
-| 23 | `IDE_IRQ` (el disco) |
-| 36 (`32+4`) | `SER0_IRQ` — el banco alto empieza en 32 |
+| 0, 1 | `TIMER1_IRQ`, `TIMER2_IRQ` |
+| 4 | `MAILBOX_IRQ` |
+| 10 | `IIS_IRQ` |
+| 20 | `USB_IRQ` |
+| **23** | `IDE_IRQ`, el disco |
+| 25, 26 | `FIREWIRE_IRQ`, `DMA_IRQ` |
+| 30 | `HI_IRQ`, encadena el banco alto |
+| 32..34 | `GPIO0/1/2_IRQ` |
+| 36, 37 | `SER0_IRQ`, `SER1_IRQ` |
+| **40** | `I2C_IRQ`, **y también el click wheel** |
+
+## Registros con comportamiento
+
+La mayoría de los registros de este SoC se pueden almacenar y devolver tal
+cual. Los que no, son exactamente los que bloquean el arranque, y todos fallan
+igual: el emulador parece vivo, no salta ninguna excepción, y el firmware está
+esperando un bit que nunca llega. La historia de cómo se encontró cada uno
+está en [04-roadmap.md](04-roadmap.md).
+
+| Registro | Bit | Qué significa | Quién lo espera |
+|---|---|---|---|
+| `PLL_STATUS` `0x6000603c` | 31 | PLL enganchado | `system-pp502x.c`: `while (!(PLL_STATUS & 0x80000000));` |
+| `0x70000028` | 7 | el bloque USB salió de reset | `usb-fw-pp502x.c`: `while ((inl(0x70000028) & 0x80) == 0);` |
+| `GPO32_VAL` `0x70000080` | 14 | el Broadcom está alimentado | `lcd-video.c`. Si está a 0 intenta subir el firmware `vmcs` de la NOR, se rinde, deja `display_on = false`, y **`lcd_update_rect()` descarta todos los dibujados en silencio** |
+| `IDE0_CFG` `0xc3000028` | 3 | `INTRQ`, transferencia terminada | `ata-pp5020.c`. Es un **pestillo**, no un espejo de la línea, y se borra escribiendo un uno |
+| `0x7000c104` | 26 | hay paquete de rueda que leer | `button-clickwheel.c`. Sin él `ipod_4g_button_read()` ni mira los datos |
+| `CACHE_CTL` `0x6000c000` | 14 | `READY` | se devuelve siempre puesto: no hay caché que esperar |
+
+Y dos zonas que no son registros sino memoria direccionable, y que hay que
+respaldar con RAM o el primer acceso se rechaza:
+
+- **`0xf0000000`-`0xf000efff`**, los arrays de la caché.
+  `cache_invalidate_special()` recorre a mano todo el array de estado marcando
+  cada línea como válida, como remedio a un fallo del silicio.
+- **`0x60000000` y `0x70000000` enteros**. El firmware de Apple toca registros
+  que no aparecen en `pp5020.h` (el primero fue `0x60009000`). Un registro
+  desconocido que devuelve cero es sobrevivible; uno sin mapear es un data
+  abort, y con la tabla de vectores aún sin instalar el CPU no vuelve. Por eso
+  hay un `create_unimplemented_device` cubriendo ambas ventanas por debajo.
+
+## El IDE y su DMA
+
+El task file es ATA estándar con los registros separados cuatro bytes, así que
+lo lleva el núcleo IDE de QEMU. Lo propio del PP es lo de debajo:
+
+| Registro | Dirección | Función |
+|---|---|---|
+| `IDE0_PRI_TIMING0/1` | `0xc3000000` y `0xc3000004` | temporizaciones PIO y DMA |
+| `IDE0_CFG` | `0xc3000028` | bit 3 `INTRQ`, bit 15 activo durante el DMA |
+| `IDE_DMA_CONTROL` | `0xc3000400` | bit 0 arranca, bit 1 arma, bit 3 dirección (1 = a memoria) |
+| `IDE_DMA_LENGTH` | `0xc3000408` | bytes **menos 4** |
+| `IDE_DMA_ADDR` | `0xc300040c` | dirección física destino |
+
+No es bus-master PCI: es un buffer plano. La dirección y la longitud se
+programan **antes** del comando ATA y el bit de arranque **después**, así que
+`start_dma` solo guarda el callback del núcleo y la escritura del bit 0 es la
+que dispara la transferencia.
+
+El bootloader de Rockbox lee con `READ MULTIPLE` (PIO) y la aplicación con
+`READ DMA`, así que sin este motor el bootloader funciona y la app no.
+
+## El click wheel
+
+Comparte ventana con el I2C en `0x7000c000` y **comparte su interrupción**
+(`I2C_IRQ`, la 40). Va por interrupción, no por sondeo:
+`ipod_4g_button_read()` solo se llama desde `ipod_4g_button_int()`.
+
+| Dirección | Función |
+|---|---|
+| `0x7000c100` | configuración; `opto_i2c_init` escribe `0xc00a1f00` |
+| `0x7000c104` | estado. Bit 26 = hay paquete. Se reconoce escribiendo `0x0c000000` encima |
+| `0x7000c140` | `CLICKWHEEL_DATA`, el paquete |
+
+Formato del paquete, de `button-clickwheel.c`:
+
+```
+paquete valido:  (status & 0x800000ff) == 0x8000001a
+  bit 8   SELECT     bit 9   RIGHT     bit 10  LEFT
+  bit 11  PLAY       bit 12  MENU
+  bit 30  rueda tocada
+  bits 16..22  posicion, 0..0x5F, el sentido horario incrementa
+```
+
+96 clics por vuelta (`WHEELCLICKS_PER_ROTATION`). Rockbox exige
+`WHEEL_SENSITIVITY` (4) clics acumulados antes de mover la selección un ítem, y
+**reinicia el acumulador al cambiar de sentido**, así que la primera pulsación
+después de invertir la dirección no mueve nada. Eso es del firmware, no del
+modelo.
 
 ## Cómo arranca un iPod 5G
 
@@ -130,7 +236,13 @@ Cómo se detectó: `bootloader/ipod.c` dice que `"portalplayer"` está en
 `DRAM_START+0x20`, y con los offsets sin corregir aparecía en `+0x220`.
 
 
-## Dónde se queda el arranque (2026-08-06)
+## La otra vía: el retailOS de Apple
+
+Todo lo anterior es la vía de Rockbox, que ya arranca hasta el menú (ver
+[04-roadmap.md](04-roadmap.md)). El firmware original de Apple es una vía
+aparte y sigue atascada donde estaba.
+
+### Dónde se queda (2026-08-06)
 
 Con el remapeo MMAP y el suelo de registros, el firmware de Apple ejecuta
 código real y extenso por todo su espacio: `0x82694`, `0x7d080`,
