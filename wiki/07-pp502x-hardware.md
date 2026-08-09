@@ -47,7 +47,7 @@ Todo sale de `pp5020.h` y `ata-target.h` salvo donde se indique. La columna
 | `0x70002800` | I2S | no |
 | `0x70003000` | LCD | no, el panel va por el Broadcom |
 | `0x70006000` | **UART serie 0**, 16550 con stride de 4 | `hw/char/serial.c` de QEMU |
-| `0x7000c000` | I2C **y** click wheel comparten ventana: I2C en `+0x00`, rueda en `+0x100`, `+0x104` y `+0x140` | sí |
+| `0x7000c000` | I2C **y** click wheel comparten ventana: I2C en `+0x00`, rueda en `+0x100`, `+0x104` y `+0x140` | `ipod_video_i2c.c` + `ipod_video_pcf50605.c`, y la rueda en `ipod_video.c` |
 | `0xc3000000` | **IDE**. Temporizaciones `+0x00`, `IDE0_CFG` `+0x28`, task file `+0x1e0`, control `+0x3f8`, DMA `+0x400` | `ipod_video_ide.c` |
 | `0xc5000000` | USB | no |
 | `0xf0000000` | **Arrays de la caché**: datos `+0`, espejo `+0x2000`, estado CPU `+0x4000`, estado COP `+0x6000`, flush `+0x8000`, invalidate `+0xc000` | RAM |
@@ -89,6 +89,9 @@ está en [04-roadmap.md](04-roadmap.md).
 | `IDE0_CFG` `0xc3000028` | 3 | `INTRQ`, transferencia terminada | `ata-pp5020.c`. Es un **pestillo**, no un espejo de la línea, y se borra escribiendo un uno |
 | `0x7000c104` | 26 | hay paquete de rueda que leer | `button-clickwheel.c`. Sin él `ipod_4g_button_read()` ni mira los datos |
 | `CACHE_CTL` `0x6000c000` | 14 | `READY` | se devuelve siempre puesto: no hay caché que esperar |
+| `I2C_STATUS` `0x7000c01c` | 6 y 2:0 | `BUSY` y el código de resultado | el driver de Apple (`0x282f44`) devuelve `STATUS & 7` como error y aborta si no es cero |
+| `ADCS2` del PCF50605 (reg `0x31`) | 7 | `ADCRDY`, conversión terminada | `pmu_adc_read` (`0x28341c`) gira sobre él **sin timeout** |
+| `BCM_ALT_CONTROL` `0x30070000` | 7 y 6 | ocupado / listo, el arranque del Broadcom | `bcm_init()` de Rockbox y `0x2876d0`/`0x2876dc` de Apple |
 
 Y dos zonas que no son registros sino memoria direccionable, y que hay que
 respaldar con RAM o el primer acceso se rechaza:
@@ -122,6 +125,70 @@ que dispara la transferencia.
 
 El bootloader de Rockbox lee con `READ MULTIPLE` (PIO) y la aplicación con
 `READ DMA`, así que sin este motor el bootloader funciona y la app no.
+
+## El I²C y el PCF50605
+
+El bloque está en `0x7000c000`, debajo del click wheel. **No es un
+bit-banger**: se le da una dirección de esclavo, hasta cuatro bytes de datos y
+una longitud, y un bit de arranque ejecuta la transferencia entera. Los dos
+firmwares lo manejan con los mismos cinco pasos en el mismo orden —`i2c-pp.c`
+de Rockbox y el driver de Apple en `0x282d90` (lectura) y `0x282f58`
+(escritura).
+
+| Registro | Offset | Ancho | Bits |
+|---|---|---|---|
+| `CTRL` | `+0x00` | byte | bit 7 `SEND` (arranca, y **se autoborra**), bit 5 = lectura, bits 2:1 = longitud−1 |
+| `ADDR` | `+0x04` | byte | primer byte del bus: `(dir7 << 1) \| R/W` |
+| `ADDR2` | `+0x08` | byte | **solo Apple**: dirección de la fase de lectura de una transacción combinada |
+| `DATA0..3` | `+0x0c`…`+0x18` | byte | |
+| `STATUS` | `+0x1c` | byte | bit 6 `BUSY`; **bits 2:0 = código de resultado** |
+
+Tres cosas que solo enseña el firmware de Apple, y las tres importan:
+
+- **`STATUS[2:0]` es un código de error.** `0x282f44` hace `and r0, r0, #7` y
+  `0x28358c` aborta la transacción si no es cero. Rockbox ni lo mira. El
+  fichero de registros plano que había antes lo cumplía por accidente, que es
+  por lo que nadie notó que no había controlador.
+- **`+0x08` es una segunda dirección**, para la escritura-más-lectura combinada
+  de `0x282e30` (`CTRL = 0x48 | SEND`). El byte recibido aparece en **`DATA1`,
+  no en `DATA0`**: los registros de datos se consumen en orden, primero los
+  transmitidos.
+- **El bloque tiene que funcionar sin inicializar.** La rutina de
+  `DEV_EN`/`DEV_RS`/`0x600060a4` de Apple (`0x282e98`) solo se alcanza desde
+  `0x282f0c`, que la llama cuando una transferencia expira. Si nuestro `STATUS`
+  nunca dice `BUSY`, ese camino no se ejecuta jamás.
+
+**Ninguno de los dos usa la interrupción**; los dos sondean. Y en este SoC la
+línea que la cabecera llama `I2C_IRQ` es la del click wheel, así que el modelo
+no la levanta.
+
+**Sin determinar**: qué significan por separado los bits 6 y 3 de `CTRL` (solo
+se ven juntos, como `0x48`), qué son los códigos 1..6 de `STATUS[2:0]`, y qué
+chip vive en la dirección `0x2a`, con la que Apple habla (`0x0e4164`,
+`0x0e9410`) y que no nombra ninguna fuente pública. El códec de audio está en
+`0x1a` según Rockbox y **no hay ni un acceso a esa dirección en la imagen de
+Apple**.
+
+### El esclavo: PCF50605 en la dirección de 7 bits `0x08`
+
+Es un dispositivo de puntero de registro: una escritura empieza por el número
+de registro y el puntero avanza tras cada byte; una lectura sigue desde donde
+quedó. **Que el puntero sobreviva al final de una transacción no es una
+suposición**: los dos drivers dependen de ello. Una lectura de los siete
+registros del RTC es una escritura y dos lecturas, con el puntero corriendo a
+través de las tres.
+
+Modelado: el fichero de registros, el conversor A/D, y el reloj (desde el reloj
+del anfitrión, por la opción `-rtc` de QEMU). Sin modelar: la carga, el
+controlador de encendido (un guest que escriba `GOSTDBY` se ignora en vez de
+apagar la máquina), los reguladores, la alarma del RTC y las interrupciones.
+
+El ADC: `ADCC2` (`0x2f`) bit 0 arranca la conversión y se autoborra, bits 4:1
+eligen la entrada, bit 7 pide 8 bits. El resultado son diez bits repartidos:
+los ocho altos en `ADCS1` (`0x30`) y los dos bajos en `ADCS2[1:0]` (`0x31`),
+con **`ADCS2` bit 7 = `ADCRDY`** — el bit sobre el que el retailOS gira sin
+timeout. Los valores que devuelve cada entrada y su justificación están en
+[04-roadmap.md](04-roadmap.md).
 
 ## El click wheel
 

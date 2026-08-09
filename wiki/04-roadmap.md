@@ -10,7 +10,7 @@ el sistema original de Apple se movió allí.
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
-| `iPod-Video` | PP5022C | **Rockbox se navega entero; el retailOS de Apple arranca su núcleo y se queda esperando al PMU** |
+| `iPod-Video` | PP5022C | **Rockbox se navega entero; el retailOS de Apple arranca del todo y se queda subiendo el firmware del chip de vídeo por DMA** |
 
 El trabajo del Classic sigue intacto y es reaprovechable si algún día
 conseguimos un `osos` descifrado.
@@ -320,7 +320,7 @@ placa y las revisiones de imagen no los sabemos, y el `sysinfo_t` de iPodLinux
 **no sirve como fuente** — pone `sdram_size` en `+0x80` mientras este firmware
 lee `+0xe0`, que cae dentro de un `pad` que iPodLinux nunca decodificó.
 
-### Dónde se queda ahora: el PMU
+### Dónde se quedaba: el PMU (resuelto, 2026-08-09)
 
 El sistema está **vivo**, no colgado:
 
@@ -368,6 +368,184 @@ número habrá que sacarlo de cómo lo interpreta el firmware, no inventarlo.
 
 Queda por comprobar, y no está descartado, que la lectura de la batería sea el
 único bloqueo: puede haber más consumidores del PMU detrás.
+
+## El retailOS arranca del todo (2026-08-09)
+
+Con el I²C y el PMU modelados —más dos muros que aparecieron detrás— el
+retailOS deja de bloquearse: termina su arranque, entra en el bucle de reposo
+del planificador y no imprime ni un pánico. **La pantalla sigue negra**, y
+ahora se sabe exactamente qué falta y por qué.
+
+Capturas a los 10, 30, 60 y 90 s: **0 píxeles encendidos en las cuatro**. Sin
+adornos: el retailOS no dibuja.
+
+### Los tres muros de esta sesión
+
+| # | Muro | Cómo se encontró | Arreglo |
+|---|---|---|---|
+| 1 | bucle infinito leyendo `ADCS2` del PCF50605 | ya estaba acotado | controlador I²C `pp502x-i2c` + esclavo `pcf50605` |
+| 2 | data abort leyendo `0x93EE1B70` | el propio firmware lo imprime por semihosting, en bucle | DRAM también responde con el bit 31 puesto |
+| 3 | bucle sobre el bit 6 de `BCM_ALT_CONTROL` | `info registers` en el monitor: `R01=0x30070000` | los dos bits del *handshake* de arranque del Broadcom |
+
+#### 1. El I²C y el PMU
+
+El bloqueo era `pmu_adc_read` (`0x28341c`) girando **sin timeout** sobre el bit
+7 de `ADCS2`, el "conversión lista" del PCF50605. Hasta ahora `0x7000c000` era
+un fichero de registros plano, así que toda transacción "funcionaba" y devolvía
+el último byte que el propio firmware había escrito.
+
+Dos dispositivos nuevos, `hw/arm/ipod_video/ipod_video_i2c.c` y
+`ipod_video_pcf50605.c`. Los detalles del bloque están en
+[07-pp502x-hardware.md](07-pp502x-hardware.md). Lo que conviene retener:
+
+- **El firmware de Apple lee `STATUS[2:0]` como código de error** y aborta la
+  transacción entera si no es cero. Rockbox no lo mira. Un fichero de
+  registros plano lo cumplía por accidente.
+- **El bit de arranque tiene que autoborrarse.** No es una suposición: todos
+  los pasos siguientes de los dos drivers son lecturas-modificación-escritura
+  de `CTRL`, así que un bit que se quedara puesto dispararía una segunda
+  transferencia no pedida en la siguiente, y contra un esclavo con puntero de
+  registro autoincremental eso lee bytes equivocados para siempre.
+- **El bloque tiene que funcionar sin inicialización.** La rutina de
+  `DEV_EN`/`DEV_RS` de Apple (`0x282e98`) solo se alcanza cuando una
+  transferencia expira; si `STATUS` nunca dice `BUSY`, el guest nunca habilita
+  el bloque.
+
+**Los valores del ADC, y de dónde sale cada uno** — esto es lo que la regla de
+"no inventar" exigía:
+
+| Entrada del mux | Valor | Justificación |
+|---|---|---|
+| 2, `ADCIN1_RES` (batería de Rockbox) | 682 | Rockbox lo convierte a milivoltios con su propio `BATTERY_SCALE_FACTOR` de 6000 por 1024 cuentas, así que son 4000 mV. Su tabla del iPod Video pone el 0 % en 3600 mV y el 100 % en 4180. Rockbox muestra ahora **77 %**, que es exactamente lo que da interpolar 3996 mV en esa tabla |
+| 3, `ADCIN1_SUBTR` (batería de Apple) | 390 | **SUPUESTO**, pero dentro de un rango que define el firmware: `0x264ee8` busca la cuenta cruda en una tabla de quince umbrales (283…454) y devuelve el índice, y `0x264cb0` no enciende un raíl por debajo del literal `0x12a` = 298 de `0x264d20`. 390 cae entre el décimo y el undécimo umbral, lejos de los dos extremos. **Cuántos voltios son, no se sabe, y nada depende de saberlo** |
+| 4 y 7, identificadores de accesorio | fondo de escala | `0x266034` toma los cuatro bits altos como cubeta y convierte la cubeta 15 en el código 100, que es el valor con el que la tarea `"RsistrAccsryMgr"` (`0xfec04`) se inicializa. Una línea de identificación sin nada enchufado está en circuito abierto y lee fondo de escala, que es esa misma cubeta. Las dos cosas coinciden |
+| el resto | fondo de escala | con `LOG_UNIMP` diciéndolo |
+
+**SUPUESTO y marcado como tal en el código**: el registro `ID` (`0x00`) devuelve
+`0x00`. Ninguna fuente —Rockbox, iPodLinux, la cabecera de OpenMoko sacada del
+datasheet— dice qué contesta un PCF50605 real. Lo único que el firmware
+necesita es que **no sea `0x24`**, que es con lo que `0x283704` decide cambiarse
+al mapa de registros de otro chip. Se elige el cero justamente porque no añade
+información que no tenemos.
+
+**Rockbox no ha regresado, pero sí ha cambiado**, y es un arreglo, no un daño:
+ahora arranca en su menú principal en vez de entrar directamente en *Now
+Playing*. `rtc_check_alarm_started()` de `rtc_pcf50605.c` decide que la alarma
+despertó al aparato si el reloj y los registros de alarma coinciden dentro de
+diez segundos. Sin RTC las dos lecturas devolvían lo mismo, así que Rockbox
+creía que había sonado una alarma y arrancaba la reproducción **en todos los
+arranques**. Con un reloj de verdad no coinciden y hace lo normal. Las capturas
+de `assets/nav-baseline` están actualizadas; la navegación en sí no cambia (la
+barra sigue moviéndose ~12 000 píxeles por paso de rueda y SELECT sigue
+entrando).
+
+#### 2. El bit 31: la vista sin caché de la DRAM
+
+Pasado el PMU, el firmware daba un data abort leyendo `0x93EE1B70` —DRAM que
+él mismo acababa de reservar, `0x13EE1B70`, con el bit 31 pegado— y lo imprimía
+por semihosting en bucle.
+
+Este muro **se explica solo**, no hay que inferirlo. Diez constructores de
+buffer comparten un idioma: `0x22131c` y nueve del módulo de reserva
+(`0x28c8fc`, `0x28c9dc`, `0x28cab4`, `0x28cb80`, `0x28cca8`, `0x28cd74`,
+`0x28ce0c`, `0x28ced0`, `0x28d0ec`). Desde `0x28cebc`:
+
+```
+str  r0, [r4, #4]         ; el puntero alineado
+ldrb r1, [r4, #12]        ; "el llamante dice que ya es sin caché"
+cmp  r1, #0
+bne  fin
+mov  r1, #4
+cmp  r1, r0, lsr #28      ; nibble alto 4, o sea IRAM?
+beq  fin                  ; entonces no tocarlo
+orr  r0, r0, #0x80000000  ; si no, así es como se usa el buffer
+str  r0, [r4, #4]
+...
+bl   0x9aa18              ; sobre [ptr - holgura, ptr + tamaño + holgura]
+```
+
+**La excepción es lo que identifica el bit.** La IRAM es la única memoria de
+este chip que nunca se cachea, y es exactamente la que el firmware no marca.
+Rockbox dice lo mismo en C, con otra constante porque su vista cacheada vive en
+otro sitio: `system-target.h:164`, `UNCACHED_ADDR(a) = a | UNCACHED_BASE_ADDR`.
+
+Cómo se localizó, y el método vale la pena: **punto de ruptura en el `memcpy`
+del firmware (`0xf0`) a través del gdbstub de QEMU**, preguntando quién pasa un
+puntero de origen con el bit 31. Respuesta: `0x21701c`, una copia de 512 bytes
+sacada de un buffer de bloque de disco de 32 KB cuyo descriptor, en
+`0x13ee9b90`, guarda la reserva cruda en `+0` y esa misma dirección con el bit
+31 en `+4`. Después, un **watchpoint de escritura** sobre esa palabra, que cae
+justo en el constructor de arriba.
+
+Como aquí no hay caché, cacheado y sin cachear son la misma memoria: un alias,
+igual que el gemelo del bit 26 que ya estaba al lado.
+
+#### 3. El Broadcom: el *handshake* de arranque
+
+Con eso el retailOS llega al chip de vídeo y se queda en `0x2876dc` esperando
+el bit 6 de `BCM_ALT_CONTROL`. Es la segunda mitad del arranque del Broadcom
+que Rockbox también hace (`lcd-video.c:559-560`):
+
+```c
+while (BCM_ALT_CONTROL & 0x80);      /* esperar mientras está ocupado */
+while (!(BCM_ALT_CONTROL & 0x40));   /* esperar a que esté listo */
+```
+
+Rockbox nunca llega ahí en esta máquina, porque `bcm_init()` solo corre si
+`GPO32` bit 14 dice que el chip está sin alimentar y nosotros fingimos que lo
+está. **El retailOS lo arranca él mismo en todos los arranques**, sin mirar ese
+bit. Los dos bits nuevos se contestan como los dos que ya había: nunca ocupado,
+siempre listo.
+
+Y eso destapó dos errores del modelo del Broadcom que Rockbox nunca podía haber
+enseñado:
+
+- **Los registros de dirección son de 16 bits.** Apple los carga como dos
+  medias palabras, la baja primero (`0x287c28`); Rockbox siempre escribe la
+  palabra entera por `BCM_WR_ADDR32`. Asignar el valor en cada escritura dejaba
+  solo la mitad alta, así que una subida de firmware a `0x000fc000` habría ido
+  a `0x000f0000` sin decir nada.
+- **El puerto de datos es tan ancho como el acceso.** Apple manda los últimos
+  1..255 bytes de un bloque de dos en dos (`0x287ca8`); una escritura de media
+  palabra que guardaba una palabra entera pisaba los dos bytes siguientes.
+
+### Dónde se queda, con precisión
+
+**La subida del firmware del Broadcom, que va por DMA.**
+
+`0x287be8` parte la transferencia en un grueso y una cola, y le da el grueso a
+`0x286fb4`, que vacía la caché sobre el origen, lo trocea en pedazos de 64 KB,
+llama a `0x1599fc` por cada uno y **espera en un método virtual del `+0x18` del
+objeto driver**. No hay nada modelado que conteste, así que la tarea se bloquea
+para siempre y el planificador se queda en reposo — por eso la máquina parece
+sana y no imprime nada.
+
+Los registros que toca ya se ven en `-d unimp` como `pp502x.soc-regs`
+`0x6000b000`, `0x6000b020`, `0x6000b040` y `0x6000b060`: **DMA0..DMA3** de
+`pp5020.h`. Así que lo siguiente es el motor de DMA del PP502x, y los argumentos
+de la llamada que se bloquea son conocidos:
+
+```
+bcm_load(name = 0x001affe8, data = 0x13ea136c, len = 0x312a0)
+   -> 201 376 bytes a la SRAM del Broadcom, dirección 0
+```
+
+**Y hay que saberlo antes de ponerse**: aunque se modele el DMA, la pantalla no
+se encenderá sola. Lo que se sube es el firmware del propio chip —el blob
+`vmcs`, cuyo nombre de fichero está literalmente en la imagen, en `0x2878f4`:
+`"VMCS    BIN"`— y después los dos guests **esperan a que ese firmware
+conteste**:
+
+| Espera | Apple | Rockbox |
+|---|---|---|
+| bit 0 de la palabra `0x10000C00` del chip | `0x287868` | `lcd-video.c:589` |
+| `BCMA_COMMAND` (`0x1f8`) distinto de cero | `0x2878b0` | `lcd-video.c:594` |
+
+Esas respuestas las produce código que no estamos ejecutando. O se emula lo
+justo del Broadcom para fingirlas (y entonces hay que averiguar qué protocolo
+de comandos espera el retailOS, que no tiene por qué ser el de Rockbox), o se
+busca la ruta por la que Rockbox se salta el arranque del chip y se mira si el
+retailOS tiene una equivalente.
 
 ## Estrategia (iPod classic 6G)
 
