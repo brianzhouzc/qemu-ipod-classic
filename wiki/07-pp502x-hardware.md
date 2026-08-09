@@ -447,24 +447,69 @@ no lo escribe nadie. Repasando lo que hay: el propio `osos` no lo toca antes de
 leerlo (solo ha ejecutado ~284 bloques), y el COP está dormido en ese momento
 por diseño.
 
-**Hipótesis principal, dicha como tal**: ese bloque lo deja la **ROM de
-arranque de Apple** en la IRAM antes de saltar al sistema. Es un patrón
-clásico: el cargador de ROM deja un bloque de parámetros arriba del todo y el
-SO lo hereda. Nosotros nos saltamos la ROM por completo.
+**Hipótesis que planteé y que hay que tirar**: dije que ese bloque lo dejaba
+la ROM de arranque de Apple en la IRAM. **Es falsa**, y la comprobación que la
+tumba es barata.
 
-Ojo con la contabilidad de hipótesis: antes retiré la idea de que la flash
-fuese el problema, y esa retirada **sigue siendo correcta** — el firmware no
-lee la flash antes de morir. Lo de ahora es distinto: no depende de lo que la
-flash *contenga* para leerlo, sino de lo que su ROM *hubiera dejado hecho*. Es
-una razón nueva, no la vieja reciclada.
+`0x1084` no calcula la dirección de un bloque de parámetros: es un
+**"dame la dirección de la variable global N"**. Devuelve
+`IRAM_END + N - 0x100`, o sea que el sistema guarda sus globales en los
+**últimos 256 bytes de la IRAM**, y la base depende del tamaño de IRAM del
+chip (96 KB en el PP5020, 128 KB en el PP5022 — de ahí `0x40018000` frente a
+`0x40020000`).
 
-Si la hipótesis se confirma, hacen falta una de dos cosas:
+Tiene 13 llamantes, y **los hay que escriben**:
 
-1. El volcado de la flash, ejecutando la ROM de verdad para que deje el bloque.
-   El procedimiento está en [06-ipod-video-5g.md](06-ipod-video-5g.md).
-2. Sintetizar el bloque nosotros, lo que exige conocer su formato — que se
-   aprendería, precisamente, de la ROM.
+```
+1034: mov r0,#16 ; bl 0x1084 ; str r4,[r0]     ; global_16 = r4
+b01e8: mov r0,#48 ; bl 0x1084 ; str r4,[r0]    ; global_48 = r4
+bbdc8: mov r0,#44 ; bl 0x1084 ; str r1,[r0]    ; global_44 = 0
+28575c:                         str r5,[r0]    ; global_44 = r5
+```
 
-Lo que falta por comprobar antes de dar la hipótesis por buena: rastrear si
-algo del `osos` escribe en `0x4001FF00`–`0x40020000` en algún momento, y si el
-CPU debería haber despertado al COP antes de llegar aquí.
+y lectores simétricos (`0xfa4`, `0xfbc`, `0xf2360`, `0x285748`). Es el área de
+variables globales del propio sistema, no algo heredado de la ROM. Sale a cero
+sencillamente porque la IRAM arranca a cero y **nadie la ha inicializado
+todavía**.
+
+### Qué queda realmente sin explicar
+
+El assert lee `[&global_24 + 4]`, o sea la **global del offset 28**, y la usa
+como puntero: `[puntero + 0xe0]` da el nibble de configuración de memoria.
+
+De los 13 llamantes de `0x1084`, **ninguno usa el offset 28**. Así que quien
+escribe esa global o tiene la base cacheada y no pasa por el helper, o el valor
+llega por otra vía. Eso es lo que falta por localizar.
+
+### Y el COP tampoco es la explicación
+
+La segunda comprobación: **el CPU no despierta al COP antes de necesitar ese
+valor**. Su camino es `0x25c` → `bl 0x15f8` → `bl 0x1348` → `bl 0x1244` →
+`bl 0x15fc` → `bl 0x27eaec` → `bl 0x13bc`, y ahí dentro:
+
+- `0x15f8` es literalmente `bx lr`, un stub vacío.
+- `0x15fc` enmascara interrupciones sobre `0x60004000` (escribe `~0` en los
+  registros de deshabilitación en `+0x1c`, `+0x28`, `+0x38`, `+0x11c`, `+0x128`,
+  `+0x138`).
+
+No hay ninguna escritura a `COP_CTL` en esa ruta. Así que la lectura de que
+"la global la rellena el COP y por eso falla" **tampoco se sostiene**: si
+dependiese del COP, el CPU tendría que despertarlo antes, y no lo hace.
+
+Lo que sí es cierto y se mantiene: `0x95024` está condicionada al COP
+(`cmp r0,#0xaa`) y en el CPU sale sin hacer nada. Pero de ahí no se deduce que
+sea ella quien pone la global 28; eso era una inferencia mía, no un hecho
+comprobado.
+
+### Estado honesto
+
+Tres hipótesis planteadas sobre este mismo assert, tres retiradas:
+
+1. *La flash en blanco* — falsa: el firmware no lee la flash antes de morir.
+2. *La ROM deja un bloque de parámetros* — falsa: es el área de globales del
+   propio sistema, con escritores dentro del `osos`.
+3. *El COP rellena la global* — no sostenida: el CPU nunca lo despierta antes.
+
+Lo verificado y sólido, que no cambia: el sistema cree que hay cero bytes de
+RAM porque la global 28 vale cero, y el assert de la línea 231 salta. Lo que
+falta es encontrar quién debería escribirla.
