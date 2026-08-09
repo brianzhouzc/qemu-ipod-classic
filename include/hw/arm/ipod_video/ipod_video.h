@@ -74,7 +74,44 @@
  * way as long as there is no cache to be coherent with.
  */
 #define DRAM_ALIAS_BIT      0x04000000
-
+/*
+ * And address bit 31 is the uncached view of the same memory. Apple's firmware
+ * hands out every buffer through it.
+ *
+ * VERIFIED, and this one comes with its own explanation rather than needing to
+ * be inferred from a discontinuity. Ten buffer constructors in the image share
+ * one idiom -- 0x22131c, and nine in the allocator module at 0x28c8fc,
+ * 0x28c9dc, 0x28cab4, 0x28cb80, 0x28cca8, 0x28cd74, 0x28ce0c, 0x28ced0 and
+ * 0x28d0ec. Written out, 0x28cebc onwards:
+ *
+ *     str  r0, [r4, #4]         ; the aligned buffer pointer
+ *     ldrb r1, [r4, #12]        ; "caller says it is already uncached"
+ *     cmp  r1, #0
+ *     bne  done
+ *     mov  r1, #4
+ *     cmp  r1, r0, lsr #28      ; top nibble 4, i.e. IRAM?
+ *     beq  done                 ; then leave it alone
+ *     orr  r0, r0, #0x80000000  ; otherwise this is how the buffer is used
+ *     str  r0, [r4, #4]
+ *     ...
+ *     bl   0x9aa18              ; over [ptr - slack, ptr + size + slack]
+ *
+ * The exemption is what identifies the bit: IRAM is the one memory on this
+ * chip that is never cached, and it is exactly the one the firmware does not
+ * tag. Rockbox says the same thing in C, with a different constant because it
+ * runs its cached view somewhere else -- system-target.h:164, "#define
+ * UNCACHED_ADDR(a) ((typeof (a))((uintptr_t)(a) | UNCACHED_BASE_ADDR))".
+ *
+ * Caught by the retailOS taking a data abort reading 0x93EE1B70 -- a 512-byte
+ * memcpy at 0x21701c out of a 32 KB disk block buffer whose descriptor, at
+ * 0x13ee9b90, holds the raw allocation at +0 and that same address plus bit 31
+ * at +4.
+ *
+ * There is no cache in this model, so the uncached view is the same memory: an
+ * alias, exactly like the bit-26 twin. If a cache is ever modelled this stops
+ * being a detail and starts being the whole point of the bit.
+ */
+#define DRAM_UNCACHED_BIT   0x80000000
 
 /*
  * IRAMORIG in Rockbox's app-pp.lds. That script only claims 0xc000 for the

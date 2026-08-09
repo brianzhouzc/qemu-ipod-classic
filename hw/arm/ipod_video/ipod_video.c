@@ -1035,6 +1035,31 @@ static void ipod_video_machine_init(MachineState *machine)
     memory_region_init_alias(rom_alias, NULL, "flash-rom-remapped", rom, 0,
                              FLASH_ROM_MEM_SIZE);
     memory_region_add_subregion(sysmem, FLASH_ROM_REMAP_BASE, rom_alias);
+    /*
+     * The uncached views of both of those -- see DRAM_UNCACHED_BIT. Apple's
+     * allocator hands out every DRAM buffer with bit 31 set, and since its
+     * pointers come in both flavours (0x10000000 and its bit-26 twin), so do
+     * the uncached ones.
+     *
+     * The window at address 0 gets no such twin, deliberately. The tag is put
+     * on by the buffer allocator, whose heap is up in DRAM proper: every
+     * tagged pointer seen so far is 0x9xxxxxxx. If one ever turns up as
+     * 0x80xxxxxx the rule is the same and the fix is two more lines, but until
+     * then it would be a window nothing has asked for.
+     */
+    MemoryRegion *dram_uncached = g_new(MemoryRegion, 1);
+    memory_region_init_alias(dram_uncached, NULL, "dram-uncached", dram, 0,
+                             DRAM_MEM_SIZE);
+    memory_region_add_subregion(sysmem, DRAM_MEM_BASE | DRAM_UNCACHED_BIT,
+                                dram_uncached);
+
+    MemoryRegion *dram_uncached26 = g_new(MemoryRegion, 1);
+    memory_region_init_alias(dram_uncached26, NULL, "dram-uncached-bit26",
+                             dram, 0, DRAM_MEM_SIZE);
+    memory_region_add_subregion(sysmem,
+                                DRAM_MEM_BASE | DRAM_ALIAS_BIT
+                                              | DRAM_UNCACHED_BIT,
+                                dram_uncached26);
 
 
     uint32_t hwrev = cpu_to_le32(nms->hw_revision);
