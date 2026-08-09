@@ -10,7 +10,7 @@ el sistema original de Apple se movió allí.
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
-| `iPod-Video` | PP5022C | **el bootloader de Rockbox arranca y dibuja en pantalla** |
+| `iPod-Video` | PP5022C | **Rockbox se navega entero; el retailOS de Apple arranca su núcleo y se queda esperando al PMU** |
 
 El trabajo del Classic sigue intacto y es reaprovechable si algún día
 conseguimos un `osos` descifrado.
@@ -201,6 +201,173 @@ diferencia pequeña de píxeles **no prueba nada**. Solo vale la barra movida.
 - **Escritura por DMA.** Solo se ha ejercitado la lectura. El camino de
   escritura está implementado pero no probado.
 - **La rueda no genera "untouch"**: una vez tocada se queda tocada.
+
+## El retailOS de Apple: de pantalla negra a núcleo arrancado
+
+Con `-M iPod-Video,entry=0` el firmware original de Apple pasó de morir en la
+instrucción 289 a ejecutar 5175 bloques, arrancar su núcleo, levantar sus dos
+núcleos y entrar en el bucle de reposo de su planificador. **La pantalla sigue
+negra**, y ahora sabemos exactamente por qué.
+
+### Lo primero: no estaba callado, estaba entrando en pánico
+
+La dirección donde acababan todas las trazas, `0xe9b98`, no era "la primera
+llamada al sistema del firmware". Es el impresor de pánico de la librería C de
+ARM. La instrucción de encima lo delata:
+
+```
+e9b94:  mov r0, #4          @ SYS_WRITE0
+e9b98:  svc 0x123456
+```
+
+y la tabla de cadenas justo arriba contiene `"Type: "`, `"undefined
+instruction"`, `"data abort"`, `"_sys_exit"`, `"CPU "`, `"Task"`. Con
+semihosting activado, el firmware dice él mismo de qué se muere. La máquina lo
+activa por defecto; `-M iPod-Video,semihosting=off` lo desactiva.
+
+**Se retira** la hipótesis de que el retailOS moría en una llamada al sistema, y
+con ella la de que la IRAM vacía era la causa: los manejadores los instala el
+propio `osos` en `0x2a0`, unos 150 bloques *después* del punto de muerte.
+
+### Los tres muros, en orden
+
+| # | Muro | Diagnóstico | Arreglo |
+|---|---|---|---|
+| 1 | `svc 0x123456` sin manejador | es el impresor de pánico, no una syscall | responder al semihosting |
+| 2 | data abort en `0x84390` leyendo `0x0471619c` | **el bit 26 de la dirección no lo decodifica el controlador de SDRAM**: toda dirección de DRAM tiene gemela 0x04000000 más arriba | alias de DRAM en `0x04000000` y `0x14000000` |
+| 3 | data abort en `0x2668e4` sobre un objeto nulo | falta el **bloque SysInfo** que deja la ROM de arranque en lo alto de la IRAM | escribir el tag, el puntero y tres campos |
+
+#### El bit 26
+
+Lo dice la propia tabla de scatter-load del firmware, en
+`0x84040..0x840a8`. Orígenes y destinos van en una tirada contigua del fichero
+y en mitad de esa tirada la dirección salta exactamente `0x04000000`:
+
+```
+src 0x006c9a64 + len 0x0004c734 = 0x00716198 ; siguiente src = 0x0471619c
+dst 0x1493690c + len 0x0004c734 = 0x14983040 ; siguiente dst = 0x14983040
+```
+
+Una discontinuidad de un bit dentro de una serie de offsets consecutivos no es
+un cambio de dirección: es la misma dirección con una bandera. Lo confirma el
+contenido: el offset `0x7161a4` del fichero es `e1b0f00e`, `movs pc, lr`; la
+copia de `0x83848` lo deja en `0x40000008`, que es justo a donde apunta el
+literal del vector SWI en `0xec`. Encaja al byte.
+
+Lo **inferido** es qué significa el bit para el hardware. La unidad de remap
+apunta en la misma dirección: MMAP1 se programa con lógico `0x00003a00` /
+físico `0x10000f84`, y comparando esa máscara con las dos que usa
+`crt0-pp.S` de Rockbox (`0x3e00` para una ventana de 32 MB, `0x3c00` para
+64 MB) sale que el bit *k* de la máscara cubre el bit *k+16* de la dirección
+— o sea que los bits 26 y 27 llegan intactos al bus físico. Alguien más abajo
+tiene que estar ignorando el bit 26, y el único candidato es el controlador de
+memoria.
+
+#### El bloque SysInfo
+
+`ipodloader2/ipodhw.c` de iPodLinux nombra las direcciones y comenta que *"los
+últimos 256 bytes parecen usarlos la Flash ROM para cosas especiales"*:
+
+```c
+#define SYSINFO_TAG_PP5022 0x4001ff18
+#define SYSINFO_PTR_PP5022 0x4001ff1c
+```
+
+El firmware de Apple coincide al byte: `0x1084` reparte globales en
+`IRAM_END - 0x100 + N`, y `0x13bc` pide `N = 24`, compara la palabra de ahí
+contra `0x53797349` (`"IsyS"`) y toma un puntero de `+4`. Nada en la imagen
+escribe ninguna de las dos palabras — la constante mágica la carga **una sola
+instrucción** en siete megabytes y solo para compararla — así que las dejó la
+ROM que nos saltamos, igual que el bit 14 de `GPO32_VAL`.
+
+Sin el bloque se rompen dos cosas, y la segunda solo se vio al arreglar la
+primera:
+
+- **El tamaño de RAM.** `0x13e8` lee `SysInfo+0xe0` como cuenta de bytes y
+  `0xe6c` la redondea contra la tabla de `0x16d8` al tamaño del banco 2. Con el
+  puntero nulo esa lectura va a `[0x000000e0]`, que tras el remap es una
+  palabra de la propia tabla de vectores, `0x00000100`; 256 bytes redondean a
+  cero, los cuatro bancos salen vacíos y salta el assert de `0xda0`. Lo
+  llamativo: el firmware ya traía la respuesta buena — `0x1f4` hace
+  `mov fp, #0x700`, cuyo nibble 2 indexa la misma tabla a `0x02000000`, los
+  32 MB de un 5G — y la tira.
+- **El identificador de hardware.** Esto es lo que el análisis previo tenía al
+  revés. Dejar el tag a cero parece inocuo, porque `0x13e8` desreferencia el
+  puntero *antes* de que `0x1400` compruebe la magia. Pero `0x140c` solo
+  publica el puntero en `0x4000608c` si la magia cuadró, y esa palabra sí
+  importa:
+
+  ```
+  0x2b8   bl 0x1658    memcpy(0x14983060, 0x40006000, 0x90)
+  0x2bc   bl 0x281224  lee [0x149830ec]; si es nulo vuelve al instante, y si no
+                       copia min(len,248) bytes a 0x108710dc y lo instala como
+                       el singleton de información de hardware
+  0x2d0   bl 0x2668c4 -> 0x111c58 -> 0x2653a4 -> 0x265164, que lee +0x84
+  ```
+
+  Con el tag a cero `0x281224` no hace nada, `0x265164` lee `+0x84` de un
+  objeto en bss que nadie rellenó y saca cero, la tabla de saltos de
+  `0x2653a4` responde "no conozco esa máquina", `0x111c58` devuelve un driver
+  nulo y `0x2668e4` lo desreferencia.
+
+Se escriben **cuatro campos y ni uno más**: la magia en `0x4001ff18`, la
+longitud en `+0x04`, el identificador de hardware en `+0x84` (que es
+`IPOD_VIDEO_HW_REVISION`, el valor que esta máquina ya declaraba, sacado del
+aparato real por la pantalla de HW info de Rockbox — su mitad alta, `0x000b`,
+es la entrada 11 de la tabla de Apple, viva) y el tamaño de SDRAM en `+0xe0`.
+El resto queda a cero: el número de serie, el GUID de FireWire, el nombre de
+placa y las revisiones de imagen no los sabemos, y el `sysinfo_t` de iPodLinux
+**no sirve como fuente** — pone `sdram_size` en `+0x80` mientras este firmware
+lee `+0xe0`, que cae dentro de un `pad` que iPodLinux nunca decodificó.
+
+### Dónde se queda ahora: el PMU
+
+El sistema está **vivo**, no colgado:
+
+- ambos núcleos ejecutan (el CPU en el driver de I²C, el COP girando sobre un
+  cerrojo en `0x40000fac`),
+- se toman ~700 interrupciones por segundo,
+- se recorre toda la secuencia de reset (`0x2668c4`, `0x276fe8`, `0xbbdc4`,
+  `0x330`) y se llega al `main` del OS en `0xaf468`,
+- el planificador entra en su bucle de reposo en `0x285730`.
+
+Y el CPU se pasa el resto del tiempo en el bloque de I²C de `0x7000c000`,
+repitiendo eternamente esta transacción:
+
+```
+CTRL=0x80  ADDR=0x10  DATA0=0x30    escribir el puntero de registro 0x30
+CTRL=0x80  ADDR=0x11                 direccionar para lectura
+CTRL=0xa2  ADDR=0x11                 leer 2 bytes  (0xa2 = SEND | lectura | len 2)
+```
+
+Dirección `0x10` >> 1 = **`0x08`, el PCF50605**, el chip de gestión de energía
+(`i2c_readbytes(0x08, ...)` en `pcf50605.c` de Rockbox). Registro **`0x30` =
+`ADCS1`**, y leyendo dos bytes se lleva también `ADCS2`: son los **registros de
+resultado del conversor A/D**, o sea la medida de la batería.
+
+El mapa del bloque, de `i2c-pp.c`:
+
+| Registro | Offset | Bits |
+|---|---|---|
+| `I2C_CTRL` | `+0x00` | bit 7 `SEND`, bit 5 = lectura, bits 2:1 = longitud−1 |
+| `I2C_ADDR` | `+0x04` | dirección de 7 bits desplazada, bit 0 = lectura |
+| `I2C_DATA0..3` | `+0x0c`,`+0x10`,`+0x14`,`+0x18` | |
+| `I2C_STATUS` | `+0x1c` | bit 6 `BUSY`; el driver de Apple lee además los bits 2:0 como código de resultado (`0x282f40`) |
+
+Hoy el bloque es un fichero de registros: `STATUS` siempre lee cero, así que
+toda transacción "termina" al instante y con éxito, y el firmware se lleva de
+vuelta lo último que él mismo escribió. Rockbox sobrevive a eso porque su
+driver lee lo que haya y sigue; el de Apple se queda dando vueltas.
+
+**El siguiente paso, acotado:** modelar el controlador I²C del PP502x y colgar
+de él un PCF50605 en la dirección `0x08` que al menos responda `ADCS1`/`ADCS2`.
+El mapa de registros del PMU está en
+`assets/rockbox/firmware/export/pcf5060x.h`. Lo que **no** tenemos es la escala
+del ADC ni los valores que el retailOS considera aceptables, así que ese
+número habrá que sacarlo de cómo lo interpreta el firmware, no inventarlo.
+
+Queda por comprobar, y no está descartado, que la lectura de la batería sea el
+único bloqueo: puede haber más consumidores del PMU detrás.
 
 ## Estrategia (iPod classic 6G)
 

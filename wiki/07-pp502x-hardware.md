@@ -561,3 +561,70 @@ periférico podría faltar. Las tres hipótesis que se plantearon sobre el
 hardware —flash en blanco, bloque de parámetros de la ROM, el COP— fallaron
 las tres. Los literales `"PP5020A "` estaban a la vista, doce bytes después
 de la comparación que los usa.
+
+## Resuelto: quién escribe la global 28, y las tres hipótesis anteriores (2026-08-09)
+
+Todo lo de arriba sobre el assert de la línea 231 queda cerrado aquí. La
+pregunta que quedaba abierta —*"de los 13 llamantes de `0x1084`, ninguno usa el
+offset 28; quién escribe esa global"*— tiene una respuesta y no es ninguna de
+las tres candidatas que se habían planteado.
+
+**La escribe la ROM de arranque de Apple, y la hipótesis 2 queda por tanto
+reinstaurada** — pero no como se había formulado. Las dos cosas eran ciertas a
+la vez y por eso se descartó de más:
+
+- `0x1084` **sí** es un "dame la dirección de la global N", y hay llamantes que
+  escriben. Eso era correcto.
+- Y **además** las entradas 24 y 28 de esa misma área son el par
+  `{tag, puntero}` que iPodLinux llama SysInfo, en `0x4001ff18` y `0x4001ff1c`.
+  Que el `osos` use ese área para sus propias globales no impide que la ROM
+  haya dejado dos palabras en ella antes.
+
+La comprobación que lo cierra: la constante `0x53797349` (`"IsyS"`) la carga
+**una sola instrucción de toda la imagen**, `0x13fc`, y es una *comparación*.
+Nunca se escribe. Un valor que el firmware solo compara y jamás produce tiene
+que venir de fuera del firmware.
+
+Coincide exactamente con `ipodloader2/ipodhw.c` de iPodLinux, que lee esas dos
+direcciones y comenta que los últimos 256 bytes de la IRAM los usa la Flash
+ROM.
+
+### Las tres hipótesis, en su sitio definitivo
+
+| Hipótesis | Veredicto final |
+|---|---|
+| *La flash en blanco es el problema* | **Sigue falsa.** El firmware no lee la flash antes de morir, y tampoco lee `0x2000405c`: `findlit.py` no encuentra ni una sola instrucción que cargue ese literal. |
+| *La ROM deja un bloque de parámetros* | **Reinstaurada, con matiz.** No es "el área de `0x1084` es de la ROM": es que dos palabras concretas de esa área las deja la ROM. |
+| *El COP rellena la global* | **Sigue sin sostenerse**, y ahora además es innecesaria. |
+| *El `osos` tiene 139 referencias a IRAM* | **Sigue falsa** (eran constantes de coma flotante), pero la conclusión que se sacaba de ella —que el `osos` instala sus propios manejadores— resultó **cierta**: lo hace en `0x2a0` → `0x83848`. |
+| *Hace falta un volcado de la flash* | **No para arrancar.** Sí sería la fuente ideal para conocer el resto del bloque SysInfo, que hoy va a ceros. |
+
+### Y una que no se había planteado: el bit 26
+
+El muro que quedaba entre "pasa el assert" y "arranca el núcleo" no era ningún
+periférico: era el mapa de memoria. El controlador de SDRAM no decodifica el
+bit 26 de la dirección, así que toda dirección de DRAM tiene una gemela
+`0x04000000` más arriba, y el firmware de Apple usa las dos indistintamente.
+La derivación completa está en `04-roadmap.md` y en el comentario de
+`DRAM_ALIAS_BIT`.
+
+De paso, dos correcciones a la unidad de remap descritas más arriba:
+
+- La ventana que pone la DRAM en la dirección 0 para el firmware de Apple es
+  **MMAP1**, no MMAP0. Su MMAP0 (lógico `0x00003bf0` / físico `0x00003a88`)
+  apunta a la física 0. Funcionaba por accidente porque el modelo activaba el
+  remap ante cualquier escritura a MMAP0.
+- La máscara: el bit *k* del registro lógico cubre el bit *k+16* de la
+  dirección. Sale de comparar las dos que usa `crt0-pp.S` — `0x3e00` para una
+  ventana de 32 MB y `0x3c00` para 64 MB: quitar el bit 9 duplica la ventana,
+  luego el bit 9 es el bit 25 de la dirección. Sigue sin aplicarse, pero ya
+  está documentada.
+
+### Método, revisado
+
+La lección de la fase anterior —desensamblar la dirección que señala la traza
+en vez de razonar sobre qué periférico podría faltar— se mantiene, con una
+corrección importante: **antes de eso, dejar hablar al firmware**. El impresor
+de pánico llevaba tres commits siendo interpretado como "la primera llamada al
+sistema". Diez segundos de semihosting habrían dicho `Type: _sys_exit` y cuatro
+bancos de memoria vacíos.
