@@ -23,15 +23,42 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodVideoBCMState, IPOD_VIDEO_BCM)
 #define BCM_MMIO_SIZE   0x80000
 
 /*
- * The chip's own address space. Rockbox writes frames at BCMA_CMDPARAM
- * (0xE0000) and the panel is 320x240 RGB565, so a full frame needs 150 KB from
- * there; round the window up well past that to leave room for the registers
- * and scratch the firmware pokes at during init.
+ * The chip's own address space is sparse, and two windows of it are used.
+ *
+ * The low one starts at BCMA_SRAM_BASE, which is address 0: the mailbox at
+ * 0x1F8/0x1FC lives there, both guests upload the ~200 KB VMCS firmware image
+ * to it, and Rockbox writes frames at 0xE0000. Two megabytes covers all of
+ * that with room to spare.
  */
 #define BCM_MEM_SIZE    0x00200000
 
+/*
+ * The high one is the VideoCore's control registers. Only two words of it are
+ * used by either driver -- 0x10000C00, which releases the uploaded firmware
+ * and reports back that it is executing, and 0x10000400, the doorbell -- but
+ * Rockbox's bcm_powerdown() also touches 0x10001400 (lcd-video.c:515), so the
+ * window runs to 0x10002000.
+ */
+#define BCM_CTRL_BASE   0x10000000
+#define BCM_CTRL_SIZE   0x00002000
+
 #define LCD_WIDTH       320
 #define LCD_HEIGHT      240
+
+/*
+ * The chip has two identical host ports, the primary and the alternate, 64 KB
+ * apart in the register window. They address the same chip memory but have
+ * their own pointers: Rockbox only ever uses the primary, while the retailOS
+ * uses both at once, pushing image data through the alternate one (0x164524
+ * and 0x165024 pass port 1) while other tasks use the primary.
+ */
+typedef struct {
+    uint32_t wr_addr;   /* auto-incrementing write pointer */
+    uint32_t rd_addr;   /* auto-incrementing read pointer */
+    uint32_t wr_start;  /* where the current run of writes was aimed */
+} IPodVideoBCMPort;
+
+#define BCM_NUM_PORTS   2
 
 struct IPodVideoBCMState {
     SysBusDevice parent_obj;
@@ -40,9 +67,11 @@ struct IPodVideoBCMState {
     qemu_irq irq;
     QemuConsole *con;
 
-    uint8_t *mem;           /* the chip's address space */
-    uint32_t wr_addr;       /* auto-incrementing write pointer */
-    uint32_t rd_addr;       /* auto-incrementing read pointer */
+    uint8_t *mem;           /* the chip's low address space */
+    uint8_t *ctrl;          /* its control registers at 0x10000000 */
+    IPodVideoBCMPort port[BCM_NUM_PORTS];
+    /* True while the uploaded VideoCore firmware is considered to be running. */
+    bool vc_running;
     bool dirty;
 };
 
