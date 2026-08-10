@@ -11,9 +11,14 @@
  *
  * THE REGISTER MAP
  *
- * Names from Rockbox (firmware/export/s5l87xx.h:1642-1651); the semantics
- * below are from Apple's own code, disassembled with
- * --adjust-vma=0x07FF51B8 over assets/classic6g/osos_decrypted.bin.
+ * The base and the offsets are Rockbox's (firmware/export/s5l87xx.h:1642-1651:
+ * WHEEL_BASE 0x3C200000, and IRQ_WHEEL 23 at :1901). The NAMES below are ours
+ * except three: Rockbox calls the registers WHEEL00/04/08/0C/10, WHEELINT,
+ * WHEELRX and WHEELTX, so only the last three are borrowed and WHEELCON,
+ * WHEELGO, WHEELDIV, WHEELSTAT, WHEELMASK and WHEELPEND are names this port
+ * invented to say what it believes each one does. The semantics are from
+ * Apple's own code, disassembled with --adjust-vma=0x07FF51B8 over
+ * assets/classic6g/osos_decrypted.bin.
  *
  *   +0x00 WHEELCON    control. VERIFIED as a sequence, UNDETERMINED bit by bit
  *   +0x04 WHEELGO     bit 0 starts the transfer queued in WHEELTX. VERIFIED
@@ -285,11 +290,11 @@ struct IPodClassicWheelState {
     int64_t untouch_ns;
     bool irq_level;
 
-    /* Counters, printed by WHEELTRACE=1 at exit. */
-    uint64_t packets;
-    uint64_t dropped;
-    uint64_t irq_raises;
-    uint64_t commands;
+    /*
+     * The WHEELTRACE=1 counters are NOT here: they are file statics in the .c,
+     * because atexit() has to reach them and there is exactly one wheel. Four
+     * per-instance copies used to sit here and nothing ever wrote to them.
+     */
 };
 
 #endif /* HW_ARM_IPOD_CLASSIC_WHEEL_H */

@@ -174,10 +174,18 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
      *
      * -- so the bit SET means the hold switch is OFF and input is allowed.
      * Apple's retailOS, disassembled: 0x08294f80 reads one byte of register
-     * 0x87 over I2C and stores (byte >> 1) & 1; 0x080634a4 turns that into
-     * "1 - it"; and 0x0803f3e0, the second instruction of the keycode
-     * dispatcher 0x0803f390, returns immediately when that is non-zero. Same
-     * polarity, arrived at from the other end.
+     * 0x87 over I2C and stores (byte >> 1) & 1 ("mov r0,#0x87" / "bl I2C read"
+     * / "and r0,r0,#2" / "lsr r0,r0,#1"); 0x080634a4 turns that into "1 - it"
+     * ("rsbs r0,r0,#1" / "movcc r0,#0"); and the keycode dispatcher
+     * 0x0803f390 calls that chain at 0x0803f3e0 -- through the tail branch
+     * 0x08030d48, which is a bare "b 0x080634a4" -- and returns immediately
+     * when the answer is non-zero ("cmp r0,#0" / "popne {r4,r5,r6,pc}" at
+     * 0x0803f3e4). Same polarity, arrived at from the other end.
+     *
+     * (0x0803f3e0 is the 21st instruction of that function, not the second:
+     * the entry first remaps the keycode through four compares. Nothing
+     * depends on where it sits, but an earlier version of this comment said
+     * "one instruction after the entry" and that was simply wrong.)
      *
      * MEASURED, before and after. With the register at 0 the wheel worked and
      * the buttons did not: holding ENTER down for three seconds and reading

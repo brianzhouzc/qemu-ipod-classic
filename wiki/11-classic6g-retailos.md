@@ -1362,8 +1362,14 @@ como todo el modelo de la rueda; ver §17.4.
 
 ### 17.1 El mapa de registros
 
-Nombres de Rockbox (`firmware/export/s5l87xx.h:1642-1651`); la semántica es del
-desensamblado de Apple, con `--adjust-vma=0x07FF51B8`.
+La base y los desplazamientos son de Rockbox (`firmware/export/s5l87xx.h:1642-1651`,
+`WHEEL_BASE 0x3C200000`, y `IRQ_WHEEL 23` en la `:1901`). Los **nombres**, en
+cambio, son casi todos nuestros: Rockbox sólo llama por su función a `WHEELINT`,
+`WHEELRX` y `WHEELTX`, y a los otros cinco los llama `WHEEL00`, `WHEEL04`,
+`WHEEL08`, `WHEEL0C` y `WHEEL10`. `WHEELCON`, `WHEELGO`, `WHEELDIV`,
+`WHEELSTAT`, `WHEELMASK` y `WHEELPEND` son inventos de este puerto para decir lo
+que creemos que hace cada uno. La semántica sí es del desensamblado de Apple,
+con `--adjust-vma=0x07FF51B8`.
 
 | Off | Nombre | Qué hace el retailOS | Estado |
 |---|---|---|---|
@@ -1445,12 +1451,22 @@ propio firmware:
                       0x0805c0e4 y llamó al despachador 0x0803f390
 ```
 
-...y la pantalla no cambiaba. La causa está una instrucción después de la
-entrada del despachador: `0x0803f3e0` llama a `0x08030d48` → `0x080634a4` →
-`0x08294f80`, que lee **un byte del registro `0x87` del PMU por I2C** y se queda
-con `(byte >> 1) & 1`; `0x080634a4` devuelve `1 − eso`; y `0x0803f3e4` **vuelve
-inmediatamente si es distinto de cero**. Con el registro a cero, cada botón se
+...y la pantalla no cambiaba. La causa está dentro del despachador, en
+`0x0803f3e0` —la instrucción **número 21** de la función, después de la cadena
+de cuatro comparaciones que remapea el código de tecla; una versión anterior de
+este párrafo decía «una instrucción después de la entrada» y era falso—.
+`0x0803f3e0` llama a `0x08030d48`, que es un `b 0x080634a4` pelado, y de ahí a
+`0x08294f80`, que lee **un byte del registro `0x87` del PMU por I2C**
+(`mov r0,#0x87` / `and r0,r0,#2` / `lsr r0,r0,#1`) y se queda con
+`(byte >> 1) & 1`; `0x080634a4` devuelve `1 − eso` (`rsbs r0,r0,#1` /
+`movcc r0,#0`); y `0x0803f3e4` **vuelve inmediatamente si es distinto de cero**
+(`cmp r0,#0` / `popne {r4,r5,r6,pc}`). Con el registro a cero, cada botón se
 tiraba en silencio.
+
+(Y hay una segunda puerta justo detrás, en `0x0803f3ec`, que también hace
+`pop` si un byte de otro bloque vale cero. No estorba —los botones funcionan—
+pero conviene saber que está ahí antes de culpar al interruptor de bloqueo la
+próxima vez.)
 
 Rockbox dice qué es ese bit, y llega a la misma polaridad desde el otro lado
 (`firmware/target/arm/s5l8702/ipod6g/pmu-6g.c:244`):
@@ -1526,8 +1542,18 @@ Tres cosas que decir de ahí:
   al que el modelo produce. Ese contador está puesto justo para que, si algún
   día el ISR deja de correr, lo diga en vez de dejarnos adivinando.
 
-Repintados: **417** escrituras de la dirección de origen de la capa 0 en la
-carrera, contra **10** en una carrera en reposo.
+Repintados: **unos 420** escrituras de la dirección de origen de la capa 0 en la
+carrera (417 en la del parche, 419 en la de la auditoría: la cuenta depende de
+dónde caiga la captura dentro del doble búfer y **no** es un número exacto que
+reproducir), contra **10** en una carrera en reposo. Lo que importa del dato es
+el orden de magnitud: cuarenta veces más que en reposo.
+
+Los ocho contadores de `WHEELTRACE`, en cambio, **sí** son exactos y cuadran con
+las teclas una por una: 14 paquetes = 1 respuesta sondeada del arranque + 3 giros
+× (armado + movimiento + dedo fuera) + Enter (pulsar y soltar) + `w` (pulsar y
+soltar). Y 13 flancos de subida = 14 − 1, porque el paquete del arranque se
+encola con `WHEELMASK` a cero y ése no levanta la línea. Reproducido idéntico en
+la auditoría.
 
 ### 17.6 Correcciones a lo escrito antes
 
@@ -1554,6 +1580,28 @@ carrera, contra **10** en una carrera en reposo.
   `0x08170e94`, construye el mensaje `'kDwn'` y lo mete en la cola del
   EventManager, y la suelta hace lo mismo con `'kUp '`. El evento llega; lo que
   la pantalla decide hacer con él es de la aplicación. **Es el hito que falta.**
+
+  **Medido en la auditoría, y estrecha bastante la busca:** esa pantalla **no
+  está sorda**. Con la misma carrera, después de Enter:
+
+  ```
+  04-select        76800 px    la nota musical y 「ミュージックが…」
+  05-post-wheel    76800 px   50307 px distintos   <- una `e`, la rueda
+  06-post-menu     76800 px       0 px distintos   <- una `w`, MENU
+  07-post-select   76800 px       0 px distintos   <- otro Enter
+  ```
+
+  La **rueda sí la mueve**: la nota desaparece y queda el degradado liso. Y no
+  es que la animación siga sola, porque en la carrera de `navtest.sh` esa misma
+  pantalla se queda **idéntica** 40 s sin tocar nada (`06-select-later`, 0 px).
+  O sea: la capa de entrada entrega **giros y botones** a esa pantalla, ella
+  reacciona al giro y **decide no hacer nada** con MENU ni con un segundo
+  Enter. Eso apunta a que la pantalla es la del asistente de primer arranque y
+  no tiene a dónde volver, no a que falte nada por debajo — pero sigue siendo
+  **INFERIDO**, no verificado.
+
+  Y en la **pantalla de idiomas** MENU tampoco hace nada (0 px), ni `a`
+  (izquierda/anterior): también medido en la auditoría, con esperas de 8 s.
 - **El panel derecho no cambia al girar** (0 píxeles a la derecha en los tres
   giros). La regla `list.pid.….delayedselected1 -> ShowSetting_Language` dice
   que debería. Que no se dispare apunta a la mitad temporizada de la interfaz
@@ -1574,8 +1622,9 @@ carrera, contra **10** en una carrera en reposo.
 |---|---|
 | `tools/ipod_classic/navtest.sh` | los tres giros dan 8000 px cada uno, y el suelo en reposo sigue siendo 0 |
 | retailOS en reposo, dos capturas seguidas | 0 px de diferencia, igual que antes de la rueda |
-| **`tools/ipod_video/navtest.sh` (el 5G)** | **76 548 px en los siete fotogramas, y el resaltado se mueve: 12 312, 12 114, 31 602.** Idéntico a lo que registra el §15. Sin regresión |
+| **`tools/ipod_video/navtest.sh` (el 5G)** | **76 548 px en los siete fotogramas, y el resaltado se mueve: 12 312, 12 114, y ~31 600** (31 602 en la carrera del parche, 31 609 en la de la auditoría). Los dos primeros son estables; el tercero **no lo es y no puede serlo**, porque la pantalla del 5G a la que entra Enter sí tiene reloj —el §15 lo registra como «~31 600» por eso—. Sin regresión |
 | El bloque `0x3C200000` ya no está en `ipod_classic_unimplemented[]` | la ventana modelada son 4 KB, no 1 MB: el resto del bloque sigue cayendo al *io floor* y `-d unimp` lo diría. No lo dice |
+| `stderr` de la carrera entera | ni una excepción, ni un reinicio, ni un `unimp`: quitando `DISPTRACE` y `WHEELTRACE`, la carrera imprime **cuatro** líneas y las cuatro son informativas. Navegar y morir no sería navegar |
 
 ### 17.9 Cómo reproducirlo
 

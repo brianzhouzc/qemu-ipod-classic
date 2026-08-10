@@ -531,9 +531,15 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
     /*
-     * The firmware delivers a movement only if it is between 6 and 35
-     * positions (threshold at 0x089116d8+0x04, window at 0x0807a6dc), so a
-     * step from the environment is clamped to that window rather than obeyed.
+     * The firmware delivers the FIRST movement of a gesture only if it is
+     * between 6 and 35 positions (threshold at 0x089116d8+0x04, window at
+     * 0x0807a6dc), and 6 is the default for that reason. The clamp here is
+     * 1..35, not 6..35, deliberately: the upper end is the firmware's hard
+     * window and going past it delivers nothing, while values below 6 are
+     * legal to ask for -- they are how you exercise Apple's acceleration path,
+     * where four sub-threshold clicks drop the threshold to 0. Anything under
+     * 6 means the first few keystrokes of a gesture do nothing, which is why
+     * it is not the default.
      */
     s->key_step = wheel_env_int("IPOD_WHEEL_STEP",
                                 S5L8702_WHEEL_KEY_STEP, 1, 35);
@@ -547,10 +553,28 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     qemu_add_kbd_event_handler(wheel_key_event, s);
 }
 
+/*
+ * irq_level is NOT in the field list below, on purpose: it is not state, it is
+ * a cache of what we last put on the wire. Recomputing it is both shorter and
+ * safer than migrating it, and it has to be recomputed anyway -- a device that
+ * comes back with words in the FIFO comes back with a qemu_irq that is low,
+ * and without this the guest would never be told and input would be dead for
+ * the rest of the run.
+ */
+static int wheel_post_load(void *opaque, int version_id)
+{
+    IPodClassicWheelState *s = opaque;
+
+    s->irq_level = false;
+    wheel_update_irq(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ipod_classic_wheel = {
     .name = TYPE_IPOD_CLASSIC_WHEEL,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = wheel_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(con, IPodClassicWheelState),
         VMSTATE_UINT32(go, IPodClassicWheelState),

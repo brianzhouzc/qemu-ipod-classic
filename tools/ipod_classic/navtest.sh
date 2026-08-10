@@ -19,7 +19,9 @@
 #   * The language screen has NO CLOCK. Two frames of a settled screen differ
 #     by exactly 0 pixels -- measured, five shots over 20 s. So on this screen
 #     any non-zero difference is real, and the second baseline is there to
-#     prove the floor is still 0 before anything is claimed.
+#     prove the floor is still 0 before anything is claimed -- and if it is
+#     not 0 the whole run is a SUSPENSO, because every threshold below assumes
+#     it.
 #   * Moving the selection bar one item has to change about 7 400 pixels: the
 #     bar is 160x23 and the row pitch is 24, so two bars' worth change colour.
 #     Counted on a real frame, the strict lower bound is 6 584. Anything under
@@ -164,9 +166,16 @@ if floor is None:
 
 ok = True
 if floor != 0:
-    print("AVISO: la pantalla en reposo cambia %d px entre dos capturas. "
-          "El suelo de ruido ya no es 0 y los umbrales de abajo no valen."
-          % floor)
+    # Y esto SUSPENDE la prueba, no es un aviso. Todo el veredicto de abajo
+    # descansa en que esta pantalla no tiene reloj y su suelo es exactamente 0
+    # (medido: cinco disparos en 20 s, y dos carreras independientes). Si deja
+    # de serlo, los umbrales dejan de distinguir "se movio el resaltado" de
+    # "parpadeo algo", y un test que sigue diciendo OK con su premisa rota es
+    # peor que ninguno.
+    print("SUSPENSO: la pantalla en reposo cambia %d px entre dos capturas. "
+          "El suelo de ruido ya no es 0, asi que los umbrales de abajo no "
+          "valen y no se puede concluir nada de ellos." % floor)
+    ok = False
 
 def verdict(name, what, hard=True):
     global ok
@@ -201,6 +210,10 @@ print("   despachador 0x0803f390 y llega a 0x08170e94, que construye el")
 print("   mensaje 'kDwn' y lo mete en la cola del EventManager. Lo que la")
 print("   pantalla de idioma hace con el sigue siendo DESCONOCIDO, asi que")
 print("   estas dos lineas se miden y se enseñan, no se aprueban.")
+print("   Y ojo con leer el 0 de 07-menu como 'la tecla no llega': en la")
+print("   pantalla de despues de SELECT una `e` SI cambia 50 307 px (medido")
+print("   aparte, wiki/11 s.17.7). Esa pantalla oye el giro y decide no")
+print("   hacer nada con MENU; no esta sorda.")
 verdict("05-select",       "SELECT cambio la pantalla", hard=False)
 verdict("06-select-later", "cambio, tarde",             hard=False)
 verdict("07-menu",         "MENU cambio la pantalla",   hard=False)
