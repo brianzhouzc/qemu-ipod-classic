@@ -220,6 +220,45 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
 /* Control-register bit that the blit path reads back. See +0x3ac above. */
 #define S5L8702_DISP_FORMAT_ROT 0x1
 
+/*
+ * THE PER-LAYER ENABLE BITS, in CONTROL (+0x008). Bit 6 turns layer 0 on,
+ * bit 5 layer 1, bit 4 layer 2 -- so layer k is bit (6 - k).
+ *
+ * This is the gate that was missing, and without it the model kept drawing
+ * layers the guest had switched off but left fully programmed, which covered
+ * the whole user interface with a stale surface. Two independent lines of
+ * evidence, both from a boot with a disk:
+ *
+ * 1. THE SETTER, disassembled. 0x081271c8 takes an index in r1 and a boolean
+ *    in r2, jumps through the table at 0x081271d8, and does
+ *    "bic r0, r0, #BIT / orrne r0, r0, #BIT" on the word it read from +0x008
+ *    before storing it back at 0x08127250. The arms are, in index order:
+ *      0 -> 0x40   1 -> 0x20   2 -> 0x10   3 -> 0x08   4 -> 0x04   5 -> 0x80
+ *    Indices 0..2 are the three layers; 3..5 are something else and only
+ *    index 5 (bit 7) is ever seen, twice, in a whole run.
+ *
+ * 2. THE ORDER OF WRITES, traced with DISPTRACE=1. Every single time, the
+ *    guest programs a descriptor, writes its SOURCE ADDRESS, and only then
+ *    sets the matching bit:
+ *      +0x060 = 0x089d42d4 (layer 0) ... +0x008: 0x41118101 -> 0x41118141
+ *      +0x078 = 0x0be2326c (layer 1) ... +0x008: 0x41118141 -> 0x41118161
+ *      +0x090 = 0x0bfb4ff8 (layer 2) ... +0x008: 0x41118161 -> 0x41118171
+ *    and when a transition ends it clears them again, 0x41118151 then
+ *    0x41118141, WITHOUT clearing the source address or the size. A settled
+ *    screen sits at 0x41118141: layer 0 alone.
+ *
+ * Not to be confused with bits 16, 20 and 24, which also look one-per-layer.
+ * An earlier version of the compositor weighed those, found them set once
+ * during init and never touched again, and rejected them as a gate -- which
+ * was correct about 16/20/24, and became the wrong conclusion only because it
+ * stopped there and declared that nothing gated a layer at all.
+ *
+ * Layers 3 and 4 have no known enable bit. No boot has ever written their
+ * descriptors, so the question has never come up; see the compositor.
+ */
+#define S5L8702_DISP_LAYER_EN_BIT(k) (1u << (6 - (k)))
+#define S5L8702_DISP_NLAYER_GATED 3
+
 struct IPodClassicDispState {
     SysBusDevice parent_obj;
 

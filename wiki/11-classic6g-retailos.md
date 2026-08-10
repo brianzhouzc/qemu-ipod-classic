@@ -24,7 +24,17 @@ saberlo). Las trazas son reproducibles con las órdenes del final.
 | 2. Pasa la inicialización temprana sin colgarse | **hecho** |
 | 3. Inicializa periféricos y llega a su bucle principal | **hecho** — kernel RTXC arrancado, planificador vivo, tarea idle en `0x22003b1c` |
 | 4. Dibuja algo en pantalla | **hecho, con disco** — la pantalla de selección de idioma, 75 463 de 76 800 píxeles. Ver §13 |
-| 5. Se puede **navegar** | **hecho a medias** — la rueda mueve el resaltado y el botón central entra en la pantalla siguiente (§17). MENU todavía no vuelve atrás |
+| 5. Se puede **navegar** | **hecho** — rueda, SELECT y **MENU**: menú principal, entrar en Música, y volver con MENU al fotograma exacto del que se salió (§18) |
+
+> **10 de agosto de 2026, aún más tarde — y ahora MENU vuelve.** Los dos
+> síntomas que quedaban —MENU no volvía atrás y el panel derecho no seguía al
+> resaltado— eran **el mismo fallo, y era nuestro**: el compositor dibujaba
+> capas que el huésped había apagado, y desde el primer cambio de pantalla una
+> capa muerta tapaba la interfaz entera. La puerta son **los bits 4..6 del
+> registro `CONTROL` del compositor**. Con ella puesta: menú principal en el
+> idioma elegido, la rueda mueve el resaltado **y el panel derecho lo sigue**,
+> SELECT entra en Música y **MENU vuelve, con 0 píxeles de diferencia respecto
+> al fotograma del que se salió** (§18).
 
 > **10 de agosto de 2026, más tarde — y ahora se puede usar.** Con la rueda de
 > clic modelada (§17), `e` mueve la barra de selección de **English** a
@@ -986,6 +996,14 @@ Lo que **se corrige**:
 | `tools/ipod_classic/ppm2png.py` | convierte un `screendump` a PNG **para mirarlo**, y también lee framebuffers crudos sacados con `pmemsave` (`--raw 320x240:argb8888`) |
 | `hw/arm/ipod_classic/ipod_classic.c` | DMAC0 y DMAC1 pasan a ser `TYPE_PL080` con IRQ 16/17 y la memoria del sistema como puerto maestro |
 
+### De la tanda del §18
+
+| Ruta | Qué es |
+|---|---|
+| `tools/ipod_classic/uirules.py` | lee la **tabla de reglas de la interfaz** —(disparador, manejador, acciones)— del binario de Apple, con el formato documentado en su cabecera. Es lo que convierte «¿MENU hace algo en esta pantalla?» en una consulta |
+| `tools/ipod_classic/evtrace.py` | arranca QEMU con monitor **y** gdbstub, deja que arranque suelto, engancha, arma los puntos de ruptura y **entonces** pulsa la tecla desde un hilo. `--str rN` sigue un puntero y enseña la cadena que hay al final |
+| `tools/ipod_classic/tests/timer_audit.c` | prueba desnuda del bloque de temporizadores: mide tres contadores libres contra `USEC_TIMER` y aísla qué escrituras reinician la cuenta |
+
 ---
 
 ## 13. `0x38900000` es el compositor, y de ahí salen los píxeles
@@ -1520,6 +1538,20 @@ las dos máquinas.
 07-menu             76800 px encendidos        0 px distintos
 ```
 
+Esa carrera es de una máquina con el arranque limpio (cero reinicios) y **pasa
+todo menos la última línea**: `10-menu-back` se perdió la pulsación de MENU, que
+es el fallo de entrada del §18.8 y no del compositor. **En otras dos carreras
+del mismo test la última línea también pasó**, y con la medida que importa:
+
+```
+10-menu-back   0 px de diferencia con 08-menu-wheel-back  -> MENU VOLVIO A LA MISMA PANTALLA
+10-menu-back  23 px de diferencia con 08-menu-wheel-back  -> MENU VOLVIO A LA MISMA PANTALLA
+```
+
+**Cero y veintitrés píxeles** —los 23 son el icono de la batería del §18.7—
+contra los 6 088 que cuesta cambiar de pantalla. No es «cambiaron muchos
+píxeles»: es **el mismo fotograma del que se salió**.
+
 Y **mirado**, que es la otra mitad de la medida:
 
 - `00-idle`: la lista de idiomas con la barra azul sobre **English**.
@@ -1570,6 +1602,14 @@ soltar). Y 13 flancos de subida = 14 − 1, porque el paquete del arranque se
 encola con `WHEELMASK` a cero y ése no levanta la línea. Reproducido idéntico en
 la auditoría.
 
+> **Ese «pulsar y soltar = dos paquetes» dejó de ser cierto en el §18.8**, y por
+> una razón medida: dos paquetes por pulsación perdían la pulsación entera
+> siempre que la tarea de rueda no corría entre ellos —seis de cada diez—. Ahora
+> el estado de los botones se **repite** mientras están pulsados y durante
+> 400 ms después de cada flanco, así que la cuenta de paquetes de una carrera
+> con teclas es bastante mayor y ya no se puede predecir a mano. Los giros no
+> cambian.
+
 ### 17.6 Correcciones a lo escrito antes
 
 1. **§6, §15 y §16: «el huésped sondea la rueda ~120 veces por segundo, así que
@@ -1585,6 +1625,14 @@ la auditoría.
 2. **§15, «lo siguiente en orden de coste», punto 1.** Hecho.
 
 ### 17.7 Lo que sigue sin saberse
+
+> **RESUELTO en el §18, y los dos primeros puntos de esta lista estaban mal
+> planteados.** «La pantalla que sigue a elegir idioma» era **el menú principal
+> con la lista tapada**: el huésped la dibujaba entera y nuestro compositor le
+> ponía encima una capa que el huésped ya había apagado. Y el panel de
+> «Welcome» **no tiene ninguna regla** que le diga que siga al resaltado: la que
+> se citaba aquí es de otra pantalla. Se dejan escritos tal cual, con lo que se
+> creyó entonces, porque el §12 vive de eso.
 
 - **MENU no vuelve atrás desde la pantalla que sigue a elegir idioma.** Medido
   dos veces, con esperas de 15 y de 25 s, y en las dos: **0 píxeles**. Si es
@@ -1667,3 +1715,374 @@ cd build && ./qemu-system-arm -M iPod-Classic \
 # q / e giran la rueda, Enter selecciona, w es MENU, a / d atras / adelante,
 # s es play. WHEELTRACE=1 cuenta paquetes, ordenes e interrupciones.
 ```
+
+---
+
+## 18. La puerta que faltaba: los bits de habilitación de capa, y el menú que sí vuelve (10 de agosto de 2026)
+
+Los dos síntomas que quedaban abiertos en el §17.7 —**MENU no vuelve atrás** y
+**el panel derecho no sigue al resaltado**— tenían **una sola causa**, y estaba
+en nuestro modelo, no en el firmware de Apple:
+
+> `ipod_classic_disp_compose()` dibujaba **toda capa que tuviera dirección de
+> origen**. El huésped, al terminar una transición, **apaga la capa pero deja
+> el descriptor entero puesto**. Desde el primer cambio de pantalla, la **capa
+> 2** —320×240 en (0,0), origen `0x0bfb4ff8`— se quedaba encima de la capa 0
+> **para siempre**, y tapaba la interfaz completa. Las teclas funcionaban; lo
+> que hacían no se veía.
+
+Con la puerta puesta, el retailOS **se navega**: menú principal en el idioma
+elegido, la rueda mueve el resaltado **y el panel derecho lo sigue**, SELECT
+entra en Música y **MENU vuelve al fotograma exacto del que se salió**.
+
+### 18.1 La medida que lo destapó, y por qué ninguna anterior podía
+
+Las investigaciones anteriores midieron **lo que la pantalla enseñaba**. Ésta
+miró **lo que el huésped había dibujado**. Con la pantalla mostrando la nota
+musical y «No Music» sobre un degradado liso —sin lista y sin barra de título—:
+
+```bash
+(qemu) pmemsave 0x08000000 0x04000000 "/tmp/dram.bin"
+# los dos búferes que la capa 0 alterna, sacados del volcado:
+python3 tools/ipod_classic/ppm2png.py fb0.bin fb0.png --raw 320x240:argb8888
+```
+
+`0x09767a24` y `0x089d42d4` contenían **el menú principal completo**: barra
+«iPod» con la batería, la lista (Music, Videos, Photos, Podcasts, Extras,
+Settings, Shuffle Songs) con Music resaltado y su flecha, y el panel derecho
+con la nota y «No Music».
+
+Y `0x0bfb4ff8`, el origen de la **capa 2**, contenía exactamente el fotograma
+que se veía: el degradado con la nota y el texto, **sin lista y sin barra de
+título**.
+
+O sea: **el huésped dibujaba bien; nosotros tapábamos.** Eso convierte «MENU no
+hace nada» en «MENU sí hace, y no se ve», que es otra avería y de otro sitio.
+La trampa nº 4 del método —contar accesos sin mirar qué valores llevan— tiene
+aquí su hermana: **mirar la pantalla sin mirar el búfer**.
+
+### 18.2 Dónde está la puerta, con dos pruebas independientes
+
+**1. El escritor, desensamblado.** `0x081271c8` recibe un índice en `r1` y un
+booleano en `r2`, salta por la tabla de `0x081271d8` y hace `bic` / `orrne`
+sobre la palabra que leyó de `+0x008`, guardándola en `0x08127250`:
+
+| índice | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| bit | `0x40` | `0x20` | `0x10` | `0x08` | `0x04` | `0x80` |
+
+**2. El orden de las escrituras, trazado con `DISPTRACE=1`.** Siempre igual: se
+programa el descriptor, se escribe la **dirección de origen**, y sólo entonces
+se enciende el bit:
+
+```
++0x060 = 0x089d42d4  (capa 0)  ...  +0x008: 0x41118101 -> 0x41118141   bit 6
++0x078 = 0x0be2326c  (capa 1)  ...  +0x008: 0x41118141 -> 0x41118161   bit 5
++0x090 = 0x0bfb4ff8  (capa 2)  ...  +0x008: 0x41118161 -> 0x41118171   bit 4
+```
+
+y al acabar la transición los apaga —`0x41118151`, luego `0x41118141`— **sin
+tocar ni la dirección de origen ni el tamaño**. Una pantalla en reposo se queda
+en `0x41118141`: **la capa 0 sola**, que es justo la que lleva el fotograma
+bueno.
+
+**VERIFICADO** por las dos vías y por el resultado: componer sólo la capa 0
+enseña el menú principal, que es lo que el huésped había dibujado.
+
+No confundir con los **bits 16, 20 y 24**, que también parecen uno por capa y
+que la versión anterior de `ipod_classic_disp.c` descartó **con razón**: ésos se
+ponen una vez en el init y no se mueven nunca. La puerta son los bits 4..6, que
+se mueven todo el rato. El comentario de entonces decía «y nada más la
+condiciona»; era esa frase la que estaba mal, no el descarte.
+
+### 18.3 El arreglo
+
+`hw/arm/ipod_classic/ipod_classic_disp.c`, en `disp_draw_layer()`:
+
+```c
+if (k < S5L8702_DISP_NLAYER_GATED &&
+    !(s->reg[S5L8702_DISP_CONTROL >> 2] & S5L8702_DISP_LAYER_EN_BIT(k))) {
+    return false;
+}
+```
+
+con `S5L8702_DISP_LAYER_EN_BIT(k) = 1u << (6 - k)`. Las capas 3 y 4 **no** se
+filtran: no sabemos qué bit las gobierna, ningún arranque ha escrito jamás sus
+descriptores, y por eso caen antes en la comprobación de `src == 0`. Está
+anotado en el código.
+
+### 18.4 Y entonces, ¿qué pasaba de verdad con MENU?
+
+Dos cosas distintas, y hay que separarlas.
+
+**En la pantalla de idiomas del primer arranque, MENU no debe hacer nada, y eso
+lo escribió Apple.** Herramienta nueva, `tools/ipod_classic/uirules.py`, que lee
+la tabla de reglas de la interfaz directamente del binario:
+
+```
+$ python3 tools/ipod_classic/uirules.py assets/classic6g/osos_decrypted.bin \
+      --grep button.menu.up --raw
+0073e628 SettingsMenus_ResetAllSettings_Language_Layout  button.menu.up1 ->
+         (no handler)  (no actions)
+```
+
+Manejador de longitud 0, cero acciones: una regla **vacía**. En toda la imagen
+hay **108 reglas** `button.menu.up`; **62 hacen algo y 46 no**. Medir MENU ahí
+no mide nada. **VERIFICADO** leyendo los bytes a mano en
+`0x0073e620..0x0073e71d` antes de escribir el analizador, y el formato entero
+está documentado en la cabecera de `uirules.py`.
+
+**En cualquier pantalla que sí tenga a dónde volver, MENU vuelve.** Medido en el
+§18.6.
+
+### 18.5 Con el panel derecho, lo mismo
+
+La regla que el §17.7 daba por incumplida,
+`list.pid.….delayedselected1 -> ShowSetting_Language`, **no es de esta
+pantalla**: es de `list.pid.229444534`, el elemento «Idioma» del **menú de
+Ajustes**. La lista del primer arranque es `list.pid.229444595`, que aparece
+**una sola vez en los 9,9 MB de la imagen** y **sólo** con `.chosen1`:
+
+```
+$ uirules.py osos_decrypted.bin --grep 229444595 --raw
+0073e6be SettingsMenus_ResetAllSettings_Language_Layout
+         list.pid.229444595.chosen1 -> HandleLanguageAfterReset
+         navigator.PopToMainScreen()
+```
+
+No hay **ninguna** regla que diga que el panel de «Welcome» siga al resaltado.
+**VERIFICADO**, búsqueda exhaustiva.
+
+Donde el firmware **sí** lo dice es en el **menú principal**: 48 reglas
+`list.pid.2294433NN.delayedselected`, 24 de ellas con
+`navigator.SwitchLayout(MainMenus_Main_Screen_XXX)` y el resto con manejadores
+`Handle…Hilited`. Y ahí, ahora, **lo sigue**: un clic de rueda mueve la barra
+unos 7 950 px en la lista **y** repinta unos 7 200 px del panel, que pasa de la
+nota musical de «ミュージック» a la tira de película de «ビデオ». Mirado, no
+sólo contado.
+
+Y de paso: `delayedselected` es la mitad **temporizada** de la interfaz, la que
+el §17.7 sospechaba muerta. Está viva, y ahora se ve.
+
+### 18.6 Lo que se ve ahora, medido y mirado
+
+`sh tools/ipod_classic/navtest.sh`, ampliado para llegar al menú principal y
+probar MENU allí:
+
+```
+00-idle               75463 px encendidos
+01-idle-again         75463 px encendidos        0 px distintos (0 en la lista, 0 en el panel)
+02-wheel-fwd          75432 px encendidos     8000 px distintos (8000 en la lista, 0 en el panel)
+03-wheel-fwd2         75463 px encendidos     8428 px distintos (8428 en la lista, 0 en el panel)
+04-wheel-back         75432 px encendidos     8000 px distintos (8000 en la lista, 0 en el panel)
+05-select             76074 px encendidos    19503 px distintos (12842 en la lista, 6661 en el panel)
+06-menu-idle          76074 px encendidos      875 px distintos (0 en la lista, 875 en el panel)
+07-menu-wheel         76046 px encendidos    15028 px distintos (7952 en la lista, 7076 en el panel)
+08-menu-wheel-back    76074 px encendidos    15151 px distintos (7975 en la lista, 7176 en el panel)
+09-into-music         75802 px encendidos     7045 px distintos (6088 en la lista,  957 en el panel)
+10-menu-back          75802 px encendidos      933 px distintos (0 en la lista, 933 en el panel)   <- MENU se perdio en ESTA carrera
+
+  suelo de la pantalla de idiomas: 0 px (limite 200)
+  suelo de la LISTA del menu principal: 0 px (limite 200)
+
+VEREDICTO
+  02-wheel-fwd           8000 px  -> el resaltado se movio
+  03-wheel-fwd2          8428 px  -> el resaltado se movio
+  04-wheel-back          8000 px  -> el resaltado volvio
+  05-select             19503 px  -> SELECT cambio la pantalla
+  07-menu-wheel        lista  7952 px + panel  7076 px  -> el resaltado se movio Y el panel lo siguio
+  08-menu-wheel-back   lista  7975 px + panel  7176 px  -> el resaltado se movio Y el panel lo siguio
+  09-into-music          7045 px  -> SELECT entro en Musica
+  11-menu-at-top       lista     0 px + panel   875 px  -> no navego, que es lo que toca
+```
+
+Y **mirado**, que es la otra mitad de la medida:
+
+- `05-select`: el **menú principal** en japonés —ミュージック, ビデオ, 写真,
+  Podcast, エクストラ, 設定, 曲をシャッフル— porque 日本語 era el idioma
+  resaltado. Es la misma prueba de «hizo lo que se le pidió» que ya daba
+  SELECT. En otra carrera, con **Čeština** resaltado, salió *Hudba, Videa,
+  Fotografie, Podcasty, Dodatky, Nastavení, Náhodná hudba* y el panel dijo
+  *Žádná*.
+- `07-menu-wheel`: la barra sobre **ビデオ** y el panel derecho con la **tira de
+  película**.
+- `09-into-music`: la pantalla de **Música** (Cover Flow, プレイリスト,
+  アーティスト, アルバム, コンピレーション, 曲, ジャンル, 作曲者,
+  オーディオブック).
+- `10-menu-back`: **el menú principal otra vez**, y el mismo fotograma que
+  `08-menu-wheel-back`.
+
+El veredicto fuerte no es el tamaño del cambio sino **a dónde va**:
+`10-menu-back` se compara contra `08-menu-wheel-back`, el fotograma del que se
+salió. «Cambiaron muchos píxeles» no demuestra que se vuelva; «volvió al
+fotograma del que salimos» sí.
+
+### 18.7 El suelo de ruido: dos cosas se mueven solas, y las dos deben
+
+`navtest.sh` suspendía la carrera si dos capturas seguidas de una pantalla
+quieta diferían en algo. Ya no vale tal cual, y las dos razones están medidas:
+
+1. **El icono de batería**: **23 px** en `x=145..151, y=4..13`, con el verde de
+   la carga entre los colores. Se repinta cuando le parece: una carrera de este
+   script midió 0 px ahí y la siguiente 23.
+2. **La etiqueta del panel del menú principal**: unos **960 px** en
+   `x=184..293, y=165..182`, o sea las **dos líneas de texto bajo el icono**.
+   La etiqueta japonesa 「ミュージックがありません」 no cabe en una línea y **se
+   desplaza sola**. La mitad izquierda de esos mismos fotogramas difiere en
+   **0 px**.
+
+Así que el suelo se comprueba contra un **límite de 200 px** en vez de contra
+cero, se **imprime siempre** el valor medido, y el menú principal se enrasa
+**sólo por su lista**. Mover el resaltado cuesta 8 000 px, cuarenta veces el
+límite, y el umbral más bajo de todo el veredicto pide 3 000: no hay solape.
+
+### 18.8 La otra mitad del problema: un botón que se enviaba UNA vez, y una pérdida que sigue abierta
+
+Con la pantalla ya visible salió a la luz algo que antes no se podía ni medir:
+**SELECT y MENU se pierden a veces**. Prueba dedicada —entrar en Música y salir,
+cinco veces, una pulsación cada 13 s, `~/6g/inout`—:
+
+```
+carrera 1 (modelo de entonces)   in1 6343 | out1    0 | in2    0 | out2 6343
+                                 in3    0 | out3    0 | in4 6343 | out4 6343
+                                 in5    0 | out5    0
+WHEELTRACE totals: 23 packets queued, 0 dropped, 1 commands, 22 rising edges
+```
+
+**23 paquetes es exactamente lo esperado** —1 del sondeo de arranque + 11
+pulsaciones × 2 flancos— y **0 descartados**. El modelo entregó todo y el
+huésped hizo caso a cuatro de ocho pulsaciones con destino. Nada en el modelo
+distingue las que funcionaron de las que no.
+
+**Lo que sí se encontró y se ha arreglado** es la *constraint 2* del §17.3
+aplicada a los botones, que era la mitad que se había quedado exenta:
+
+> El ISR sobrescribe el mismo bloque de estado en cada paquete. Una pulsación
+> eran **exactamente dos paquetes**, uno con el bit puesto y otro con el bit
+> quitado. Y el retailOS actúa **al soltar** —sus reglas se llaman
+> `button.menu.up` y `button.select.up`—, así que necesita que la tarea de
+> rueda corra y vea el bit **puesto**, y vuelva a correr y lo vea **quitado**.
+> Si la tarea no corre en ese hueco, la pulsación entera desaparece sin dejar
+> rastro.
+
+El aparato de verdad no tiene ese problema porque **transmite**: mientras algo
+pasa informa a su ritmo, y el estado de los botones va en **todos** los
+paquetes. Ahora el modelo también (`S5L8702_WHEEL_BTN_REPEAT_MS`, 400 ms, diez
+ticks; ajustable con `IPOD_WHEEL_BTN_REPEAT_MS`): repite el estado un paquete
+por tick mientras hay un botón pulsado y durante la ventana posterior a cada
+flanco, para que el de subida reciba el mismo trato que el de bajada.
+
+Dos carreras más, ya con la repetición:
+
+```
+carrera 2   in1 0 | out1 0 | in2 0 | out2 0 | in3 0 | out3 0
+            in4 6343 | out4 6343 | in5 6343 | out5 6343      (134 paquetes, 0 descartados)
+carrera 3   in1 6343 | out1 6665 | in2 0 | out2 322 | in3 6343 | out3 6343
+            in4 6343 | out4 6343 | in5 0 | out5 0            (134 paquetes, 0 descartados)
+```
+
+Contando **sólo las pulsaciones que tenían a dónde ir**:
+
+| | SELECT desde el menú principal | MENU desde la pantalla de Música |
+|---|---|---|
+| sin repetición (carrera 1) | 1 de 3 | 2 de 3 |
+| con repetición (carreras 2 y 3) | 5 de 10 | **5 de 5** |
+
+**Lo honesto es decir las dos cosas.** La repetición **elimina un modo de fallo
+que el modelo tenía demostradamente** —dos paquetes por pulsación contra un ISR
+que sobrescribe su bloque de estado— y **MENU no ha fallado ni una vez** desde
+que está. Pero **no arregla la pérdida de SELECT**, que sigue ahí, y por tanto
+**la pérdida tiene otra causa que no está encontrada**. No se vende como
+arreglada.
+
+**El sospechoso número uno para lo que queda**, y es donde miraría el siguiente:
+la puerta del §17.4. El despachador de teclas lee por I2C el registro `0x87` del
+PMU **en cada tecla** y **se vuelve sin hacer nada** si el bit sale distinto de
+cero (`0x0803f3e0` → `0x08294f80`, y el `popne` de `0x0803f3e4`). Una lectura
+que devuelva otra cosa —el modelo del PMU tiene un puntero de registro que
+autoincrementa y se comparte entre transacciones, `ipod_classic_pmu.c:131`— tira
+la tecla en silencio y con exactamente esta pinta. El experimento: punto de
+ruptura en `0x0803f3e4` con `evtrace.py`, leer `r0` en cada pulsación y ver si
+las perdidas son las que traen `r0 != 0`. **No está hecho.**
+
+Consecuencia práctica inmediata: `navtest.sh` puede suspender por esto sin que
+nada se haya roto. Si suspende **sólo** en `09-into-music`, repítelo antes de
+buscar culpables.
+
+### 18.9 Una trampa de método que costó dos carreras: los QEMU huérfanos
+
+Dos carreras seguidas de `navtest.sh` fallaron con la pantalla en negro y
+**116 y 68** líneas de `guest asked for a software reset (SWRCON = 0xaa5),
+next image "diskmode"` en `stderr`. No era el parche. Era esto:
+
+```
+$ ps aux | grep qemu
+... 24 procesos qemu-evt de una sesion anterior, al 80 % de CPU cada uno
+$ uptime
+load average: 16.00     # en 12 nucleos
+```
+
+`navtest.sh` hace `pkill -9 -x qemu-system-arm`, que por diseño **no** toca un
+binario llamado de otra forma —la copia privada `~/evt/qemu-evt` que usa
+`evtrace.py` existe justamente para que una sesión no mate a otra—. El precio
+es el simétrico: **los huérfanos no se limpian solos**. Con la máquina así de
+cargada el huésped no llega a tiempo a sus propios plazos de arranque y se
+reinicia a *diskmode* en bucle.
+
+Antes de creerse un fallo intermitente: `ps aux | grep qemu` y `uptime`.
+
+**Pero no todo es carga, y esto es nuevo.** Con la máquina vacía —carga 0,4, un
+solo QEMU, 7 GB de memoria libre— dos carreras seguidas se reiniciaron **1 y 3
+veces**, y el reinicio cae **entre los 48 y los 52 s**, o sea **antes de la
+primera tecla**. La huella en las capturas es exactamente la que la
+investigación de eventos describió sin nombre: donde debería estar la lista de
+idiomas aparece la pantalla **Low Battery** (76 797 px) y poco después **negro**
+(0 px). Ahora tiene nombre, porque `stderr` lo dice:
+
+```
+qemu-system-arm: warning: S5L8702: guest asked for a software reset
+                 (SWRCON = 0xaa5), next image "diskmode"
+```
+
+O sea: **la pantalla «Low Battery» de los 46 s y el reinicio a modo disco son
+el mismo suceso**. Sigue sin explicación —el ADC del PMU devuelve 844 de 1023,
+que no es poca batería (`ipod_classic_pmu.c:47`), así que el disparador es otra
+cosa—, pero ya no es un misterio sin bordes: es un camino concreto del huésped
+que decide reiniciarse a `diskmode`, y por dónde empezar es por qué registro del
+PMU lee antes de decidirlo.
+
+Por eso `navtest.sh` cuenta ahora esos reinicios y **avisa a gritos** cuando hay
+alguno: una carrera que se reinicia tiene todos los tiempos corridos y su
+veredicto no vale para nada. Repítela.
+
+### 18.10 Regresiones comprobadas
+
+| Prueba | Resultado |
+|---|---|
+| `navtest.sh`, la mitad de siempre: los tres giros en la pantalla de idiomas | **8 000, 8 428 y 8 000 px**, y el suelo en **0 px**. Las mismas cifras del §17.8 (los 428 de más son el icono de batería del §18.7). Sin regresión |
+| `navtest.sh`, la mitad nueva | el menú principal aparece, sus dos mitades se mueven juntas, SELECT entra en Música y MENU vuelve al mismo fotograma. Ver §18.6 |
+| **`tools/ipod_video/navtest.sh` (el 5G)** | **76 548 px en los siete fotogramas y el resaltado se mueve: 12 312, 12 114 y 31 598.** Los dos primeros, clavados a los del §17.8; el tercero cae en el «~31 600» que esa misma tabla ya registraba como no reproducible al píxel porque esa pantalla tiene reloj. **Sin regresión** |
+| retailOS **sin disco** | **0 px**, `CPU_exception_handler` y el reinicio por software de siempre: el ciclo de caída del §4, igual que antes. El compositor no compone porque nadie le da dirección de origen, y ahora tampoco porque nadie enciende una capa |
+| `tools/ipod_classic/lcdtest.S` | no programa ninguna capa, así que la puerta no decide nada para él: sigue pintando por el puerto de datos del panel |
+| Migración | `vmstate_ipod_classic_wheel` pasa a versión 2 al añadir `button_repeat_until`. Nada migra esta máquina hoy, así que el formato viejo no se mantiene vivo |
+
+### 18.11 Lo que sigue sin saberse
+
+- **El byte bajo de `LAYERn_CFG`** (`+0x0d8`, `+0x0e0`, `+0x0e8`) vale `0xff` en
+  las capas 0 y 1 y **`0x00`** en la capa 2, en las 106 escrituras de una
+  carrera. Parece una **alfa constante**, y si lo es, la capa 2 es invisible
+  incluso mientras su bit de habilitación está puesto. **No se modela**: el bit
+  ya explica el síntoma entero, y esto sólo afectaría a los fotogramas **de
+  mitad de transición**. **INFERIDO**, sin resolver. Si algún día una
+  transición se ve tapada un instante, es esto.
+- **Los campos de 4 bits de `LAYERn_CFG` en `[31:28]` y `[15:12]`**, que
+  `0x081278fc` escribe en parejas `(1,0)`, `(0,1)`, `(5,4)`, `(9,8)`, `(11,10)`:
+  parecen modos de mezcla. **DESCONOCIDOS**, y no hacen falta.
+- **Los índices 3, 4 y 5 del escritor de `CONTROL`** (bits `0x08`, `0x04`,
+  `0x80`): sólo se ve usado el 5, dos veces en una carrera entera.
+  **DESCONOCIDOS**.
+- **Las capas 3 y 4**: nadie las programa y no se les conoce bit.
+- **El byte de sufijo de cada disparador** en la tabla de reglas: es ASCII y
+  vale `'1'` en las 1 380 reglas de la imagen. **DESCONOCIDO** para qué es.
+- **La pantalla «Low Battery» intermitente** de los 46 s sigue sin explicación
+  propia; ver la sospecha del §18.9.

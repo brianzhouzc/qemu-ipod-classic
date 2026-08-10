@@ -289,12 +289,22 @@ static void wheel_tick(void *opaque)
         s->touched = false;
         s->armed = false;
         wheel_send_event(s);
-    } else if (s->buttons != s->sent_buttons) {
+    } else if (s->buttons != s->sent_buttons
+               || now < s->button_repeat_until) {
+        /*
+         * The button state is REPEATED for a while, not sent once. A real
+         * wheel streams, so the current state of every button is in every
+         * packet it sends; ours used to emit exactly one packet per edge, and
+         * a guest task that did not happen to run between the down packet and
+         * the up packet lost the whole press. See S5L8702_WHEEL_BTN_REPEAT_MS
+         * in the header for the measurement, and for what it did NOT fix.
+         */
         wheel_send_event(s);
     }
 
     busy = s->touched || s->pending_steps != 0
-           || s->buttons != s->sent_buttons;
+           || s->buttons != s->sent_buttons
+           || now < s->button_repeat_until;
     if (busy) {
         wheel_kick(s);
     }
@@ -364,6 +374,12 @@ static void wheel_key_event(void *opaque, int keycode)
     } else {
         s->buttons |= bit;
     }
+    /*
+     * Both edges start the repeat window, because the retailOS acts on the
+     * UP one and needs to see it as clearly as the DOWN one.
+     */
+    s->button_repeat_until = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                           + s->button_repeat_ns;
     wheel_kick(s);
 }
 
@@ -496,6 +512,7 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->armed = false;
     s->pending_steps = 0;
     s->untouch_at = 0;
+    s->button_repeat_until = 0;
     s->sent_buttons = 0;
     s->irq_level = false;
     timer_del(s->tick);
@@ -548,6 +565,9 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     s->untouch_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_UNTOUCH_MS",
                                               S5L8702_WHEEL_UNTOUCH_MS,
                                               10, 60000);
+    s->button_repeat_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_BTN_REPEAT_MS",
+                                                    S5L8702_WHEEL_BTN_REPEAT_MS,
+                                                    0, 5000);
 
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, wheel_tick, s);
     qemu_add_kbd_event_handler(wheel_key_event, s);
@@ -572,8 +592,12 @@ static int wheel_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ipod_classic_wheel = {
     .name = TYPE_IPOD_CLASSIC_WHEEL,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    /*
+     * Bumped to 2 when button_repeat_until joined the field list. Nothing
+     * migrates this machine today, so the old format is not kept alive.
+     */
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = wheel_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(con, IPodClassicWheelState),
@@ -593,6 +617,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_BOOL(armed, IPodClassicWheelState),
         VMSTATE_INT32(pending_steps, IPodClassicWheelState),
         VMSTATE_INT64(untouch_at, IPodClassicWheelState),
+        VMSTATE_INT64(button_repeat_until, IPodClassicWheelState),
         VMSTATE_TIMER_PTR(tick, IPodClassicWheelState),
         VMSTATE_END_OF_LIST()
     },

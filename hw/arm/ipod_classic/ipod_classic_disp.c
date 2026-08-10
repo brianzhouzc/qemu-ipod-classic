@@ -263,6 +263,25 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
     if (src == 0 || w <= 0 || h <= 0) {
         return false;
     }
+    /*
+     * THE GATE. A layer is only on the panel while its enable bit is set in
+     * CONTROL; the guest clears the bit at the end of a transition and leaves
+     * the descriptor -- source address, size, position -- exactly as it was.
+     * Drawing on the source address alone therefore keeps a dead surface on
+     * screen for ever, and that is what hid the whole main menu behind the
+     * leftover right-hand pane of the screen before it.
+     *
+     * See S5L8702_DISP_LAYER_EN_BIT in the header for the disassembly of the
+     * setter and for the traced write order that pins each bit to its layer.
+     *
+     * Layers 3 and 4 are not gated because we do not know which bit, if any,
+     * gates them: no boot has ever written their descriptors, so they are
+     * skipped above on src == 0 and this line never decides anything for them.
+     */
+    if (k < S5L8702_DISP_NLAYER_GATED &&
+        !(s->reg[S5L8702_DISP_CONTROL >> 2] & S5L8702_DISP_LAYER_EN_BIT(k))) {
+        return false;
+    }
     if (bpp != 2 && bpp != 4) {
         /*
          * 4- and 8-bit formats need a palette we have never seen written, so
@@ -341,11 +360,14 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
      * one. With the Z order the other way round slot 0 would cover slot 1 from
      * the first frame and there would be no transition at all.
      *
-     * A layer is drawn when it has a source address and a positive size, and
-     * nothing else gates it. The control register at +0x008 does carry three
-     * fields that look like per-layer enables (bits 16, 20 and 24) but they are
-     * all set once during init and never touched again, so using them as the
-     * gate would be reading meaning into a constant.
+     * A layer is drawn when it has a source address, a positive size AND its
+     * enable bit set in CONTROL (+0x008): bit 6 for layer 0, bit 5 for layer 1,
+     * bit 4 for layer 2. An earlier version of this comment said "nothing else
+     * gates it" and named bits 16, 20 and 24 as the only candidates, dismissing
+     * them because they are set once during init and never touched again. That
+     * was right about 16/20/24 and wrong about the conclusion: the gate is
+     * bits 4..6, they move all the time, and ignoring them left every finished
+     * transition's surface on the panel for ever. See the header.
      */
     for (int k = 0; k < S5L8702_DISP_NSLOTS; k++) {
         drew |= disp_draw_layer(s, k, fb, width, height);

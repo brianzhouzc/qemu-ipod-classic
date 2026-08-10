@@ -243,6 +243,44 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_UNTOUCH_MS    1500
 
 /*
+ * BUTTONS ARE REPEATED, and this is the same constraint 2 as above, applied to
+ * the half of the wheel that used to be exempt from it.
+ *
+ * A press used to be exactly two packets: one with the bit set, one with it
+ * clear. The retailOS acts on the RELEASE -- its rules are called
+ * "button.menu.up" and "button.select.up" -- so it needs the wheel task to run
+ * and see the bit SET, and then run again and see it CLEAR. Miss either and
+ * the whole press is gone. And the ISR overwrites the same state block on
+ * every packet, so a task that does not run between the two never sees the
+ * press at all.
+ *
+ * MEASURED, five SELECT/MENU round trips into the Music screen and back, one
+ * press every 13 s, with the model reporting every packet queued and none
+ * dropped. Counting only presses that had somewhere to go:
+ *
+ *              SELECT from the main menu     MENU out of Music
+ *   one shot         1 of 3                       2 of 3
+ *   repeated         5 of 10                      5 of 5
+ *
+ * The real wheel does not have this problem because it streams: while anything
+ * is happening it reports at its own rate and the current button state is in
+ * every packet. So does this now -- the state is repeated one packet per tick
+ * while a button is held, and for a while after the release so that the UP
+ * edge gets the same treatment. Tunable with IPOD_WHEEL_BTN_REPEAT_MS; 400 ms
+ * is ten ticks, and a monitor "sendkey ret 150" therefore lands about four
+ * DOWN packets and ten UP ones.
+ *
+ * AND IT IS NOT THE WHOLE STORY, which is why the table above is printed with
+ * its bad column: SELECT is still lost about half the time and this did not
+ * change that, so the loss has a second cause that has NOT been found. The
+ * suspect and the experiment are written down in wiki/11 s.18.8; the short
+ * version is that the key dispatcher reads the PMU hold switch over I2C on
+ * every single key and returns without doing anything if the answer is not
+ * zero. Do not read this repeat as "input is fixed".
+ */
+#define S5L8702_WHEEL_BTN_REPEAT_MS 400
+
+/*
  * Deep enough that a burst of keystrokes cannot overrun it, shallow enough
  * that if the guest is NOT draining we find out quickly through the dropped
  * counter rather than by guessing.
@@ -280,6 +318,12 @@ struct IPodClassicWheelState {
     bool armed;
     int32_t pending_steps;  /* positions still owed to the guest, signed */
     int64_t untouch_at;     /* virtual ns at which the finger comes off */
+    /*
+     * Virtual ns until which the button state keeps being REPEATED, one packet
+     * per tick, instead of being sent once and forgotten. See
+     * S5L8702_WHEEL_BTN_REPEAT_MS: without it a whole press can vanish.
+     */
+    int64_t button_repeat_until;
 
     /* What the last packet we sent said, so we do not repeat ourselves. */
     uint32_t sent_buttons;
@@ -288,6 +332,7 @@ struct IPodClassicWheelState {
     uint32_t key_step;
     int64_t tick_ns;
     int64_t untouch_ns;
+    int64_t button_repeat_ns;
     bool irq_level;
 
     /*
