@@ -16,7 +16,16 @@ saberlo). Las trazas son reproducibles con las órdenes del final.
 | 1. Se carga y ejecuta la primera instrucción | **hecho** |
 | 2. Pasa la inicialización temprana sin colgarse | **hecho** |
 | 3. Inicializa periféricos y llega a su bucle principal | **hecho** — kernel RTXC arrancado, planificador vivo, tarea idle en `0x22003b1c` |
-| 4. Dibuja algo en pantalla | **no** — ver §6 |
+| 4. Dibuja algo en pantalla | **no** — pero ahora se sabe exactamente qué falta: §9 |
+
+> **Agosto de 2026.** La máquina ya tiene panel: `ipod_classic_lcd.c` modela una
+> memoria de imagen de 320×240 RGB565 con ventana y las órdenes `0x2A/0x2B/0x2C`,
+> y la expone por `qemu_console`, así que un `screendump` mide de verdad si hay
+> dibujo. Validado con un caso de control (`tools/ipod_classic/lcdtest.S`):
+> 76 800 de 76 800 píxeles encendidos y 1920 colores distintos, exactamente la
+> rampa que escribe el test. Con el retailOS, **con disco y sin él, el
+> `screendump` sigue dando 0 píxeles encendidos**. La pantalla negra ya no es
+> "no lo sabemos": es una medida.
 
 Con `-drive if=ide` el arranque es limpio: cero excepciones, cero reinicios.
 Sin disco entra en un ciclo de caída y reinicio (§4).
@@ -160,22 +169,72 @@ nunca. Es el muro que se comió 48 millones de lecturas en una traza de 45 s.
 de LCD, antes de tocar nada que Rockbox nombre. Los dos son `INDETERMINADO`,
 pero la ventana tiene que cubrirlos o se caen al suelo de E/S de la máquina.
 
-### Por dónde pasan los píxeles: `INDETERMINADO`
+### Por dónde pasan los píxeles: **cero llegan**, y ahora está contado
 
-Lo medido es esto y sólo esto: en un arranque entero llega **una** palabra de
-píxel a `LCD_WDATA` por escritura de CPU. Lo que la primera versión de esta
-página concluía de ahí — «el framebuffer va por DMA» — **no se sigue**, y la
-auditoría lo rebaja a `INDETERMINADO`.
+Corrección a las dos versiones anteriores de esta sección. Con el panel
+modelado y `LCDTRACE=1` contando cada acceso, un arranque sin disco de 25 s da:
 
-La explicación alternativa es al menos igual de buena: el retailOS emite
-`0x2A`/`0x2B`/`0x2C` (fijar ventana y «escribir en memoria») y **se cae en la
-instrucción siguiente**, en el código de dibujo de `0x0815b1b8` (§4). Es decir,
-puede que no haya píxeles por MMIO porque nunca llega a empujarlos, no porque
-vayan por otra ruta. Para decidirlo hay que llegar antes a un dibujado que no
-aborte.
+```
+LCDTRACE totals: 63 writes to the command port +0x04, 168 to the data port
+                 +0x40..0x5C, of which 0 were pixels; 21 frame-engine starts
+```
 
-(El modelo sólo anuncia la **primera** escritura de píxel, no las cuenta; para
-repetir la medida hay que instrumentar `ipod_classic_lcd.c` a mano.)
+Las 168 escrituras al puerto de datos son **21 arranques × 8 parámetros**: los
+cuatro bytes de `0x2A` (`00 00 01 3f`) y los cuatro de `0x2B` (`00 00 00 ef`).
+**Ni una sola palabra de píxel.** La frase «llega una palabra de píxel por
+escritura de CPU» era ese byte `0x3f`, y la conclusión «luego el framebuffer va
+por DMA» no se sostiene por otro camino: en un arranque sin disco entero,
+**ningún canal de DMAC0 apunta jamás a `LCD_WDATA`** (`-d unimp`: el único
+destino programado es `0x3CA00010`, el FIFO de I²S, y el LLI que se escribe es
+`0x22010020`, también de audio).
+
+Lo que sí hace el retailOS es arrancar un **motor de trama** dentro del propio
+bloque de LCD, cuyos registros no conoce ninguna fuente externa:
+
+| Registro | Qué se le escribe | Sitio |
+|---|---|---|
+| `+0x70` | `1` — arrancar | `0x08127f94` |
+| `+0x74` | `(320 << 16) \| 240` | `0x08127f8c` |
+| `+0x78` | `0x0005000a` `INDETERMINADO` | `0x08127f3c` |
+| `+0x7C` | `0x00000804` `INDETERMINADO` | `0x080afb1c` |
+| `+0x80` | `1` … `0` alrededor de fijar la ventana | `0x0808b000`/`0x0808b030` |
+| `+0x88` | `0x01000000` `INDETERMINADO` | `0x080afb0c` |
+| `+0x8C` | `while (LCD[0x8c] & 3);` — bits [1:0] = transferencia en curso, y es un giro **sin timeout** por partida doble | `0x080a4090`, `0x080b0128` |
+
+**De dónde lee ese motor es `INDETERMINADO`**: no hay ningún registro de
+dirección de origen en los 256 bytes de la ventana, y no hay DMA apuntándole.
+El modelo lo acepta, lo cuenta y declara `+0x8C` libre, que es lo que ya hacía
+la ventana sin implementar; la diferencia es que ahora lo dice en voz alta.
+
+### El panel, que sí está modelado
+
+`ipod_classic_lcd.c` lleva una memoria de 320×240 en RGB565, ventana con
+`0x2A`/`0x2B`, puntero de escritura tras `0x2C`, y un `qemu_console`. Todos los
+números vienen de una medida, ninguno de un datasheet:
+
+- **Juego de órdenes de 8 bits**: el huésped escribe `LCD_CON = 0x80000c21`, y
+  `0x080b6f8c` sólo produce ese valor por la rama `lcd_get_type() ∈ {0,1}`, que
+  es `LCD_CMDSET_8BIT` de Rockbox (`lcd-6g.c:201-214`).
+- **320×240**: los tres registros de driver de panel entre los que elige el
+  firmware (`0x08911f90`, `0x08911fb8`, `0x08911fe0`) empiezan los tres por
+  `0x00f00140` = `(240<<16)|320`; la ventana que fija es `0..0x13f` × `0..0xef`;
+  y `+0x74` recibe `(320<<16)|240`.
+- **RGB565**: el modo de trama es `LCD_MODE_P16`.
+
+Validación con caso de control, porque un panel que no se prueba no es una
+medida: `tools/ipod_classic/lcdtest.S` emite exactamente esa secuencia y empuja
+76 800 palabras. `screendump` + `tools/ipod_classic/pixcount.py` devuelven
+**76 800 píxeles encendidos y 1920 colores distintos**, que es al píxel lo que
+el test escribe. Si la aritmética de ventana o el formato estuvieran mal, ese
+número saldría mal de forma evidente.
+
+```bash
+arm-none-eabi-as -o /tmp/l.o tools/ipod_classic/lcdtest.S
+arm-none-eabi-objcopy -O binary /tmp/l.o /tmp/l.bin
+qemu-system-arm -M iPod-Classic -kernel /tmp/l.bin -display none -monitor stdio
+(qemu) screendump /tmp/shot.ppm
+python3 tools/ipod_classic/pixcount.py /tmp/shot.ppm
+```
 
 Cuando el retailOS dibuja (ver §4, ocurre en el camino de error) emite
 `0x2A`, `0x2B`, `0x2C` — *column address set*, *page address set*, *memory
@@ -230,14 +289,54 @@ nula **no falla** — lee tranquilamente una palabra de la tabla de vectores —
 sólo revienta la segunda. Un puntero nulo en esta máquina no da un fallo
 limpio: da un valor plausible y una caída doscientos bytes más tarde.
 
-El nulo viene de `0x08236130`, que recorre una lista enlazada de proveedores de
-recursos llamando a un método virtual de cada uno y devuelve cero si ninguno
-tiene la etiqueta pedida. Las etiquetas son 4CC clásicas: `"FONT"`
-(`0x464F4E54`) y `"Str "` (`0x53747220`), y justo encima de la función que cae
-hay un `"COLR"`. `0x08239658` devuelve explícitamente `{0,0}` cuando su
-manejador de entrada es nulo, y su llamador no lo comprueba.
+**Corrección de agosto de 2026, y es una corrección de fondo: el nulo NO viene
+de la búsqueda de recursos.** Medido con `gdbpoke.py` (§10), parando en cada
+instrucción de esa función:
 
-**Con un disco enganchado, el ciclo entero desaparece.**
+| Parada | Qué se lee |
+|---|---|
+| `0x0815b1e0` | `r0 = 0x086aef48` — la búsqueda de `"FONT"` **encuentra** el recurso |
+| `0x0815b1f4` | `r0 = 0x0874a444` — la de `"Str "` **también** |
+| `0x0815b20c` | `r5 = 0x0be6770c` — no nulo, no salta a la salida |
+| `0x0815b230` | `[sp] = {0, 0}` — **aquí** aparece el nulo |
+| `0x0815b23c` | `r1 = 0xea000002`, la palabra de VA 0; la siguiente carga aborta |
+
+Y el registro `FONT` que devuelve, leído del huésped, es
+`0dad0001 0000003a 01d58101 0dad0002`: id del nombre, cuerpo 58, estilo.
+
+O sea que la cadena de proveedores funciona y el recurso existe. Lo que falla es
+la construcción del objeto de texto, y la razón es concreta:
+
+```
+0x0815b22c  bl 0x08239658   "hazme una cadena con esta fuente"
+0x08239658  -> 0x08238fa0 -> 0x082393ec
+0x082393ec  busca la fuente por nombre, cuerpo y estilo en DOS listas:
+              [0x08912cd8 + 8]  fuentes ya instanciadas
+              [0x08912cd8 + 4]  ficheros de fuente disponibles
+            si ninguna casa, devuelve {0,0}
+las dos listas las llena una sola función, 0x08239220, y hace esto:
+  0x080518a4(1, &vol, &path)   ->  vol = 4, path = "Resources/Fonts"  (0x08380628)
+  0x08239134(vol, path)        ->  recorre ESE DIRECTORIO y registra cada fichero
+```
+
+`0x08239134` es un iterador de directorio de verdad — salta las entradas que
+empiezan por `.` (compara con 46) y llama a `0x08107184` por cada nombre.
+
+**Conclusión, VERIFICADA de punta a punta: el retailOS no lleva ninguna fuente
+dentro de la imagen. Todas viven en `\Resources\Fonts\` de la partición `rsrc`
+del disco** (`Helvetica.ttf`, `HelveticaBold.ttf`, `CJK11.ttf`, `CJK16.ttf`,
+cuatro `MonoHope-*.sbit`). Sin volumen montado la lista está vacía, no casa
+ninguna fuente, y el llamador llama a un método virtual sobre el `{0,0}`.
+
+Lo confirma un experimento no destructivo: con `gdbpoke.py --skip
+0x0815b230=0x0815b270:0` se salta esa llamada sin tocar la imagen de Apple, y el
+arranque **vuelve a caer en el mismo ciclo**, ahora con `DFAR 0xEA00003E` en vez
+de `0xEA00002A` — otro método virtual, ranura `+0x3C`, sobre otro nulo del mismo
+origen. No es un fallo que se pueda esquivar: sin fuentes, todo el grafo de
+objetos de la interfaz sale nulo.
+
+**Con un disco enganchado, el ciclo entero desaparece** — pero por la razón mala:
+la interfaz ni siquiera llega a intentarlo (§9).
 
 ---
 
@@ -366,6 +465,110 @@ Candidatos por descartar, en orden de coste:
 
 ---
 
+## 9. Con disco: dónde se para la interfaz, instrucción a instrucción
+
+Esto es nuevo, y responde a «qué está esperando la tarea bloqueada» del §6, que
+llevaba abierto desde el principio. Todo medido con `gdbpoke.py` y un disco de
+64 MB a ceros; con `A.img` (MBR válido, partición de firmware real y FAT32 con
+`iPod_Control`) sale exactamente igual.
+
+La cadena, de fuera adentro. Cada eslabón es una parada real del depurador:
+
+```
+0x0811c008   crea la tarea RTXC "MP3ExampleTask"
+0x0811bf68     cuerpo de la tarea de interfaz          <- llega
+0x0811bfb8       blx [obj+0x204] -> 0x081a3134         <- entra y NO vuelve
+0x081a3134         blx [obj+0x208] -> 0x081a3360       <- entra y NO vuelve
+0x081a3360           bucle sobre 9 fábricas de subsistema; se para en la nº 8
+0x0824caa8             new(0x124) + constructor 0x0824cc8c
+0x0824cc8c               bl 0x08035bf8                 <- lector de SysInfo
+0x08035bf8                 bl 0x080ca440
+0x080ca440                   bl 0x0815f818
+0x0815f818                     bl 0x0815f7c0
+0x0815f7c0                       bl 0x0812289c
+0x0812289c   81228b4: bl 0x0805c430      ; toma el mutex de [obj+0x2c]
+             81228c4: ldrb r0,[r4,#0x28] ; <- LA BANDERA
+             81228c8: cmp  r0,#0
+             81228cc: beq  0x81228bc     ; 81228bc: bl 0x080c8968  = esperar
+```
+
+**`while (![obj+0x28]) wait();`** — la interfaz espera a que haya un volumen
+montado. Con disco, `0x081228d0` (la salida del bucle) no se alcanza jamás; sin
+disco sí. La CPU se va al bucle idle porque la tarea está bloqueada en un objeto
+del kernel, no girando: por eso 27 000 IRQ y ninguna otra excepción.
+
+Quién levanta la bandera: **sólo** `0x08122a04`, con dos llamadores,
+`0x08059ae4` y `0x081229f0`, los dos dentro de `0x08059aa0` = «montar el
+volumen». Y `0x08059aa0` tiene **un solo** llamador, `0x083287e0`, que es el
+cuerpo de la tarea que consume la cola 4:
+
+```
+0x0832878c   for(;;) { msg = KS_receive(4); switch (msg[0x10]) {
+                 case 0: 0x08059aa0(dev, 0);   // montar
+                 case 1: 0x08126638(dev);      // sin medio
+                 case 2: 0x081263dc(dev); ... } }
+```
+
+Sin disco, esa tarea recibe mensajes y monta (falla el sondeo, pero **levanta la
+bandera igual** y la interfaz sigue). Con disco **no recibe ninguno**:
+`0x083287b4` no se alcanza en 90 s.
+
+El único emisor de mensajes de tipo 0 en los 9,4 MB de imagen es `0x0813b160`
+(mensaje estático en `0x0813b21c`, `[msg+0x10] = 0`), al que se llega por
+`0x0813b220`, que es un manejador de la tarea **`"ATAWorkLoopTask"`** (la cadena
+está en `0x0813b2bc`, y `0x0813b234` es quien crea la tarea). Sin disco se
+ejecuta; con disco no.
+
+### Lo que se arregló por el camino: GPIO pin 86
+
+Hay un segundo camino hacia la misma bandera y estaba roto por un bit.
+`0x08328720` es un bucle de sondeo que decide entre «montar» y «sin medio»:
+
+```asm
+bl 0x08294d7c ; cmp r0,#0 ; bne sin_medio     (PMU 0x4b bit 2)   medido: 0
+bl 0x08295508 ; cmp r0,#0 ; bne sin_medio     (PMU 0x12/0x4b)    medido: 0
+bl 0x080a1474 ; cmp r0,#0 ; bne sin_medio     ([0x089120a1]!=100) medido: 0
+bl 0x080aeca4 ; cmp r0,#0 ; movne r1,#0       gpio_get_pin(86)   medido: 0  <-
+mov r0,#4 ; bl 0x080b2ce8                     ; anunciar {r1}
+```
+
+`0x080aeca4` es literalmente `gpio_get_pin(86)`, y `0x3CF00000` era
+`create_unimplemented_device`, o sea cero: el firmware concluía «no hay medio»
+aunque hubiera disco. Ahora hay un modelo de GPIO
+(`hw/arm/ipod_classic/ipod_classic_gpio.c`) y el pin 86 sigue a si hay `-drive`;
+medido después del cambio, `0x080aeca4` devuelve 1 y el mensaje pasa a ser de
+tipo 0. **Necesario y no suficiente**: `0x080b2ce8` despacha por
+`[[0x08911ad8]+0x10]`, y ese puntero sigue valiendo 0 a los 35 s, así que el
+anuncio se tira. Lo que el pin 86 arregla es real y estaba mal; lo que queda es
+otra cosa.
+
+Qué es el pin 86 en la placa: `INDETERMINADO`. Qué hace en el firmware de Apple:
+verificado arriba.
+
+### El obstáculo concreto que queda
+
+> **Con disco, la tarea `ATAWorkLoopTask` nunca encola el trabajo que hace que
+> `0x0813b160` anuncie «monta el volumen».** Sin disco sí. Todo lo demás
+> —proveedores de recursos, contenedor empotrado, panel, ventana— está
+> comprobado y funcionando.
+
+Lo que se sabe del ATA en ese momento (`ATATRACE=1`, disco a ceros, `A.img` y
+`E.img`: **las tres trazas son idénticas, 682 líneas**):
+
+- La orden `0xEC` (IDENTIFY) se completa.
+- Dos lecturas por DMA, las dos en LBA 0: `0x1000` bytes a `0x0be5d3e0` y
+  `0x8000` bytes a `0x0be55320`.
+- Después el driver cierra limpiamente (`+0x18 = 0x640`, lee `+0x70`/`+0x7c`) y
+  **no vuelve a hablar**. No está girando sobre ningún registro.
+- Sin disco la traza acaba en `WR +0x70 = 0xec` sin respuesta: el IDENTIFY falla,
+  y **ese fallo es lo que dispara el anuncio**.
+
+Es decir: el camino de error del ATA anuncia y el de éxito no. La pieza que
+falta está entre «el IDENTIFY salió bien» y «encola el trabajo de llegada de
+medio», y es lo primero que hay que mirar mañana.
+
+---
+
 ## 7. Cómo reproducirlo
 
 ```bash
@@ -438,4 +641,59 @@ grep -c '^0x0805712c' /tmp/asm.log     # 0 = ningún bloque empezó ahí
   hecho; "luego el framebuffer va por DMA" era una inferencia con al menos otra
   explicación igual de buena (que el firmware se cae antes de empujar píxeles),
   y se coló como si fuese medida. Cuando una cuenta sale casi cero, la primera
-  hipótesis a descartar es "no llegó a intentarlo".
+  hipótesis a descartar es "no llegó a intentarlo". (Resuelto: eran cero
+  píxeles y ocho parámetros de orden; ver §3.)
+
+---
+
+## 10. `gdbpoke.py`, y por qué cambia el ritmo de trabajo
+
+`-d in_asm` sólo responde «¿se tradujo un bloque que empieza aquí?». La pregunta
+que hacía falta era «¿qué hay en `r0` cuando el huésped llega a esta dirección?»,
+y para eso hace falta un depurador. Esta WSL no tiene `gdb-multiarch`, así que
+hay uno nuevo de 200 líneas que habla el protocolo remoto de GDB directamente
+contra el `-gdb tcp::PORT` de QEMU:
+
+```bash
+sh tools/ipod_classic/gdbrun.sh 1300 $HOME/6g/z64.img 90 \
+   --break 0x0815b1e0 --break 0x0815b230 --hits 6 --mem 0x0bede7a4:16
+```
+
+`gdbrun.sh` arranca QEMU con `-S -gdb`, espera y lanza `gdbpoke.py`.
+`QEMU_EXTRA` añade argumentos (`-d int -D ...`). Todo el §9 y la corrección del
+§4 salen de esta herramienta; sin ella habrían sido días de `-d in_asm`.
+
+Además de `--break`/`--mem`/`--step` tiene `--skip FROM=TO[:R0]`, que reescribe
+el PC en una parada: sirve para **saltarse una llamada sin tocar la imagen del
+huésped**, que es como se demostró que esquivar el fallo de `0x0815b230` no
+lleva a ninguna parte (§4).
+
+> **Trampa que costó una hora y que hay que conocer.** QEMU **no** tiene lógica
+> de «ignora el breakpoint del que acabo de salir»:
+> `accel/tcg/cpu-exec.c:346` dispara siempre que `pc == bp->pc`. Un `c` pelado
+> desde una parada vuelve a parar en el mismo sitio **para siempre**, y la
+> primera versión de la herramienta sacó ocho paradas idénticas de una función
+> con 374 llamadores sin que saltara ninguna alarma. La salida está tres líneas
+> más arriba en el mismo fichero: *«Singlestep overrides breakpoints»*. `cont()`
+> hace `s` y luego `c`.
+>
+> Y el caso de control que lo destapó: poner el breakpoint en una función con
+> muchos llamadores y mirar si `lr` cambia entre paradas. Si no cambia, la
+> herramienta está rota, no el firmware.
+
+Segunda trampa, de direcciones: **los breakpoints son sobre direcciones
+virtuales**. El firmware mapea VA 0 sobre IRAM0, así que la tabla de vectores se
+ejecuta en `0x00000000`, no en `0x22000000`, y el manejador de Data Abort está
+en **`0x00003400`** (`[0x22000010] = 0xEA000CFA`). Poner el breakpoint en
+`0x22003400` no dispara nunca.
+
+## 11. Ficheros de esta tanda
+
+| Ruta | Qué es |
+|---|---|
+| `hw/arm/ipod_classic/ipod_classic_lcd.c` | ahora con panel: memoria 320×240 RGB565, ventana, `0x2A/0x2B/0x2C`, `qemu_console`, y los registros `+0x70..+0x8C` del motor de trama |
+| `hw/arm/ipod_classic/ipod_classic_gpio.c` | GPIO. Un solo pin modelado, el 86, y la razón está en la cabecera |
+| `tools/ipod_classic/gdbpoke.py` | cliente del protocolo remoto de GDB: breakpoints, registros, memoria, saltos |
+| `tools/ipod_classic/gdbrun.sh` | arranca QEMU con `-S -gdb` y lo conduce |
+| `tools/ipod_classic/lcdtest.S` | caso de control del panel: dibuja una rampa de 320×240 |
+| `tools/ipod_classic/pixcount.py` | cuenta píxeles no negros de un `screendump` |

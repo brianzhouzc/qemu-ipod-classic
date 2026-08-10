@@ -1,19 +1,40 @@
 /*
- * S5L8702 LCD interface.
+ * S5L8702 LCD interface and the panel behind it.
  *
- * The bus side is modelled: the handshake bits every driver spins on, the
- * command and data ports, and a read cycle that completes. The panel on the
- * other side is NOT modelled -- commands and pixel words are accepted and
- * dropped, and a read cycle returns zero. Nothing here draws.
+ * Two halves.
  *
- * That split is deliberate. The handshake is specified twice over (see the
- * header: Rockbox and Apple's retailOS spin on the same three bits), so it can
- * be written down with confidence. The panel is a different matter: which
- * controller is fitted is chosen at runtime from GPIO PDAT(6) bits [5:4], we
- * do not model GPIO yet, and guessing a command set would be inventing with
- * the appearance of rigour. Only the FIRST pixel write is reported, not every
- * one, because a driver that gets going pushes them by the hundred thousand;
- * the log therefore says "at least one", never how many.
+ * The BUS side is the MPU/8080 command port: the handshake bits every driver
+ * spins on, the command and data ports, and a read cycle that completes. That
+ * part is specified twice over -- see the header: Rockbox and Apple's retailOS
+ * spin on the same three status bits -- so it can be written down with
+ * confidence.
+ *
+ * The PANEL side is new, and it is the reason anything can appear on screen at
+ * all. It is a 320x240 RGB565 image memory with a write window, driven by the
+ * three commands the retailOS actually emits. Every number in it comes from a
+ * measurement, not from a datasheet we do not have:
+ *
+ *   - The command set is the 8-bit one. VERIFIED: the guest writes
+ *     LCD_CON = 0x80000c21 at 0x080b6fe0, and 0x080b6f8c only produces that
+ *     value on the "lcd_get_type() in {0,1}" arm, which is Rockbox's
+ *     LCD_CMDSET_8BIT (lcd-6g.c:201-214).
+ *   - The commands are 0x2A column-address-set, 0x2B row-address-set,
+ *     0x2C memory-write. VERIFIED: 0x080c1164 is Rockbox's displaylcd_setup()
+ *     compiled from other sources -- same three commands, same four-byte
+ *     big-endian parameters -- and the trace shows exactly
+ *     0x2A {00 00 01 3f} 0x2B {00 00 00 ef} 0x2C.
+ *   - 320x240 and RGB565: see the header.
+ *
+ * What is NOT modelled, and is marked so below: the frame engine at +0x70.
+ * Writing 1 there starts something that is meant to move a whole frame, and
+ * nothing we have found says where it reads from -- there is no source-address
+ * register anywhere in this 256-byte window and, measured over a whole diskless
+ * boot, no DMAC0 channel is ever pointed at LCD_WDATA either (the only
+ * destination programmed is the I2S FIFO at 0x3CA00010). So +0x70 is accepted,
+ * counted and logged, and +0x8C reports "not busy" so the two spin loops at
+ * 0x080a4090 and 0x080b0128 terminate. UNDETERMINED, and deliberately loud.
+ *
+ * Set LCDTRACE=1 to get every access with its value and the guest PC.
  *
  * See include/hw/arm/ipod_classic/ipod_classic_lcd.h for the register map and
  * where every bit comes from.
@@ -24,12 +45,234 @@
 #include "qemu/module.h"
 #include "hw/irq.h"
 #include "migration/vmstate.h"
+#include "hw/core/cpu.h"
+#include "ui/console.h"
+#include "ui/pixel_ops.h"
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
+
+/*
+ * INSTRUMENTATION ONLY -- LCDTRACE=1 in the environment prints every access to
+ * this window, with the guest PC that made it, to stderr. Nothing here changes
+ * what the model does. Same pattern as ATATRACE=1 in ipod_classic_ata.c.
+ * See wiki/11-classic6g-retailos.md sec.3.
+ */
+static int lcdtrace = -1;
+static void lcd_trace_totals(void);
+
+static bool lcd_trace_on(void)
+{
+    if (lcdtrace < 0) {
+        const char *e = getenv("LCDTRACE");
+        lcdtrace = (e && *e && *e != '0') ? 1 : 0;
+        if (lcdtrace) {
+            atexit(lcd_trace_totals);
+        }
+    }
+    return lcdtrace == 1;
+}
+
+/*
+ * The last PC the CPU synchronised, which under TCG is the head of the
+ * translation block that is running -- accel/tcg/cputlb.c:io_prepare() does not
+ * call cpu_restore_state(), so this is NOT the address of the store. It is the
+ * same granularity as -d in_asm and useful for the same thing: naming the
+ * function. Printed as "pc~" to say so.
+ */
+static uint32_t lcd_trace_pc(void)
+{
+    CPUState *cs = current_cpu;
+    return cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0;
+}
+
+/*
+ * Running totals, reported by LCDTRACE. Never read by the model itself.
+ * The per-write lines are throttled, so these are the only exact counts.
+ */
+static uint64_t lcd_wdata_writes;
+static uint64_t lcd_wcmd_writes;
+static uint64_t lcd_pixels_total;
+static uint64_t lcd_frame_starts;
+
+static void lcd_trace_totals(void)
+{
+    fprintf(stderr, "LCDTRACE  totals: %" PRIu64 " writes to the command port "
+            "+0x04, %" PRIu64 " to the data port +0x40..0x5C, of which %"
+            PRIu64 " were pixels; %" PRIu64 " frame-engine starts (+0x70)\n",
+            lcd_wcmd_writes, lcd_wdata_writes, lcd_pixels_total,
+            lcd_frame_starts);
+}
+
+/* ------------------------------------------------------------------ panel */
+
+/* ILI934x-family 8-bit command set. Only the three the guest emits. */
+#define PANEL_CMD_DISPOFF   0x28
+#define PANEL_CMD_DISPON    0x29
+#define PANEL_CMD_CASET     0x2A
+#define PANEL_CMD_PASET     0x2B
+#define PANEL_CMD_RAMWR     0x2C
+
+static void panel_command(IPodClassicLCDState *s, uint8_t cmd)
+{
+    s->cmd = cmd;
+    s->param_n = 0;
+
+    switch (cmd) {
+    case PANEL_CMD_CASET:
+    case PANEL_CMD_PASET:
+        s->phase = S5L8702_PANEL_PARAMS;
+        s->param_want = 4;
+        break;
+
+    case PANEL_CMD_RAMWR:
+        s->phase = S5L8702_PANEL_PIXELS;
+        s->param_want = 0;
+        s->cur_x = s->win_x0;
+        s->cur_y = s->win_y0;
+        s->pixels_this_frame = 0;
+        break;
+
+    case PANEL_CMD_DISPON:
+        s->display_on = true;
+        s->phase = S5L8702_PANEL_IDLE;
+        s->param_want = 0;
+        break;
+
+    case PANEL_CMD_DISPOFF:
+        s->display_on = false;
+        s->phase = S5L8702_PANEL_IDLE;
+        s->param_want = 0;
+        break;
+
+    default:
+        /*
+         * Any other command: we do not know how many parameters it takes, so
+         * the safe thing is to swallow the data writes that follow rather than
+         * mistake them for pixels. PARAMS with param_want 0 does exactly that.
+         */
+        s->phase = S5L8702_PANEL_PARAMS;
+        s->param_want = 0;
+        qemu_log_mask(LOG_UNIMP, "s5l8702.lcd: panel command 0x%02x is not "
+                      "modelled; its parameters will be dropped\n", cmd);
+        break;
+    }
+}
+
+static void panel_params_done(IPodClassicLCDState *s)
+{
+    uint16_t a = (s->param[0] << 8) | s->param[1];
+    uint16_t b = (s->param[2] << 8) | s->param[3];
+
+    if (a > b) {
+        uint16_t t = a; a = b; b = t;
+    }
+
+    if (s->cmd == PANEL_CMD_CASET) {
+        s->win_x0 = MIN(a, S5L8702_PANEL_WIDTH - 1);
+        s->win_x1 = MIN(b, S5L8702_PANEL_WIDTH - 1);
+    } else {
+        s->win_y0 = MIN(a, S5L8702_PANEL_HEIGHT - 1);
+        s->win_y1 = MIN(b, S5L8702_PANEL_HEIGHT - 1);
+    }
+    s->phase = S5L8702_PANEL_IDLE;
+}
+
+static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
+{
+    if (s->cur_y < S5L8702_PANEL_HEIGHT && s->cur_x < S5L8702_PANEL_WIDTH) {
+        s->fb[s->cur_y * S5L8702_PANEL_WIDTH + s->cur_x] = px;
+        s->dirty = true;
+    }
+    s->pixels_this_frame++;
+    lcd_pixels_total++;
+
+    if (s->cur_x >= s->win_x1) {
+        s->cur_x = s->win_x0;
+        if (s->cur_y >= s->win_y1) {
+            s->cur_y = s->win_y0;   /* the panel wraps, like the real part */
+        } else {
+            s->cur_y++;
+        }
+    } else {
+        s->cur_x++;
+    }
+}
+
+static void panel_data(IPodClassicLCDState *s, uint32_t value)
+{
+    switch (s->phase) {
+    case S5L8702_PANEL_PARAMS:
+        if (s->param_n < s->param_want) {
+            s->param[s->param_n++] = value & 0xff;
+            if (s->param_n == s->param_want) {
+                panel_params_done(s);
+            }
+        }
+        break;
+
+    case S5L8702_PANEL_PIXELS:
+        /*
+         * In frame mode (LCD_CON = LCD_MODE_P16, which the guest writes at
+         * 0x080b7010 straight after the 0x2C) the port carries one 16-bit
+         * pixel per access. A 32-bit store therefore delivers one pixel in its
+         * low half; if the high half is ever non-zero this assumption is wrong
+         * and the log below says so.
+         */
+        if (value >> 16) {
+            static bool warned;
+            if (!warned) {
+                warned = true;
+                qemu_log_mask(LOG_UNIMP, "s5l8702.lcd: data word 0x%08x has a "
+                              "non-zero high half; the model treats the data "
+                              "port as one 16-bit pixel per access\n", value);
+            }
+        }
+        panel_pixel(s, value & 0xffff);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * The frame engine. UNDETERMINED and deliberately inert: see the file header.
+ * The guest writes the geometry to +0x74 and a 1 to +0x70, then spins on
+ * +0x8C bits [1:0] until they clear. We report "done" immediately, which is
+ * what the previous read-as-zero behaviour did, so nothing regresses -- but
+ * now the event is counted and named, and the count of pixels that actually
+ * arrived through the data port is printed with it.
+ */
+static void panel_frame_go(IPodClassicLCDState *s, uint32_t value)
+{
+    lcd_frame_starts++;
+    if (value == 0) {
+        return;
+    }
+    if (lcd_trace_on() || lcd_frame_starts <= 4) {
+        fprintf(stderr, "LCDTRACE  frame engine started (+0x70 = 0x%x), "
+                "geometry +0x74 = 0x%08x (%ux%u), window %u,%u..%u,%u, "
+                "%" PRIu64 " pixels have arrived through the data port since "
+                "the last 0x2C\n", value, s->fr_geom, s->fr_geom >> 16,
+                s->fr_geom & 0xffff, s->win_x0, s->win_y0, s->win_x1,
+                s->win_y1, s->pixels_this_frame);
+    }
+    qemu_log_mask(LOG_UNIMP, "s5l8702.lcd: frame engine start (+0x70 = 0x%x) "
+                  "is not modelled -- no source address exists anywhere in "
+                  "this window and no DMA channel points at LCD_WDATA, so "
+                  "where it would read from is UNDETERMINED\n", value);
+}
+
+/* ------------------------------------------------------------------- mmio */
 
 static uint64_t ipod_classic_lcd_read(void *opaque, hwaddr offset,
                                       unsigned size)
 {
     IPodClassicLCDState *s = opaque;
+
+    if (lcd_trace_on() && offset != S5L8702_LCD_STATUS) {
+        fprintf(stderr, "LCDTRACE  rd +0x%02" HWADDR_PRIx "            pc~0x%08x\n",
+                offset, lcd_trace_pc());
+    }
 
     switch (offset) {
     case S5L8702_LCD_STATUS:
@@ -45,14 +288,14 @@ static uint64_t ipod_classic_lcd_read(void *opaque, hwaddr offset,
     case S5L8702_LCD_DBUFF:
         /*
          * Rockbox reads this as "*buf++ = LCD_DBUFF >> 1", so the panel's byte
-         * sits above bit 0. We have no panel, so this is zero; the shift is
-         * the driver's business either way.
+         * sits above bit 0. We have no panel read path, so this is zero; the
+         * shift is the driver's business either way.
          */
         s->dbuff_valid = false;
         return s->dbuff;
 
     case S5L8702_LCD_CON:
-        return s->con;
+        return s->con_reg;
     case S5L8702_LCD_INTCON:
         return s->intcon;
     case S5L8702_LCD_PHTIME:
@@ -63,6 +306,27 @@ static uint64_t ipod_classic_lcd_read(void *opaque, hwaddr offset,
         return s->drv_rst;
     case S5L8702_LCD_RCMD:
         return s->rcmd;
+
+    case S5L8702_LCD_FR_GEOM:
+        return s->fr_geom;
+    case S5L8702_LCD_FR_UNK78:
+        return s->fr_unk78;
+    case S5L8702_LCD_FR_UNK7C:
+        return s->fr_unk7c;
+    case S5L8702_LCD_FR_HOLD:
+        return s->fr_hold;
+    case S5L8702_LCD_FR_UNK88:
+        return s->fr_unk88;
+
+    case S5L8702_LCD_FR_GO:
+        return 0;
+
+    case S5L8702_LCD_FR_STATUS:
+        /*
+         * "while (LCD[0x8c] & 3);" at 0x080a4090 and 0x080b0128, both with no
+         * timeout. Bits [1:0] are transfer-in-progress and must read zero.
+         */
+        return 0;
 
     default:
         qemu_log_mask(LOG_UNIMP, "%s: read of +0x%" HWADDR_PRIx "\n", __func__,
@@ -76,32 +340,41 @@ static void ipod_classic_lcd_write(void *opaque, hwaddr offset, uint64_t value,
 {
     IPodClassicLCDState *s = opaque;
 
-    if (offset >= S5L8702_LCD_WDATA && offset <= S5L8702_LCD_WDATA_LAST) {
-        /*
-         * Pixel data. Dropped -- see the file header. The first one is
-         * announced so the log does not stay silent about it; the rest are
-         * not, so this says nothing about how many arrive.
-         */
-        static uint64_t dropped;
-        if (++dropped == 1) {
-            qemu_log_mask(LOG_UNIMP, "%s: pixel data discarded, no panel is "
-                          "modelled (further writes are silent)\n", __func__);
+    if (lcd_trace_on()) {
+        if (offset >= S5L8702_LCD_WDATA && offset <= S5L8702_LCD_WDATA_LAST) {
+            /*
+             * Only the first 64 are printed in full: a driver that gets going
+             * pushes them by the hundred thousand. The running total is
+             * printed on every power of two so the log always says how many.
+             */
+            uint64_t n = lcd_wdata_writes + 1;
+            if (n <= 64 || (n & (n - 1)) == 0) {
+                fprintf(stderr, "LCDTRACE  wr +0x%02" HWADDR_PRIx " = 0x%08x  "
+                        "DATA[%" PRIu64 "]  pc~0x%08x\n", offset,
+                        (uint32_t)value, n, lcd_trace_pc());
+            }
+        } else {
+            fprintf(stderr, "LCDTRACE  wr +0x%02" HWADDR_PRIx " = 0x%08x  %s"
+                    "pc~0x%08x\n", offset, (uint32_t)value,
+                    offset == S5L8702_LCD_WCMD ? "CMD           " : "              ",
+                    lcd_trace_pc());
         }
+    }
+
+    if (offset >= S5L8702_LCD_WDATA && offset <= S5L8702_LCD_WDATA_LAST) {
+        lcd_wdata_writes++;
+        panel_data(s, value);
         return;
     }
 
     switch (offset) {
     case S5L8702_LCD_CON:
-        s->con = value;
+        s->con_reg = value;
         break;
 
     case S5L8702_LCD_WCMD:
-        /*
-         * A panel command. Which controller is listening depends on a strap we
-         * do not read yet, so there is nothing meaningful to do with it.
-         */
-        qemu_log_mask(LOG_UNIMP, "%s: panel command 0x%" PRIx64
-                      " ignored, no panel is modelled\n", __func__, value);
+        lcd_wcmd_writes++;
+        panel_command(s, value & 0xff);
         break;
 
     case S5L8702_LCD_RCMD:
@@ -111,9 +384,9 @@ static void ipod_classic_lcd_write(void *opaque, hwaddr offset, uint64_t value,
     case S5L8702_LCD_RDATA:
         /*
          * Writing here starts a read cycle; the result appears in LCD_DBUFF
-         * and bit 0 of LCD_STATUS goes up. With no panel the result is zero,
-         * but the handshake still has to complete or the driver waits for
-         * ever at lcd-s5l8702.c:241.
+         * and bit 0 of LCD_STATUS goes up. With no panel read path the result
+         * is zero, but the handshake still has to complete or the driver waits
+         * for ever at lcd-s5l8702.c:241.
          */
         s->dbuff = 0;
         s->dbuff_valid = true;
@@ -132,18 +405,32 @@ static void ipod_classic_lcd_write(void *opaque, hwaddr offset, uint64_t value,
         s->drv_rst = value;
         break;
 
+    case S5L8702_LCD_FR_GEOM:
+        s->fr_geom = value;
+        break;
+    case S5L8702_LCD_FR_UNK78:
+        s->fr_unk78 = value;
+        break;
+    case S5L8702_LCD_FR_UNK7C:
+        s->fr_unk7c = value;
+        break;
+    case S5L8702_LCD_FR_HOLD:
+        s->fr_hold = value;
+        break;
+    case S5L8702_LCD_FR_UNK88:
+        s->fr_unk88 = value;
+        break;
+
+    case S5L8702_LCD_FR_GO:
+        panel_frame_go(s, value);
+        break;
+
     case S5L8702_LCD_STATUS:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: LCD_STATUS is read-only\n",
                       __func__);
         break;
 
     default:
-        /*
-         * +0x7C and +0x88 land here. The retailOS writes 0x804 and 0x1000000
-         * to them once each, very early, and never reads them back; no source
-         * we have names them and nothing observable depends on them, so they
-         * are accepted and dropped. UNDETERMINED.
-         */
         qemu_log_mask(LOG_UNIMP, "%s: write of 0x%" PRIx64 " to +0x%"
                       HWADDR_PRIx "\n", __func__, value, offset);
         break;
@@ -158,11 +445,36 @@ static const MemoryRegionOps ipod_classic_lcd_ops = {
     .valid.max_access_size = 4,
 };
 
+/* ---------------------------------------------------------------- console */
+
+static void ipod_classic_lcd_gfx_update(void *opaque)
+{
+    IPodClassicLCDState *s = opaque;
+
+    if (!s->dirty) {
+        return;
+    }
+    s->dirty = false;
+    dpy_gfx_update_full(s->con);
+}
+
+static void ipod_classic_lcd_invalidate(void *opaque)
+{
+    IPodClassicLCDState *s = opaque;
+
+    s->dirty = true;
+}
+
+static const GraphicHwOps ipod_classic_lcd_gfx_ops = {
+    .invalidate = ipod_classic_lcd_invalidate,
+    .gfx_update = ipod_classic_lcd_gfx_update,
+};
+
 static void ipod_classic_lcd_reset(DeviceState *dev)
 {
     IPodClassicLCDState *s = IPOD_CLASSIC_LCD(dev);
 
-    s->con = 0;
+    s->con_reg = 0;
     s->intcon = 0;
     /* s5l87xx.h records the reset values of these two as 0x0060 and 0x07FF. */
     s->phtime = 0x0060;
@@ -171,24 +483,61 @@ static void ipod_classic_lcd_reset(DeviceState *dev)
     s->dbuff = 0;
     s->dbuff_valid = false;
     s->rcmd = 0;
+
+    s->fr_geom = 0;
+    s->fr_unk78 = 0;
+    s->fr_unk7c = 0;
+    s->fr_hold = 0;
+    s->fr_unk88 = 0;
+
+    memset(s->fb, 0, sizeof(s->fb));
+    s->win_x0 = 0;
+    s->win_y0 = 0;
+    s->win_x1 = S5L8702_PANEL_WIDTH - 1;
+    s->win_y1 = S5L8702_PANEL_HEIGHT - 1;
+    s->cur_x = 0;
+    s->cur_y = 0;
+    s->phase = S5L8702_PANEL_IDLE;
+    s->cmd = 0;
+    s->param_n = 0;
+    s->param_want = 0;
+    s->pixels_this_frame = 0;
+    /*
+     * The guest never sends 0x29 (display on) in any boot measured so far, and
+     * a panel that stays dark until it does would hide real pixels behind an
+     * unmodelled command. We show whatever is in image memory. NOTE: this is a
+     * convenience value, not a measurement.
+     */
+    s->display_on = true;
+    s->dirty = true;
 }
 
 static void ipod_classic_lcd_realize(DeviceState *dev, Error **errp)
 {
     IPodClassicLCDState *s = IPOD_CLASSIC_LCD(dev);
+    DisplaySurface *surface;
 
     memory_region_init_io(&s->iomem, OBJECT(s), &ipod_classic_lcd_ops, s,
                           TYPE_IPOD_CLASSIC_LCD, S5L8702_LCD_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+
+    s->con = graphic_console_init(dev, 0, &ipod_classic_lcd_gfx_ops, s);
+    qemu_console_resize(s->con, S5L8702_PANEL_WIDTH, S5L8702_PANEL_HEIGHT);
+    surface = qemu_create_displaysurface_from(S5L8702_PANEL_WIDTH,
+                                              S5L8702_PANEL_HEIGHT,
+                                              PIXMAN_r5g6b5,
+                                              S5L8702_PANEL_WIDTH * 2,
+                                              (uint8_t *)s->fb);
+    dpy_gfx_replace_surface(s->con, surface);
 }
 
 static const VMStateDescription vmstate_ipod_classic_lcd = {
     .name = TYPE_IPOD_CLASSIC_LCD,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
-        VMSTATE_UINT32(con, IPodClassicLCDState),
+        VMSTATE_UINT32(con_reg, IPodClassicLCDState),
         VMSTATE_UINT32(intcon, IPodClassicLCDState),
         VMSTATE_UINT32(phtime, IPodClassicLCDState),
         VMSTATE_UINT32(rst_time, IPodClassicLCDState),
@@ -196,6 +545,25 @@ static const VMStateDescription vmstate_ipod_classic_lcd = {
         VMSTATE_UINT32(dbuff, IPodClassicLCDState),
         VMSTATE_BOOL(dbuff_valid, IPodClassicLCDState),
         VMSTATE_UINT32(rcmd, IPodClassicLCDState),
+        VMSTATE_UINT32(fr_geom, IPodClassicLCDState),
+        VMSTATE_UINT32(fr_unk78, IPodClassicLCDState),
+        VMSTATE_UINT32(fr_unk7c, IPodClassicLCDState),
+        VMSTATE_UINT32(fr_hold, IPodClassicLCDState),
+        VMSTATE_UINT32(fr_unk88, IPodClassicLCDState),
+        VMSTATE_UINT16_ARRAY(fb, IPodClassicLCDState,
+                             S5L8702_PANEL_WIDTH * S5L8702_PANEL_HEIGHT),
+        VMSTATE_UINT16(win_x0, IPodClassicLCDState),
+        VMSTATE_UINT16(win_x1, IPodClassicLCDState),
+        VMSTATE_UINT16(win_y0, IPodClassicLCDState),
+        VMSTATE_UINT16(win_y1, IPodClassicLCDState),
+        VMSTATE_UINT16(cur_x, IPodClassicLCDState),
+        VMSTATE_UINT16(cur_y, IPodClassicLCDState),
+        VMSTATE_UINT8(phase, IPodClassicLCDState),
+        VMSTATE_UINT8(cmd, IPodClassicLCDState),
+        VMSTATE_UINT8_ARRAY(param, IPodClassicLCDState, 8),
+        VMSTATE_UINT8(param_n, IPodClassicLCDState),
+        VMSTATE_UINT8(param_want, IPodClassicLCDState),
+        VMSTATE_BOOL(display_on, IPodClassicLCDState),
         VMSTATE_END_OF_LIST()
     },
 };

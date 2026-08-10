@@ -21,6 +21,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_pmu.h"
 #include "hw/arm/ipod_classic/ipod_classic_ata.h"
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
+#include "hw/arm/ipod_classic/ipod_classic_gpio.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 

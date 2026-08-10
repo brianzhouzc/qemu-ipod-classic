@@ -278,7 +278,6 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.spdif",    SPDIF_MEM_BASE,    0x100000 },
     { "s5l8702.spi0",     SPI0_MEM_BASE,     0x100000 },
     { "s5l8702.adc",      ADC_MEM_BASE,      0x100000 },
-    { "s5l8702.gpio",     GPIO_MEM_BASE,     0x100000 },
     { "s5l8702.chipid",   CHIPID_MEM_BASE,   0x100000 },
     { "s5l8702.rtc",      RTC_MEM_BASE,      0x100000 },
     { "s5l8702.adm",      ADM_MEM_BASE,      0x100000 },
@@ -535,6 +534,23 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, LCD_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_LCD_IRQ));
+
+    /*
+     * GPIO. Only one pin is modelled and it is the reason this device exists:
+     * 0x080aeca4 reads pin 86 and the storage task turns it straight into
+     * "mount the volume" or "there is no media" (see ipod_classic_gpio.h). With
+     * the window unimplemented it read zero, the volume was never mounted, and
+     * every boot WITH a disk parked the user-interface task in
+     * "while (!ready) wait();" at 0x081228c4 -- which is why those boots
+     * reached the RTXC idle loop and never drew anything.
+     *
+     * The pin follows whether a drive is attached, so a boot with no -drive is
+     * unchanged.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_GPIO);
+    qdev_prop_set_bit(dev, "media-present", drive_get(IF_IDE, 0, 0) != NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, GPIO_MEM_BASE);
 
     /*
      * The random number generator at 0x3C100000. See the long note above it:
