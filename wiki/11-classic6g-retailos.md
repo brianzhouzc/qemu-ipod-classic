@@ -7,6 +7,13 @@ Todo lo que sigue está **medido** salvo donde diga `INFERIDO` (razonado a
 partir de algo verificado) o `INDETERMINADO` (no lo sabemos y no fingimos
 saberlo). Las trazas son reproducibles con las órdenes del final.
 
+> Este documento es **qué hace el firmware y qué se sabe de cada bloque**, y
+> está ordenado por bloque. Si lo que buscas es **cómo se averiguó, en qué orden
+> y qué se creyó por error por el camino**, eso está en
+> [12-historia-6g.md](12-historia-6g.md), que además lleva el catálogo de
+> hipótesis retiradas y el capítulo de las tres veces que un descarte resultó
+> ser la pista buena.
+
 ---
 
 ## 0. Estado
@@ -1131,10 +1138,18 @@ byte a byte con `hw/dma/pl080.h`. QEMU ya trae el modelo, así que fue cablearlo
 - región de `0x1000`, no `0x100000`, para que el resto del bloque siga cayendo
   al *io floor* y `-d unimp` lo diga si el huésped lo toca;
 - IRQ 16 y 17, que el huésped ya tiene desenmascaradas
-  (`VIC0 INTENABLE = 0x21a3010f`);
+  (`VIC0 INTENABLE = 0x21a3010f`); †
 - y el puerto maestro tiene que ser la memoria del sistema, porque el huésped
   programa los canales con el alias **cacheado** (`0x0be55320`) mientras la CPU
   corre sobre el no cacheado (`0x8be55320`).
+
+> † **Dos lecturas distintas de `INTENABLE`, y no están reconciliadas.** Aquí
+> son `0x21A3010F`; `ipod_classic.c:640` e `ipod_classic_wheel.h:149` dicen
+> `0x01A3010F`, tomado en otro momento del arranque. Difieren **sólo en el bit
+> 29**. Ninguna de las dos conclusiones depende de eso: los bits 16, 17 y 23
+> están puestos en las dos (`3` en el nibble 19..16, `A` en el 23..20). Cuál de
+> las dos es el estado en régimen es `INDETERMINADO`, y quien lo mida que corrija
+> aquí y en los dos sitios del código.
 
 ### Lo que se destrabó, medido
 

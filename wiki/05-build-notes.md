@@ -232,32 +232,83 @@ Quien no lea el fuente o esta wiki no las encuentra.
 | `remap` | `off` | DRAM en la dirección 0 desde el reset |
 | `semihosting` | `on` | Contesta al semihosting de ARM; es como el retailOS imprime sus panics |
 
+### La máquina del iPod classic 6G
+
+Hacen falta el `osos` **descifrado** (ver [10](10-classic6g-emcore.md)) y un
+disco construido a partir de la partición de firmware del `.ipsw`:
+
+```bash
+# el disco. El FAT32 va VACIO: las tipografias estan en la particion de
+# FIRMWARE, no aqui.
+truncate -s 64M ~/6g/fat32.img && mkfs.vfat -F 32 -n IPOD ~/6g/fat32.img
+python3 tools/ipod_classic/mkdisk6g4k.py ~/6g/E.img \
+        assets/extracted/Firmware-24.9.1.2 ~/6g/fat32.img
+
+cd build && ./qemu-system-arm -M iPod-Classic \
+    -kernel ../assets/classic6g/osos_decrypted.bin -serial null \
+    -drive if=ide,format=raw,file=$HOME/6g/E.img -snapshot
+```
+
+- Tarda **entre 22 y 30 s** de reloj de pared hasta el primer píxel.
+- **Sin `-drive` no hay imagen**, y eso es del huésped: la interfaz se muere
+  buscando tipografías y entra en un ciclo de caída y reinicio. No hay ninguna
+  tipografía dentro de la imagen del firmware.
+- **No hay propiedad `entry`**: el `osos` descifrado se carga crudo en
+  `0x08000000`, que es su `addr` en el directorio del firmware. Las dos
+  propiedades que sí hay, y que tampoco salen en `-M iPod-Classic,help`, son
+  `bootrom` (ruta a un binario de bootrom, que **no tenemos**) y `semihosting`
+  (encendida por defecto — **es como el retailOS imprime sus panics**).
+
+Variables de entorno de traza, todas del Classic:
+
+| Variable | Qué traza |
+|---|---|
+| `DISPTRACE=1` | el compositor de `0x38900000`, con el PC del huésped y totales |
+| `LCDTRACE=1` | el panel: órdenes, píxeles y arranques del motor de trama |
+| `ATATRACE=1` | toda la conversación con el ATA, registro a registro |
+| `WHEELTRACE=1` | paquetes, órdenes y flancos de la IRQ 23 |
+| `GPIOTRACE=1` | accesos a GPIO |
+| `IPOD_WHEEL_STEP` (6), `IPOD_WHEEL_TICK_MS` (40), `IPOD_WHEEL_UNTOUCH_MS` (1500) | ajustan la rueda. **Ninguno es un dato del aparato** |
+
 ### Teclas
 
-El teclado está mapeado al click wheel:
+El teclado está mapeado al click wheel, **igual en las dos máquinas**:
 
 | Tecla | Botón |
 |---|---|
 | `w` | MENU |
-| `a` | LEFT |
+| `a` | LEFT / anterior |
 | `s` | PLAY |
-| `d` | RIGHT |
+| `d` | RIGHT / siguiente |
 | `Enter` | SELECT |
 | `e` | rueda en sentido horario |
 | `q` | rueda en sentido antihorario |
 
-La primera pulsación de rueda después de cambiar de sentido no mueve nada:
-Rockbox reinicia su acumulador al invertir la dirección.
+En el 5G, la primera pulsación de rueda después de cambiar de sentido no mueve
+nada: Rockbox reinicia su acumulador al invertir la dirección. En el Classic no
+pasa eso — cada pulsación mueve un elemento — porque el modelo espacia los
+paquetes con un temporizador para satisfacer al decodificador de Apple, que
+exige un paquete de armado antes de cada movimiento.
 
 ### Pruebas automáticas de navegación
 
-Hay dos, una por firmware. Las dos capturan a `assets/` e informan de cuántos
-píxeles cambia cada fotograma respecto al anterior.
+Hay **tres**. Las tres informan de cuántos píxeles cambia cada fotograma
+respecto al anterior; las dos del 5G capturan a `assets/` y la del Classic a
+`~/6g/nav`.
 
 ```bash
-./tools/ipod_video/navtest.sh     # Rockbox, ~55 s
-./tools/ipod_video/appletest.sh   # el retailOS de Apple, ~3 min
+./tools/ipod_video/navtest.sh       # 5G, Rockbox, ~55 s
+./tools/ipod_video/appletest.sh     # 5G, el retailOS de Apple, ~3 min
+sh tools/ipod_classic/navtest.sh    # Classic, el retailOS, ~2 min
 ```
+
+**La del Classic sí es una aserción**, a diferencia de las otras dos: comprueba
+que la pantalla está quieta antes de tocar nada (dos capturas seguidas, 0 px de
+diferencia — esta pantalla no dibuja reloj), pulsa `e`, `e`, `q`, Enter y `w`, y
+**suspende** si algún giro no mueve el resaltado **o si el suelo de ruido deja de
+ser 0**, que es la premisa de la que cuelgan todos sus umbrales. Cifras de
+referencia: **8 000 px por giro**, **50 540 px** al entrar con Enter. Deja los
+PNG en `~/6g/nav` y **hay que mirarlos**, que es la otra mitad de la medida.
 
 `navtest.sh` arranca, sale de *Now Playing* con MENU, gira la rueda y
 selecciona. `appletest.sh` hace dos arranques del retailOS: uno que fotografía
@@ -270,7 +321,7 @@ prueba nada. Sólo cuenta la barra de selección movida, que son ~14.000, o una
 pantalla nueva, que pasa de 18.000. Un puñado de píxeles es el reloj o el icono
 de batería.
 
-> **Ninguno de los dos scripts es una aserción: son generadores de
+> **Ninguno de los dos scripts del 5G es una aserción: son generadores de
 > evidencia.** Los dos cierran la invocación de QEMU con `|| true` y su
 > post-proceso en Python no comprueba nada. Verificado: si no se genera ningún
 > PPM, el bucle no imprime nada **y el script sale con código 0**. Un QEMU que

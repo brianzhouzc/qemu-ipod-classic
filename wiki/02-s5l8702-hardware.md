@@ -1,5 +1,19 @@
 # S5L8702 / iPod classic 6G — hardware
 
+> **Actualizado el 10 de agosto de 2026.** Este documento se escribió cuando no
+> se había modelado nada. Ahora la máquina `-M iPod-Classic` arranca el retailOS
+> de Apple hasta una pantalla navegable, y hay **catorce bloques de periférico
+> con comportamiento de verdad** (más el PMU detrás del I²C): la sección
+> [«Qué está modelado»](#qué-está-modelado-en--m-ipod-classic) los lista, con lo
+> que se sabe de cada uno y lo que no. Dos cosas que este mapa **no podía
+> traer** y son las que dibujan y dan entrada:
+>
+> - **`0x38900000`, el compositor de vídeo.** No lo nombra ninguna fuente
+>   externa —ni Rockbox ni freemyipod—, sólo el código de Apple. Es de donde
+>   salen los píxeles. Ver [11](11-classic6g-retailos.md) §13.
+> - **`0x3C100000`**, un bloque que Rockbox sólo define para el S5L8700 y que en
+>   este chip se comporta como un generador de números. Ver [11](11-classic6g-retailos.md) §2.
+
 Fuente primaria: `firmware/export/s5l87xx.h` de Rockbox, resuelto con el
 preprocesador para `CONFIG_CPU == S5L8702`:
 
@@ -40,8 +54,19 @@ Todo lo de este documento sale de ahí salvo donde se indique otra cosa.
 | SDRAM (`DRAM_ORIG`) | `0x08000000` | 64 MB |
 | IRAM0 (`IRAM_ORIG`) | `0x22000000` | `0x20000` (128 KB) |
 | IRAM1 | `0x22020000` | `0x20000` (128 KB) |
-| Bootrom | por confirmar — en el Touch 2G está en `0x0` | — |
+| Bootrom | `0x20000000`, con alias en `0x0` ([08](08-s5l8702-fuentes-externas.md)) | 50 o 64 KiB, sin reconciliar |
+| Últimos 256 B de IRAM1 | `0x2203FF00` | bloque de parámetros que la bootrom deja al firmware |
 | TTB (tablas de páginas, lo pone Rockbox) | `DRAM_ORIG + DRAM_SIZE - 0x4000` | `0x4000` |
+
+> **La bootrom no se puede volcar por USB, y está comprobado.** Tras el
+> arranque, `0x20000000` devuelve una constante por banco de 16 KiB: está
+> bloqueada. Ver [10-classic6g-emcore.md](10-classic6g-emcore.md) §4. Por eso la
+> máquina se la salta y reproduce a mano lo que ese bloque de parámetros
+> contenía — y por eso `IICCON = 0x184` es una inferencia y no un dato.
+>
+> El área de IRAM del retailOS **no es libre**: la imagen tiene carga dispersa,
+> `fichero [0, 0x0AE48) -> 0x22000000` y el resto a `0x08000000`. Ver
+> [11](11-classic6g-retailos.md) §1.
 
 > El S5L8720 del Touch 2G tiene IRAM1 de solo `0x10000`; el S5L8702 tiene
 > `0x20000`. Total 256 KB de IRAM.
@@ -59,6 +84,7 @@ Todo lo de este documento sale de ahí salvo donde se indique otra cosa.
 | `0x38600000` | `USB_HC_BASE` | USB host controller | — |
 | `0x38700000` | `ATA_BASE` | **Controlador ATA** | ❌ (2G: DMAC1) |
 | `0x38800000` | `USB_FC_BASE` | USB function controller | — |
+| `0x38900000` | **ninguna** | **Compositor de vídeo.** No está en `s5l87xx.h` ni en el modelo de freemyipod: el nombre y el mapa de registros salen del código de Apple | ❌ (2G: LCD) |
 | `0x38a00000` | `ATA_UNKNOWN_BASE` | Bloque auxiliar ATA / FMI | — |
 | `0x38b00000` | `SDCI_BASE` | SD/MMC — usado para **CE-ATA** | ❌ (2G SDIO: `0x38D00000`) |
 | `0x38c00000` | `AES_BASE` | Motor AES | ✅ sí |
@@ -70,6 +96,7 @@ Todo lo de este documento sale de ahí salvo donde se indique otra cosa.
 | `0x39a00000` | `EIC_BASE` / `SYSALV_BASE` | Controlador de int. externas | — |
 | `0x39C00000` | `INT_BASE` | Controlador de interrupciones legacy | — |
 | `0x39E00000` | `ECC_BASE` | ECC de NAND | — |
+| `0x3C100000` | (`LCD_BASE` **sólo en S5L8700**) | Bloque sin nombre; el retailOS lo usa como **generador de números**, con tres registros y sin bit de habilitación | — |
 | `0x3C200000` | `WHEEL_BASE` | **Interfaz del click wheel** | ❌ solo classic/nano |
 | `0x3C400000` | `USB_PHY_BASE` | PHY USB | ✅ sí |
 | `0x3C500000` | `CLK_BASE` | Reloj / PLL | ✅ sí |
@@ -122,6 +149,38 @@ Extraídos de `s5l8702_macros.h`. Van al par de PL192 en `0x38E00000` /
 | 43 | `IRQ_NANDECC` |
 | 44 | **`IRQ_MMC`** (CE-ATA) |
 
+## Qué está modelado en `-M iPod-Classic`
+
+Estado del árbol a 10 de agosto de 2026. «Modelado» aquí significa *tiene
+comportamiento*, no *devuelve ceros sin quejarse*. Todo lo que no aparece en
+esta tabla es `create_unimplemented_device()` (24 bloques) o cae al **suelo de
+E/S** que cubre los 768 MB de la ventana de periféricos — que hace falta porque
+el retailOS mapea toda esa ventana como una sección identidad sin caché, así que
+una dirección sin mapear no es un cero inofensivo, es un *data abort*.
+
+| Bloque | Base | Fichero | Qué sabe hacer, y qué no |
+|---|---|---|---|
+| CPU + RAM | — | `ipod_classic.c` | ARM926EJ-S, SDRAM 64 MB, IRAM0/IRAM1, y el **alias de IRAM0 en `0x0`**, de donde el ARM926 toma sus excepciones |
+| VIC0 / VIC1 | `0x38E00000` / `+0x1000` | `hw/intc/pl192.c` (de serie) | 64 líneas. El despachador del retailOS vive en IRAM (`0x22004DA0`), lee los dos bancos **sin condición cruzada** y sirve una interrupción por entrada |
+| Timers | `0x3C700000` | `ipod_classic_timer.c` | 8 canales; A–D de 16 bits en IRQ 8, E–H de 32 bits en IRQ 7. **Sólo modo intervalo**; PCLK se trata como ECLK y se avisa por `-d unimp` si alguien lo selecciona |
+| Reloj / PLL | `0x3C500000` | `ipod_classic_clk.c` | `SWRCON` reinicia de verdad, `RSTSR`, `PLLMOD2`, y `PLLLOCK` reporta bloqueados los PLL que `PLLMODE` habilitó |
+| I²C0 + PCF50635 | `0x3C600000` | `ipod_classic_i2c.c`, `ipod_classic_pmu.c` | Transacción completa con **estado y control en registros distintos** (`IICCON[13:8]` / `IICSTA2[13:8]`), byte de **25 µs virtuales**, fichero de registros del PMU, ADC, e INT1..6 de lectura-limpia. **Sin alarma, sin carga, sin reguladores** |
+| ATA + DMA | `0x38700000` | `ipod_classic_ata.c` | El puente de Apple, no un *task file* directo: leer un registro arranca un ciclo cuyo resultado aparece en `ATA_PIO_RDATA`. Lee de verdad. Sólo el bit 0 de `ATA_IRQSTAT`; los demás son `INDETERMINADO` |
+| **Compositor** | `0x38900000` | `ipod_classic_disp.c` | **Lo que dibuja.** Cinco descriptores de capa en `+0x058 + k*0x18`. Guarda y **no honra** las tablas de gamma, la matriz de color, el escalador y el bit de rotación: en todos los arranques medidos son la identidad |
+| Panel LCD | `0x38300000` | `ipod_classic_lcd.c` | 320×240 RGB565, ventana `0x2A`/`0x2B`, escritura tras `0x2C`, `qemu_console`, y los registros `+0x70..+0x8C` del motor de trama. Compone en `gfx_update`, que es **decisión de modelado** y está dicho en el código |
+| DMAC0 / DMAC1 | `0x38200000` / `0x39900000` | `hw/dma/pl080.c` (de serie) | IRQ 16 y 17, **memoria del sistema como puerto maestro** porque el huésped programa los canales con el alias cacheado mientras la CPU corre sobre el no cacheado. Ventana de 4 KB, para que el resto siga cayendo al suelo de E/S |
+| Click wheel | `0x3C200000` | `ipod_classic_wheel.c` | IRQ 23, los dos formatos de paquete, cinco botones y la rueda por teclado, con el ritmo que exige el decodificador del firmware. Ventana de 4 KB |
+| GPIO | `0x3CF00000` | `ipod_classic_gpio.c` | **Un pin modelado**, el 86, que la tarea de almacenamiento traduce a «hay disco». Los demás leen cero |
+| Generador | `0x3C100000` | `ipod_classic.c` | LCG sembrado por el huésped. Identidad `INFERIDA`, contrato de tres registros verificado, y **sin bit de habilitación** — condicionar el «dato listo» cuelga el arranque |
+| UART0 | `0x3CC00000` | `hw/char/exynos4210_uart.c` (de serie) | IRQ 24 |
+| Bloque de parámetros del bootrom | `0x2203FF00` | `ipod_classic.c` | Los **tres** campos que el arranque lee: id de hardware (`19`, o el firmware se reinicia a `"softupdt"`), base y tamaño de DRAM. Los otros ocho quedan a cero a propósito |
+| Semihosting de ARM | — | `ipod_classic.c` | Encendido por defecto. **Es como el retailOS imprime sus panics** |
+
+**Lo que no está**: audio (I²S y CS42L55), USB (OTG, host, function y PHY), NAND
+(FMC/ECC), CE-ATA sobre SDCI, el DSP CalmADM2E, el RTC, el ADC, el SPI y su NOR,
+el motor AES y el SHA-1 del propio SoC, el controlador de interrupciones
+externas (EIC, que el firmware programa y que nunca dispara), y la bootrom.
+
 ## Diferencias respecto al S5L8720 (iPod Touch 2G)
 
 Lo que **se mantiene** entre las dos generaciones y por tanto se puede portar
@@ -161,8 +220,26 @@ Resuelto en el doc 08:
   (modelo de freemyipod), sin reconciliar. El remap posterior a IRAM0 existe pero
   no se conoce el registro que lo controla.
 - **Volcado público de la bootrom**: no confirmado; hay que volcarla del hierro.
+  **Y no se puede por USB**: [10](10-classic6g-emcore.md) §4 lo comprueba.
 - **UARTs**: 1 controlador, **4 puertos**, stride `0x4000`. Consola en el puerto 0.
 - **Bloque `WHEEL`**: registros y secuencia de init documentados (y `mikey-6g.c`
   no tiene nada que ver — es el mando de los auriculares por I²C).
 - **NOR SPI**: en SPI0 (`0x3C300000`), 1 MiB, layout SysCfg / NOR boot IM3 /
-  ficheros "flsh" documentado.
+  ficheros "flsh" documentado. Volcada del aparato real:
+  `assets/classic6g/bootflash_nor_1MB.bin`, y su entrada `HwVr` en el offset
+  `0x5c` es lo que confirma el id de hardware `19` que el firmware exige.
+
+Y lo que **sigue** sin saberse, después de haber arrancado el firmware entero:
+
+- **Qué es el pin 86 del GPIO en la placa.** Lo que hace en el firmware de
+  Apple está verificado; lo que hay al otro lado del pin, no.
+- **Los bits de `WHEELCON` uno a uno**, el `0x3A980` de `WHEELDIV`, los bits 1
+  y 2 de `WHEELPEND`/`WHEELMASK`, y por qué el hardware real acepta **las dos**
+  codificaciones de `WHEELTX` (la de Rockbox y la de Apple). Ninguno hace falta.
+- **Los registros `0x3830007C` y `0x38300088` del bloque de LCD**, que el
+  retailOS escribe antes de tocar nada que Rockbox nombre.
+- **Si `LCD +0x70` engancha un cuadro o sólo habilita el barrido.**
+- **El significado de los bits 2 y 8 de `LCD_STATUS`**: ningún driver los mira.
+- **El resto del mapa de `0x38900000`**: lo que hay documentado son los
+  veintisiete sitios de la imagen que cargan ese literal más lo que
+  `DISPTRACE=1` vio; el bloque puede tener más.

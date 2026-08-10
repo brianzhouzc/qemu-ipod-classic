@@ -1,5 +1,30 @@
 # Qué se reaprovecha de qemu-ios
 
+> **Documento de planificación, histórico (10 de agosto de 2026).** Se escribió
+> antes de modelar nada. La máquina `-M iPod-Classic` ya arranca el retailOS de
+> Apple, y conviene decir **qué se reutilizó de verdad**, porque no se parece a
+> lo que hay debajo:
+>
+> - **Se reutilizó tal cual, y sin tocar una línea**: los dos VIC (`hw/intc/pl192.c`),
+>   los dos DMAC (`hw/dma/pl080.c`) y la UART (`hw/char/exynos4210_uart.c`).
+>   Tres aciertos de esta tabla, y el de los PL080 resultó ser **la pieza que
+>   destrabó el arranque con disco**.
+> - **Se intentó reutilizar y salió mal**: `ipod_touch_clock.c`. Coincide con el
+>   S5L8702 hasta `0x4c` **por casualidad**, y contestaba a `SWRCON`, `RSTSR` y
+>   `PLLMOD2` con `hw_error()`, que no es un log sino un `abort()` del proceso.
+>   Se reescribió (`e7f8bfaf3`).
+> - **Todo lo demás se escribió de cero**: I²C y PMU, ATA con DMA, panel LCD,
+>   GPIO, timers, click wheel y el compositor de vídeo. No por gusto, sino
+>   porque el S5L8702 los tiene distintos y porque **tres de esos bloques no
+>   están en ninguna fuente externa** — el compositor de `0x38900000`, el
+>   generador de `0x3C100000` y los registros del motor de trama del LCD sólo
+>   existen en el código de Apple.
+>
+> La lección, que es la del bit de estado que nunca llega: **un modelo prestado
+> que decodifica *casi* el mismo mapa es peor que no tener modelo**, porque
+> falla en las direcciones que el mapa nuevo añadió y lo hace de la forma más
+> ruidosa posible.
+
 > **Aviso: ya existe un modelo del S5L8702 en QEMU.**
 >
 > `github.com/freemyipod/qemu`, rama **`s5l8702-dev`**, contiene un modelo

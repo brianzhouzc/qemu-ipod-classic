@@ -10,6 +10,12 @@ Los otros documentos dicen **cómo es** el hardware
 ([07](07-pp502x-hardware.md)) y **en qué estado está** el trabajo
 ([04](04-roadmap.md)). Este dice **cómo se averiguó**, y qué costó.
 
+> El documento hermano, para el iPod classic 6G, es
+> [12-historia-6g.md](12-historia-6g.md). Varias lecciones de aquí se volvieron
+> a pagar allí — el bit de estado que nunca llega, «cero no es desconocido
+> inofensivo», y sobre todo el `HI_IRQ`, que reapareció como el interruptor de
+> bloqueo del PMU.
+
 ## Cómo leer esto
 
 Cada afirmación lleva el hash del commit donde se hizo y, cuando el resultado

@@ -1,8 +1,18 @@
 # iPod Video (5G/5.5G) — el aparato real
 
 Hardware disponible físicamente, volcado el 2026-08-06. A diferencia del
-Classic 6G, **su firmware no está cifrado**, lo que lo convierte en el único
-camino realista hacia arrancar el sistema operativo original de Apple.
+Classic 6G, **su firmware no está cifrado**, lo que lo convirtió en el camino
+realista hacia arrancar el sistema operativo original de Apple.
+
+> **Ya no es el único** (10 de agosto de 2026). El firmware del Classic 6G
+> también está cifrado y aun así arranca: no hizo falta descifrarlo aquí, sino
+> **pedírselo al propio aparato**, que tiene la clave GID en el silicio y su
+> motor AES accesible por USB bajo emCORE. Ver
+> [10-classic6g-emcore.md](10-classic6g-emcore.md) y
+> [12-historia-6g.md](12-historia-6g.md). La comparación de entropía de más
+> abajo sigue siendo correcta y sigue siendo la prueba de cinco segundos que hay
+> que hacer antes de planificar nada — sólo que la respuesta «esto está
+> cifrado» ya no cierra la puerta.
 
 ## Identificación
 

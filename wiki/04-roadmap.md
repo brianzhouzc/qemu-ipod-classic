@@ -1,19 +1,27 @@
 # Roadmap
 
+> **Estado a 10 de agosto de 2026: las dos máquinas arrancan el firmware
+> original de Apple y las dos se navegan.** Este documento es el más largo y el
+> más cercano a un diario, y por tanto el que más se queda atrás. Las secciones
+> anteriores a «Estrategia» son el recorrido del iPod Video 5G y siguen siendo
+> válidas. La parte del Classic, desde «Estrategia» hasta el final, se escribió
+> cuando su firmware era ilegible: **está corregida al final**, en
+> [«Estado actual»](#estado-actual-10-de-agosto-de-2026), y la crónica completa
+> está en [12-historia-6g.md](12-historia-6g.md).
+
 ## Dos objetivos, dos máquinas
 
 El proyecto arrancó apuntando al **iPod classic 6G** (S5L8702) y se topó con que
 su firmware está cifrado con una clave que vive en el silicio. Al aparecer un
 **iPod Video 5G** físico, cuyo firmware está en claro, el objetivo de arrancar
-el sistema original de Apple se movió allí.
+el sistema original de Apple se movió allí. Después, el bloqueo del Classic cayó
+por un camino que no era el previsto: **no había que extraer la clave, sino
+pedirle al aparato que descifrara** ([10](10-classic6g-emcore.md)).
 
 | Máquina | SoC | Estado |
 |---|---|---|
-| `iPod-Classic` | S5L8702 | ejecuta código, timers e interrupciones verificados |
+| `iPod-Classic` | S5L8702 | **arranca el retailOS de Apple**: kernel RTXC, ATA con DMA, volumen `rsrc` montado, tipografías, y la pantalla de idioma — 75 463 de 76 800 píxeles — que la rueda mueve y el botón central atraviesa |
 | `iPod-Video` | PP5022C | **Rockbox se navega entero, y el retailOS de Apple también: arranca, dibuja su interfaz y responde a la rueda y a los botones** |
-
-El trabajo del Classic sigue intacto y es reaprovechable si algún día
-conseguimos un `osos` descifrado.
 
 ## iPod Video (PP502x) — estado
 
@@ -1053,6 +1061,17 @@ detalles están en [07-pp502x-hardware.md](07-pp502x-hardware.md).
 
 ## Estrategia (iPod classic 6G)
 
+> **Superada, y por un camino que no era éste.** La estrategia de abajo daba el
+> `osos` por inabordable y proponía arrancar Rockbox primero. Lo que pasó fue
+> otra cosa: el 9 de agosto de 2026 **el propio aparato descifró su firmware**
+> con su motor AES por USB (`b71d16f3d`,
+> [10-classic6g-emcore.md](10-classic6g-emcore.md)), así que el retailOS pasó de
+> ser el hito especulativo H7 a ser lo primero que se arrancó — y **Rockbox
+> sobre el S5L8702 nunca llegó a probarse**. El párrafo de abajo se conserva
+> porque su segunda mitad sigue siendo cierta y fue exactamente lo que ocurrió:
+> los drivers de Rockbox fueron la especificación ejecutable contra la que se
+> validó cada periférico.
+
 El `osos` de Apple está cifrado con la clave GID del SoC
 (ver [01-firmware-ipsw.md](01-firmware-ipsw.md)), así que no es un objetivo
 inicial razonable. **El primer objetivo es arrancar Rockbox**, que es open
@@ -1062,13 +1081,26 @@ S5L8702 y se carga en `0x08000000` — exactamente igual que el `osos`.
 Ventaja de rebote: los drivers de Rockbox son la especificación ejecutable
 contra la que validar cada periférico que modelemos.
 
+> Y hubo una tercera fuente que la estrategia no preveía y que resultó
+> imprescindible: **el desensamblado del propio retailOS**. Los bloques que
+> ninguna fuente externa nombra —el compositor de `0x38900000`, el generador de
+> `0x3C100000`, los registros del motor de trama del LCD— sólo se pudieron
+> modelar leyendo el código de Apple. Rockbox dice cómo es el hardware; Apple
+> dice qué partes de ese hardware hay que hacer funcionar de verdad.
+
 ## Hitos
 
 > **Estos hitos son los del iPod classic 6G (S5L8702)**, que fue el objetivo
-> original. H3 en adelante están parados: no por falta de plan, sino porque el
-> firmware del Classic está cifrado y no hay nada real que arrancar. El trabajo
-> que sí llegó a alguna parte es el del iPod Video, y no sigue esta numeración
-> — su recorrido es todo lo anterior de este documento.
+> original.
+>
+> **Corregido el 10 de agosto de 2026.** Aquí ponía que «H3 en adelante están
+> parados… porque el firmware del Classic está cifrado y no hay nada real que
+> arrancar». Ya no. **H3, H4 y H5 están hechos, y H7 —el hito marcado como
+> especulativo— también, aunque por otra vía**: no hizo falta modelar el motor
+> AES ni volcar la bootrom, porque descifró el aparato. Lo que sigue sin hacerse
+> es **H2b (arrancar Rockbox en esta máquina, que nunca se intentó)** y **H6
+> (audio)**. Los criterios de éxito de abajo se conservan tal cual se
+> escribieron, con una nota de qué pasó realmente en cada uno.
 
 ### H0 — Infraestructura ✅
 - [x] Clonar `devos50/qemu-ios`, crear rama `ipod_classic_6g`
@@ -1158,7 +1190,7 @@ bootrom ocupa esa dirección primero y el alias solo aparece tras un remap, como
 en el S5L8720. Hasta que haya un volcado de bootrom que lo aclare, si se pasa
 una bootrom esta se queda con la dirección.
 
-### H2b — Arrancar Rockbox
+### H2b — Arrancar Rockbox ❌ nunca se intentó
 - [ ] Toolchain: `apt install gcc-arm-none-eabi` sirve para nuestros tests, pero
       Rockbox quiere `arm-elf-eabi-gcc` de `tools/rockboxdev.sh`
 - [ ] Compilar el bootloader de Rockbox para ipod6g
@@ -1166,57 +1198,128 @@ una bootrom esta se queda con la dirección.
 
 **Criterio de éxito:** ver la salida de depuración de Rockbox por serie.
 
-### H3 — Pantalla
-- [ ] Controlador LCD en `0x38300000` + ventanas en `0x39200000` (IRQ 14)
-- [ ] Scanout 320×240 RGB565 a `ui/console`
+> **Sigue abierto, y ahora es barato.** Al descifrarse el `osos`, este hito dejó
+> de ser un paso intermedio y se quedó sin hacer. Merecería la pena igualmente:
+> Rockbox y el retailOS ejercitan **conjuntos disjuntos** del hardware — es la
+> lección del bit 26 del 5G — así que arrancarlo encontraría agujeros que el
+> firmware de Apple no toca. Por ejemplo, Rockbox **sí** empuja el cuadro por
+> DMAC0 hacia `LCD_WDATA` (`lcd-s5l8702.c:172`), un camino que este modelo
+> nunca ha ejercitado porque Apple usa el compositor.
+
+### H3 — Pantalla ✅ (por otro bloque)
+- [x] Controlador LCD en `0x38300000` — es un puerto de órdenes tipo MPU/8080,
+      no un motor de barrido
+- [x] Scanout 320×240 RGB565 a `ui/console`
+- [ ] Ventanas en `0x39200000` (IRQ 14) — **el retailOS apenas las toca**
 
 **Criterio de éxito:** el logo o el menú de Rockbox aparece en la ventana SDL.
 
-### H4 — Entrada
-- [ ] Click wheel en `0x3C200000` (IRQ 23), mapeado a teclado/rueda del ratón
-- [ ] GPIO de botones
+> **Cumplido con el retailOS, no con Rockbox, y la pieza no era la que ponía
+> aquí.** Los píxeles no salen del bloque de LCD ni de `0x39200000`: salen de
+> **`0x38900000`, un compositor que ninguna fuente externa nombra** y que este
+> plan no podía prever. El bloque de LCD sólo fija la ventana y presenta.
+> Medido: **75 463 de 76 800 píxeles, 404 colores**, y la imagen mirada. Ver
+> [11](11-classic6g-retailos.md) §13.
+
+### H4 — Entrada ✅
+- [x] Click wheel en `0x3C200000` (IRQ 23), mapeado a teclado
+- [x] GPIO — un pin, el 86, que es el que la interfaz espera
 
 **Criterio de éxito:** navegar por el menú de Rockbox.
 
-### H5 — Almacenamiento
-- [ ] Controlador ATA en `0x38700000` (IRQ 29), respaldado por un archivo de
-      imagen de disco
-- [ ] Alternativa/complemento: CE-ATA sobre SDCI en `0x38b00000` (IRQ 44)
+> **Cumplido con el retailOS.** La rueda mueve el resaltado (**8 000 píxeles por
+> giro sobre un suelo de ruido de 0**) y el botón central entra en la pantalla
+> siguiente (**50 540 píxeles**), en el idioma que estaba resaltado.
+> `sh tools/ipod_classic/navtest.sh` lo comprueba y decide. **MENU todavía no
+> vuelve atrás**, y ése es el hito que falta. Ver [11](11-classic6g-retailos.md)
+> §17.
+>
+> Y la mitad del trabajo no era la rueda: el despachador de teclas del retailOS
+> consulta el **interruptor de bloqueo del PMU** y tiraba todos los botones en
+> silencio. El giro no pasa por ahí, así que el fallo parecía de la rueda.
+
+### H5 — Almacenamiento ✅
+- [x] Controlador ATA en `0x38700000` (IRQ 29), con **DMA**, respaldado por un
+      archivo de imagen de disco
+- [ ] Alternativa/complemento: CE-ATA sobre SDCI en `0x38b00000` (IRQ 44) — no
+      hace falta, el retailOS usa el ATA paralelo
 
 **Criterio de éxito:** Rockbox monta el FAT32 del disco y reproduce un archivo.
 
-### H6 — Audio
+> **Cumplido con el retailOS**, y la parte que costó no fue el ATA: sus dos
+> lecturas por DMA terminaban desde el principio. Lo que faltaba era **DMAC0**,
+> un PL080 que QEMU ya traía, y sin el cual un `memcpy` posterior dormía para
+> siempre en un semáforo sin *timeout*. El retailOS monta la partición `rsrc`
+> como volumen 4 y lee sus tipografías de `\Resources\Fonts\`. Ver
+> [11](11-classic6g-retailos.md) §14.
+
+### H6 — Audio ❌
 - [ ] I²S en `0x3CA00000` + códec CS42L55 por I²C
 
-### H7 (especulativo) — el OS de Apple
-- [ ] Modelar el motor AES en `0x38c00000` con la clave GID del S5L8702
-- [ ] Bootrom del S5L8702 (hace falta un volcado)
-- [ ] Descifrar y arrancar `osos`
+> Sigue sin hacerse, en las dos máquinas. **No suena nada.**
+
+### H7 (especulativo) — el OS de Apple ✅ (y no como estaba previsto)
+- [ ] ~~Modelar el motor AES en `0x38c00000` con la clave GID del S5L8702~~
+- [ ] ~~Bootrom del S5L8702 (hace falta un volcado)~~
+- [x] **Descifrar y arrancar `osos`**
 
 Este hito depende de material que ahora mismo no tenemos. Se replantea cuando
 lleguemos.
 
-## Estado actual (2026-08-09)
+> **Y se replanteó solo.** Ninguno de los dos primeros puntos hizo falta:
+> - **El AES no hay que modelarlo**, porque quien descifra es el aparato real.
+>   El `osos` sale en claro por USB en 1,2 s con emCORE (`b71d16f3d`).
+> - **La bootrom no hay que volcarla**, y además **no se puede**: tras el
+>   arranque devuelve una constante por banco de 16 KiB
+>   ([10](10-classic6g-emcore.md) §4). En su lugar la máquina reproduce a mano
+>   el bloque de parámetros que dejaba en lo alto de IRAM1 — tres campos, y ni
+>   uno más.
+>
+> Es el hito que estaba marcado como especulativo y fue el primero que se
+> cumplió. La crónica está en [12-historia-6g.md](12-historia-6g.md).
 
-> **Corregido.** Aquí ponía *"En H0 completo, empezando H1"*, que era la última
-> línea del documento y llevaba unos 50 commits sin tocarse. Contradecía a la
-> tabla de hitos de este mismo fichero (H0, H1 y H2 están ✅) y a la tabla de
-> estado de la cabecera.
+## Estado actual (10 de agosto de 2026)
 
-**iPod Video 5G (`iPod-Video`, PP5022C)** — es la máquina que arranca software
-real, y va muy por delante de lo que describen los hitos H0–H7:
+> **Corregido dos veces.** Primero decía *"En H0 completo, empezando H1"*, que
+> llevaba unos 50 commits sin tocarse. Después decía que el Classic *"no arranca
+> firmware real y no lo hará mientras el `osos` siga cifrado"*, y eso dejó de ser
+> cierto el 9 de agosto por la tarde. Esta línea final del documento es el sitio
+> que más veces se ha quedado atrás: si tocas algo, empieza por aquí.
+
+**iPod Video 5G (`iPod-Video`, PP5022C)** — va muy por delante de lo que
+describen los hitos H0–H7, que son los del Classic:
 
 - **Rockbox** arranca hasta el menú y se navega con la rueda.
 - **El retailOS de Apple** arranca, dibuja su interfaz y se navega: pantalla de
   idioma → menú principal → submenú de *Videos* → atrás.
 - Lo que falta: **audio** (ni I²S ni códec), **USB**, y ejecutar de verdad el
-  firmware del VideoCore, del que hoy sólo se modela el protocolo.
+  firmware del VideoCore, del que hoy sólo se modela el protocolo. Y **la rueda
+  no mueve el resaltado en la pantalla de idioma**, medido y no diagnosticado.
 
-**iPod classic 6G (`iPod-Classic`, S5L8702)** — H0, H1 y H2 completos: ejecuta
-código, con timers y una ruta de interrupción verificados de extremo a extremo
-contra tests bare-metal. **No arranca firmware real** y no lo hará mientras el
-`osos` siga cifrado con una clave que vive en el silicio. H3–H7 siguen abiertos
-y son reaprovechables si aparece un `osos` descifrado; ver también
-[08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md), porque
-`freemyipod/qemu` ya tiene un modelo del S5L8702 bastante más completo que el
-nuestro.
+**iPod classic 6G (`iPod-Classic`, S5L8702)** — **arranca el retailOS original
+de Apple y se navega.** H0, H1, H2, H3, H4, H5 y H7 hechos; H2b (Rockbox) nunca
+se intentó y H6 (audio) sigue sin hacerse.
+
+- Catorce bloques de periférico con comportamiento de verdad (más el PMU detrás
+  del I²C), listados en [02-s5l8702-hardware.md](02-s5l8702-hardware.md). Los
+  otros 24 son `create_unimplemented_device()`.
+- La pantalla de selección de idioma: **75 463 de 76 800 píxeles, 404 colores**,
+  entre 22 y 30 s de reloj de pared. `sh tools/ipod_classic/navtest.sh` la
+  arranca, la mueve con la rueda y **decide**.
+- **Lo que falta, en orden**: (1) **MENU no vuelve atrás**, y la tecla llega
+  entera hasta la cola del EventManager, así que lo que falta está por encima de
+  la capa de entrada; (2) el **panel derecho no cambia al girar**, lo que apunta
+  al `TimerEventManager`; (3) audio, USB, NAND y CE-ATA.
+- **Sin disco no hay imagen**, y es del huésped: no hay ninguna tipografía
+  dentro de la imagen del firmware.
+
+Ver también [08-s5l8702-fuentes-externas.md](08-s5l8702-fuentes-externas.md):
+`freemyipod/qemu@s5l8702-dev` tiene un modelo del S5L8702 con **más bloques**
+que el nuestro (AES, SHA, JPEG, NAND, SPI, watchdog, USB). Dos diferencias que
+conviene tener presentes antes de compararlos: su máquina **arranca desde una
+bootrom**, que es lo que aquí no se puede volcar
+([10](10-classic6g-emcore.md) §4), y su lista de dispositivos **no incluye
+`0x38900000`**, que es el bloque del que salen los píxeles en este árbol.
+
+La crónica completa de cómo se llegó hasta aquí, con las hipótesis que
+resultaron falsas, está en [12-historia-6g.md](12-historia-6g.md).
