@@ -278,7 +278,6 @@ struct IPodClassicWheelState {
 
     /* What the last packet we sent said, so we do not repeat ourselves. */
     uint32_t sent_buttons;
-    bool sent_touched;
 
     QEMUTimer *tick;
     uint32_t key_step;

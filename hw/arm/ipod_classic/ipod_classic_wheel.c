@@ -163,7 +163,6 @@ static void wheel_send_event(IPodClassicWheelState *s)
 {
     wheel_fifo_push(s, wheel_event_packet(s));
     s->sent_buttons = s->buttons;
-    s->sent_touched = s->touched;
 }
 
 /*
@@ -498,7 +497,6 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->pending_steps = 0;
     s->untouch_at = 0;
     s->sent_buttons = 0;
-    s->sent_touched = false;
     s->irq_level = false;
     timer_del(s->tick);
     qemu_set_irq(s->irq, 0);
@@ -566,6 +564,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_UINT32(fifo_len, IPodClassicWheelState),
         VMSTATE_UINT32(position, IPodClassicWheelState),
         VMSTATE_UINT32(buttons, IPodClassicWheelState),
+        VMSTATE_UINT32(sent_buttons, IPodClassicWheelState),
         VMSTATE_BOOL(touched, IPodClassicWheelState),
         VMSTATE_BOOL(armed, IPodClassicWheelState),
         VMSTATE_INT32(pending_steps, IPodClassicWheelState),
