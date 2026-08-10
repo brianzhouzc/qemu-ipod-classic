@@ -546,15 +546,31 @@ Y de ahí hacia abajo, cada eslabón es otra parada real:
 0x0823d420     el sondeo de almacenamiento: reserva 4096 B, LBA 0
 0x0823d52c       bl 0x0827aad0                       <- CON DISCO NO VUELVE
 0x0827aad0         bl 0x0827a3f8 ; blx [r0+8]        <- vuelve (r0 = 0)
-0x0827ab10         bl 0x0827aa1c                     <- AQUÍ SE PARA
+0x0827ab10         bl 0x0827aa1c -> 0x0827a980       ; leer y clasificar LBA 0
+0x0827a9ac           blx r3 -> 0x080aea1c            <- AQUÍ SE PARA
+                       r0 = 0x8be5d3e0 (alias sin caché de 0x0be5d3e0),
+                       r2 = 1  -> "léeme UN bloque"
+0x080aea1c             blx [[0x08966004+4]+0 +0x0c]  ; el read del almacenamiento
 ```
 
-`0x0827aa1c` es el que interpreta el mapa de particiones sobre el búfer de 4096
-bytes que acaba de leerse de LBA 0. **Ese es el obstáculo concreto de hoy**, y
-es el mismo con disco a ceros, con `A.img` (MBR de 512 bytes, partición de
+`0x0827a980` es corto y lo dice todo: llama al read, y si vuelve con cero mira
+`buf+0x1FE` buscando `0xAA55` (→ `0x080aee04`, parser de MBR) y si no `buf+0`
+buscando `0x4552` `'ER'` (→ `0x080a38cc`, parser de Apple Partition Map). **Nunca
+llega a mirar.**
+
+Y lo que hace que esto sea un hallazgo y no un callejón: **la lectura sí
+ocurre**. `ATATRACE=1` enseña la orden `0xC8`, `ATA_TBUF_START = 0x0be5d3e0`,
+`ATA_TBUF_SIZE = 0x1000`, la transferencia, el huésped leyendo `ATA_IRQSTAT`,
+reconociéndola con un uno y parando el motor con `ATA_COMMAND = 2`. El disco
+entrega, la interrupción llega y el huésped la acusa — y aun así la llamada de
+lectura no vuelve. **El agujero está entre «el DMA terminó» y «despierta a quien
+lo pidió»**, no en el ATA.
+
+Es el mismo punto con disco a ceros, con `A.img` (MBR de 512 bytes, partición de
 firmware real y FAT32 con `iPod_Control`) y con `E.img` (MBR en unidades de
-4096): las tres se paran en el mismo sitio, y las tres dan trazas de ATA
-idénticas de 682 líneas.
+4096): las tres se paran ahí, y las tres dan trazas de ATA idénticas de 682
+líneas. El contenido del disco sigue sin importar, y ahora se sabe por qué:
+nadie llega a mirarlo.
 
 ### Lo que se arregló por el camino: GPIO pin 86
 
@@ -584,11 +600,12 @@ verificado arriba.
 
 ### El obstáculo concreto que queda
 
-> **Con disco, `0x0827aa1c` — el intérprete del mapa de particiones — no
-> vuelve.** Se le llama con el búfer de 4096 bytes leído de LBA 0. Todo lo que
-> hay aguas arriba y aguas abajo está comprobado y funciona: el ATA entrega, los
-> proveedores de recursos están montados, el contenedor empotrado está en RAM, el
-> panel dibuja lo que se le mande y la ventana se fija bien.
+> **Con disco, la lectura de un bloque de LBA 0 (`0x080aea1c`, llamada desde
+> `0x0827a9ac`) no vuelve nunca, aunque el DMA de ATA se completa y el huésped
+> acusa la interrupción.** Todo lo demás está comprobado y funciona: el ATA
+> entrega los bytes, los proveedores de recursos están montados, el contenedor
+> empotrado está en RAM, el panel dibuja lo que se le mande y la ventana se fija
+> bien.
 
 Lo que se sabe del ATA en ese momento (`ATATRACE=1`, disco a ceros, `A.img` y
 `E.img`: **las tres trazas son idénticas, 682 líneas**):
@@ -605,10 +622,15 @@ Lo que se sabe del ATA en ese momento (`ATATRACE=1`, disco a ceros, `A.img` y
   `0x0827aad0`, y por eso el camino sin disco no se bloquea: **se bloquea el que
   encuentra un disco, no el que no lo encuentra.**
 
-Lo primero que hay que hacer mañana es entrar en `0x0827aa1c` con
-`gdbpoke.py` y ver en qué se para: si es un giro sobre un registro que no
-modelamos, si espera otra lectura que nunca pide, o si está bloqueado en un
-objeto del kernel.
+Lo primero que hay que hacer mañana es entrar en `0x080aea1c` con `gdbpoke.py`
+—`blx [[0x08966004+4]+0 +0x0c]`, dos o tres niveles más— y averiguar en qué
+objeto del kernel se queda dormida la petición. La sospecha, `INFERIDO`: la
+notificación de fin de transferencia no llega a la tarea que la espera. Dos
+cosas que descartar primero, las dos baratas: que la línea de interrupción del
+ATA (`S5L8702_ATA_IRQ`) esté en el VIC que el firmware ha desenmascarado, y que
+`0x0823d420` no esté esperando además una segunda interrupción del bloque de
+ATA que el modelo no genera (el modelo sólo levanta `ATA_IRQSTAT` bit 0, desde
+INTRQ del núcleo IDE; qué hacen los demás bits es `INDETERMINADO`).
 
 `INFERIDO`, y hay que comprobarlo antes de creérselo: si eso se destraba, se
 monta un volumen; si el volumen es la partición `rsrc` del `.ipsw`, aparece
