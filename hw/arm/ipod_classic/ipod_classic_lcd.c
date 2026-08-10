@@ -49,6 +49,7 @@
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
+#include "hw/arm/ipod_classic/ipod_classic_disp.h"
 
 /*
  * INSTRUMENTATION ONLY -- LCDTRACE=1 in the environment prints every access to
@@ -475,6 +476,31 @@ static void ipod_classic_lcd_gfx_update(void *opaque)
 {
     IPodClassicLCDState *s = opaque;
 
+    /*
+     * Ask the display pipe for a frame before showing anything.
+     *
+     * WHY HERE and not only on the "go" write to +0x70. The retailOS writes
+     * +0x70 = 1 once per boot with a disk attached (MEASURED: LCDTRACE reports
+     * one frame-engine start in 45 seconds) and then keeps re-pointing the
+     * layer descriptors as the user interface animates, without touching +0x70
+     * again. So +0x70 is not a per-frame trigger on this path, and a model that
+     * only composed there would show one stale frame. Composing at refresh time
+     * is the behaviour of an engine that scans its layers out continuously,
+     * which is what the register set looks like -- but it IS a modelling
+     * choice, not a measurement, and it is the one to revisit if the display
+     * ever looks a frame behind.
+     *
+     * Nothing composes when no layer has a source address, so the panel's own
+     * image memory -- and with it tools/ipod_classic/lcdtest.S, the control
+     * case that proves this panel works -- behaves exactly as before.
+     */
+    if (s->disp && ipod_classic_disp_compose(s->disp, s->fb,
+                                             S5L8702_PANEL_WIDTH,
+                                             S5L8702_PANEL_HEIGHT)) {
+        s->composed_frames++;
+        s->dirty = true;
+    }
+
     if (!s->dirty) {
         return;
     }
@@ -513,6 +539,7 @@ static void ipod_classic_lcd_reset(DeviceState *dev)
     s->fr_unk7c = 0;
     s->fr_hold = 0;
     s->fr_unk88 = 0;
+    s->composed_frames = 0;
 
     memset(s->fb, 0, sizeof(s->fb));
     s->win_x0 = 0;

@@ -22,6 +22,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_ata.h"
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
 #include "hw/arm/ipod_classic/ipod_classic_gpio.h"
+#include "hw/arm/ipod_classic/ipod_classic_disp.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 
@@ -66,6 +67,12 @@
 #define USB_HC_MEM_BASE   0x38600000   /* USB_HC_BASE */
 #define ATA_MEM_BASE      0x38700000   /* ATA_BASE, the hard disk */
 #define USB_FC_MEM_BASE   0x38800000   /* USB_FC_BASE */
+/*
+ * Not in s5l87xx.h and not in freemyipod's model: the display pipe. Named from
+ * Apple's own code -- see ipod_classic_disp.h, which carries the whole register
+ * map and how each line of it was found.
+ */
+#define DISP_MEM_BASE     0x38900000
 #define ATA_UNK_MEM_BASE  0x38A00000   /* ATA_UNKNOWN_BASE */
 #define SDCI_MEM_BASE     0x38B00000   /* SDCI_BASE, CE-ATA */
 #define AES_MEM_BASE      0x38C00000   /* AES_BASE */
@@ -201,6 +208,7 @@ typedef struct {
     IPodClassicI2CState *i2c0;
     IPodClassicATAState *ata;
     IPodClassicLCDState *lcd;
+    IPodClassicDispState *disp;
     Clock *sysclk;
     bool semihosting;
     /*

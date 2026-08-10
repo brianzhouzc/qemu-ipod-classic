@@ -25,6 +25,7 @@
 #include "sysemu/reset.h"
 #include "hw/qdev-clock.h"
 #include "hw/arm/exynos4210.h"
+#include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/sysbus.h"
@@ -256,7 +257,7 @@ static const struct { const char *name; hwaddr base; hwaddr size; }
 ipod_classic_unimplemented[] = {
     { "s5l8702.sha1",     SHA1_MEM_BASE,     0x100000 },
     { "s5l8702.miu",      MIU_MEM_BASE,      0x100000 },
-    { "s5l8702.dmac0",    DMAC0_MEM_BASE,    0x100000 },
+    /* DMAC0 and DMAC1 are real PL080s now; see the machine init. */
     { "s5l8702.usb-otg",  USBOTG_MEM_BASE,   0x100000 },
     { "s5l8702.sm1",      SM1_MEM_BASE,      0x100000 },
     { "s5l8702.usb-hc",   USB_HC_MEM_BASE,   0x100000 },
@@ -267,7 +268,6 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.adm-sfr",  ADM_SFR_MEM_BASE,  0x100000 },
     { "s5l8702.lcd-win",  LCD_WIN_MEM_BASE,  0x100000 },
     { "s5l8702.fmc",      FMC_MEM_BASE,      0x100000 },
-    { "s5l8702.dmac1",    DMAC1_MEM_BASE,    0x100000 },
     { "s5l8702.eic",      EIC_MEM_BASE,      0x100000 },
     { "s5l8702.int",      INT_MEM_BASE,      0x100000 },
     { "s5l8702.ecc",      ECC_MEM_BASE,      0x100000 },
@@ -534,6 +534,76 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, LCD_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_LCD_IRQ));
+
+    /*
+     * The two DMA controllers, and this is what unblocks a boot with a disk.
+     *
+     * They are PrimeCell PL080s. Two independent sources say so and they agree:
+     * Rockbox names them ("2 PL080 DMA controllers" at 0x38200000 and
+     * 0x39900000, firmware/target/arm/s5l8702/dma-s5l8702.h:33-36), and the
+     * register offsets the retailOS actually drives match pl080.h to the byte
+     * -- +0x04 INTTCSTS, +0x08 INTTCCLR, +0x30 CONFIG, channels at
+     * base + 0x100 + (ch << 5).
+     *
+     * WHY IT MATTERS, measured: after the ATA driver's two DMA reads complete
+     * -- and they do complete, the ATA interrupt fires and its RTXC semaphore
+     * is signalled -- the caller does a memcpy through DMAC0 channel 0
+     * (0x2200844c, 0x1000 bytes) and then sleeps on the channel's semaphore in
+     * 0x22008600 with KS_wait and NO timeout. Only DMAC0's terminal-count ISR
+     * (registered at 0x080357f4 on IRQ 16, entry 0x22002810) can wake it. With
+     * the block unimplemented that interrupt never came, so every boot with a
+     * disk parked the storage task for ever and the volume was never mounted.
+     *
+     * Two details that are easy to get wrong:
+     *  - the region is 0x1000, not 0x100000, so the rest of the 1 MB block
+     *    still falls to the io floor and -d unimp will say so if the guest
+     *    reaches for it;
+     *  - the master port has to be system memory, because the guest programs
+     *    the channel with the CACHED alias (0x0be55320) while the CPU runs on
+     *    the uncached one (0x8be55320). Both have to land on the same DRAM.
+     */
+    dev = qdev_new(TYPE_PL080);
+    object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, DMAC0_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_DMAC0_IRQ));
+
+    dev = qdev_new(TYPE_PL080);
+    object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, DMAC1_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_DMAC1_IRQ));
+
+    /*
+     * The display pipe at 0x38900000. No external source names this block; the
+     * whole register map in ipod_classic_disp.h comes from Apple's own code.
+     * It holds the panel geometry (+0x214 = 0x013f00ef, i.e. 319 and 239), the
+     * three layer descriptors, nine source-address slots and three 256-entry
+     * gamma tables, and the retailOS programs 793 distinct addresses in it on
+     * every boot attempt.
+     *
+     * It was create_unimplemented_device() until now, and that was not a
+     * neutral choice: six functions in the osos read-modify-write +0x008 and
+     * one reads +0x200 back, so a zero readback silently threw away every
+     * field written before it. Honest readback is the first thing this device
+     * buys, before any question of composing a frame.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_DISP);
+    nms->disp = IPOD_CLASSIC_DISP(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, DISP_MEM_BASE);
+    /*
+     * And this is the wire that finally puts a picture on the screen. The
+     * panel behind the LCD port holds the image, but the retailOS never sends
+     * it a pixel: it composes the frame in this block from layers in DRAM. So
+     * the panel asks the pipe for the frame when it is about to be shown. See
+     * the note in ipod_classic_lcd_gfx_update().
+     */
+    nms->lcd->disp = nms->disp;
 
     /*
      * GPIO. Only one pin is modelled and it is the reason this device exists:

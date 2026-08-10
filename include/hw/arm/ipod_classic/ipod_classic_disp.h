@@ -1,0 +1,224 @@
+/*
+ * S5L8702 display pipe, 0x38900000.
+ *
+ * NO SOURCE WE HAVE NAMES THIS BLOCK. Rockbox's s5l87xx.h does not list it,
+ * freemyipod's model has nothing there, and Rockbox never touches it -- Rockbox
+ * pushes its frame through DMAC0 into LCD_WDATA instead (lcd-s5l8702.c:172).
+ * Everything below comes from disassembling Apple's own osos, and from a
+ * measured boot; where the two disagree the measurement wins and it is said so.
+ *
+ * WHY IT MATTERS. 0x08127f14, the retailOS's "draw the whole screen", ends
+ * with two stores to the LCD frame engine (LCD +0x74 geometry, LCD +0x70 = 1
+ * "go") and no pixel ever goes through the LCD data port. Nothing in the LCD's
+ * own 256-byte window says where that frame comes from. This block does: it has
+ * the panel geometry, three layer descriptors, five-plus source-address slots,
+ * three 256-entry gamma tables and four colour-matrix coefficient tables. It is
+ * the composition engine the LCD frame engine presents.
+ *
+ * ---------------------------------------------------------------- registers
+ *
+ * Every entry below is either (V) verified from a store or load in the osos
+ * whose base register was loaded with the literal 0x38900000 -- the complete
+ * list of those twenty-seven sites is in wiki/11 -- or (M) additionally
+ * confirmed by the value seen in a real boot, or (U) undetermined.
+ *
+ *  +0x000  (M) written 1 by the init path. Meaning UNDETERMINED.
+ *  +0x004  (M) written 1 by 0x0812729c. Meaning UNDETERMINED.
+ *  +0x008  (V,M) THE CONTROL REGISTER. Six different functions do
+ *          read-modify-write on it, one bit field each, which is why leaving
+ *          this block unimplemented was actively harmful: reads returned 0, so
+ *          every RMW threw away every bit set before it.
+ *            bit 0      0x080a508c arg r3 == 1
+ *            bit 1      0x080a511c arg != 0
+ *            bits 2..7  0x081271c8, six selectors (6,5,4,3,2,7 for sel 0..5)
+ *            bit 8      0x080822e8 arg == 0
+ *            bit 15     0x0808dfe4 arg == 1
+ *            bits 17:16 0x080a508c byte arg at sp+10 (1 or 2)
+ *            bit 20     0x080a508c byte arg at sp+9 == 1
+ *            bits 25:24 0x080a508c byte arg at sp+8 (1 or 2)
+ *            bit 28     0x080a508c arg r1 == 1
+ *            bit 29     0x080a508c arg r0 != 0
+ *            bit 30     0x080be518 arg != 0
+ *          MEASURED, diskless boot: the values that reach it are 0x01110001,
+ *          0x00008000, 0x00000100 and 0x40000000 -- each one a single field
+ *          written onto a zero readback. 0x01110001 is exactly what
+ *          0x080a508c(0, 0, {1,1,1}, 1) computes, which is the call the init
+ *          path makes, so the decode above is confirmed end to end.
+ *  +0x00c  (M) 0x000f0f0f from a literal at 0x08127460. UNDETERMINED.
+ *  +0x020  (M) written 1 next to +0x004. UNDETERMINED.
+ *  +0x024  (M) 0x00ffffff. UNDETERMINED.
+ *  +0x030  (V) destination rectangle origin, (y | x << 16)
+ *  +0x034  (V) destination rectangle limit, ((y+h) | (x+w) << 16)
+ *          Both from 0x08127964, the blit entry point.
+ *  +0x038  (V) SOURCE ADDRESS, plane 0   \
+ *  +0x03c  (V) SOURCE ADDRESS, plane 1    |  written together by 0x081276dc
+ *  +0x040  (V) SOURCE ADDRESS, plane 2    |  case 5, the planar-YUV path, for
+ *  +0x044  (V) SOURCE ADDRESS, plane 3   /   pixel formats 8, 9 and 10.
+ *  +0x04c  (V) (dstW | dstH << 16) from 0x08127d8c
+ *  +0x050  (V) (x | y << 16) centring offset, 0x08127e30
+ *  +0x054  (V) (w | h << 16) clipped size, 0x08127e20
+ *  +0x060  (V) SOURCE ADDRESS, slot 0  \
+ *  +0x078  (V) SOURCE ADDRESS, slot 1   |  0x081276dc cases 0..4. Stride 0x18.
+ *  +0x090  (V) SOURCE ADDRESS, slot 2   |  Which slot is used is chosen by the
+ *  +0x0a8  (V) SOURCE ADDRESS, slot 3   |  caller, not by this block.
+ *  +0x0c0  (V) SOURCE ADDRESS, slot 4  /
+ *  +0x0d4  (M) (a | b << 8) from 0x0812793c. UNDETERMINED.
+ *  +0x0d8  (V,M) LAYER 0 config, +0x0dc LAYER 0 (second word)
+ *  +0x0e0  (V,M) LAYER 1 config, +0x0e4 LAYER 1
+ *  +0x0e8  (V,M) LAYER 2 config, +0x0ec LAYER 2
+ *          The config word is built by 0x080b0140 as
+ *          (fmt << 28) | (a << 16) | (b << 12) | c, and the second word is set
+ *          by 0x080a9614 to a plain value. MEASURED: the init path calls
+ *          0x080b0140(i, 0, 0, 1, 0) and 0x080a9614(i, 0) for i in 0..2, so all
+ *          three configs are 0x00001000 and all three second words 0 -- which
+ *          is what the boot trace shows, decode confirmed.
+ *  +0x0f0..+0x17c (V) nine 4-word entries, copied by 0x081276a0
+ *  +0x180..+0x1c4 (V) nine 2-word entries, copied by 0x08127664
+ *  +0x1ec..+0x1fc (V,M) five words copied straight out of a struct by
+ *          0x080bf110. MEASURED 0, 0, 0x10, 0, 0. UNDETERMINED.
+ *  +0x200  (V,M) bit 0 set/cleared by 0x08096eb8; measured 0 then 0x00010080,
+ *          and it is read back three times per boot, so this one is genuinely
+ *          read-modify-write and genuinely read.
+ *  +0x204  (M) 2.       +0x208 (M) 0.      +0x20c (M) 2.
+ *  +0x210  (M) 0x00010110.
+ *  +0x214  (M) 0x013f00ef -- (319 << 16) | 239, THE PANEL GEOMETRY, to the
+ *          pixel. Nothing else in this block is as unambiguous.
+ *          Which instruction writes +0x200..+0x214 is UNDETERMINED: no
+ *          pc-relative literal in the image resolves to a base that reaches
+ *          them, so the base arrives in a register from somewhere we have not
+ *          traced. The values are measured, the writer is not identified.
+ *  +0x31c..+0x360 (V) nine 2-word entries, copied by 0x081275ec
+ *  +0x364..+0x3a8 (V) nine 2-word entries, copied by 0x08127628
+ *  +0x3ac  (V,M) 0x080bcef8 builds it as
+ *          (w << 20) | (h << 8) | (c << 2) | (d << 1) | e, and 0x08127f54 calls
+ *          it with (64, 64, 0, 0, 0) -> 0x04004000, which is exactly what the
+ *          boot writes. Bit 0 is read back by the blit at five places and
+ *          swaps width for height everywhere it is tested, so bit 0 is
+ *          "rotated 90 degrees". INFERRED from that use, not from a datasheet.
+ *  +0x400..+0x7fc (M) 256-entry gamma/palette table, channel 0
+ *  +0x800..+0xbfc (M) channel 1
+ *  +0xc00..+0xffc (M) channel 2
+ *          0x0806fe9c is the writer and 0x08127268 builds the argument as
+ *          tbl[i] = i * 4 for i in 0..255, so what the boot loads is the
+ *          identity ramp, left-shifted by two. MEASURED: all 768 words, value
+ *          == index * 4, in all three tables.
+ *
+ * Nothing above +0xfff was touched in a whole diskless boot, so the window is
+ * 4 KB and the rest of the 1 MB block still falls to the machine's io floor,
+ * where -d unimp will report it if that ever stops being true.
+ *
+ * WHAT THIS MODEL DOES NOT DO, and it is the whole open question: compose.
+ * A boot that never gets a volume mounted never writes a source address into
+ * any of the nine slots above -- MEASURED, zero writes to +0x038..+0x0c0 in a
+ * 40-second diskless boot -- so there is nothing to compose from and no amount
+ * of modelling here will produce a pixel. Set DISPTRACE=1 to watch for the
+ * first source address that ever arrives.
+ */
+
+#ifndef HW_ARM_IPOD_CLASSIC_DISP_H
+#define HW_ARM_IPOD_CLASSIC_DISP_H
+
+#include "hw/sysbus.h"
+#include "qom/object.h"
+
+#define TYPE_IPOD_CLASSIC_DISP "s5l8702.disp"
+OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
+
+/* The window we answer for. Everything above this falls to the io floor. */
+#define S5L8702_DISP_MEM_SIZE   0x1000
+#define S5L8702_DISP_NREG       (S5L8702_DISP_MEM_SIZE / 4)
+
+/*
+ * THE FIVE LAYER DESCRIPTORS, and this is what puts pixels on the panel.
+ *
+ * 0x08126ffc..0x0812716c is one function with a five-way switch on the layer
+ * index; every arm writes the same six registers at base 0x058 + k * 0x18:
+ *
+ *   +0x00  source stride in bytes            (r2 = bpp * srcW / 2 ... see below)
+ *   +0x04  (align << 24) | (fmt << 8) | ...  bit 16 set when NOT 32 bpp
+ *   +0x08  SOURCE ADDRESS, already advanced to the first visible pixel
+ *   +0x0c  (W << 16) | H          destination size
+ *   +0x10  W * bytes-per-pixel / 4          (a cross-check, not used here)
+ *   +0x14  (X << 16) | Y          destination position
+ *
+ * VERIFIED against a real boot with a disk. Layer 0:
+ *   +0x058 = 0x00000500 (1280 = 320 * 4), +0x05c = 0x00000700 (fmt 7, and bit
+ *   16 clear so 32 bpp), +0x060 = 0x09767a24, +0x064 = 0x014000f0 (320 x 240),
+ *   +0x06c = 0. Layer 1:
+ *   +0x070 = 0x00000280 (640 = 320 * 2), +0x074 = 0x02010300 (fmt 3, bit 16
+ *   set so 16 bpp), +0x078 = 0x0be2326c, +0x07c = 0x006c00f0 (108 x 240),
+ *   +0x084 = 0x00d40000 (x = 212, and 212 + 108 = 320 exactly).
+ *
+ * The bytes-per-pixel table comes from the switch at 0x08126f90, which maps the
+ * format field to a multiplier r1 in {1, 2, 4, 8} and then computes the stride
+ * as r1 * srcW / 2 -- so r1 is twice the bytes per pixel:
+ *   fmt 0 -> 4 bpp, fmt 1 -> 8 bpp, fmt 2..5 -> 16 bpp, fmt 6..7 -> 32 bpp.
+ * Both measured layers agree with it to the byte.
+ *
+ * W and H are SIGNED. MEASURED: while the right-hand pane slides off screen the
+ * firmware writes +0x07c = 0xffc900f0, i.e. width -55. Anything with a
+ * non-positive width or height, or an origin off the panel, is not drawn.
+ */
+#define S5L8702_DISP_SLOT_BASE   0x058
+#define S5L8702_DISP_SLOT_STEP   0x018
+#define S5L8702_DISP_NSLOTS      5
+#define S5L8702_DISP_SLOT_STRIDE 0x00
+#define S5L8702_DISP_SLOT_FORMAT 0x04
+#define S5L8702_DISP_SLOT_SRC    0x08
+#define S5L8702_DISP_SLOT_SIZE   0x0c
+#define S5L8702_DISP_SLOT_POS    0x14
+
+/* Named registers, all justified in the comment above. */
+#define S5L8702_DISP_UNK00      0x000
+#define S5L8702_DISP_UNK04      0x004
+#define S5L8702_DISP_CONTROL    0x008
+#define S5L8702_DISP_UNK0C      0x00c
+#define S5L8702_DISP_DST_ORIGIN 0x030
+#define S5L8702_DISP_DST_LIMIT  0x034
+#define S5L8702_DISP_SRC_PLANE0 0x038
+#define S5L8702_DISP_SRC_PLANE3 0x044
+#define S5L8702_DISP_DST_SIZE   0x04c
+#define S5L8702_DISP_DST_OFF    0x050
+#define S5L8702_DISP_DST_CLIP   0x054
+#define S5L8702_DISP_SRC_SLOT0  0x060
+#define S5L8702_DISP_SRC_STRIDE 0x018
+#define S5L8702_DISP_NSLOT      5
+#define S5L8702_DISP_LAYER0     0x0d8
+#define S5L8702_DISP_LAYER_STEP 0x008
+#define S5L8702_DISP_NLAYER     3
+#define S5L8702_DISP_STATUS200  0x200
+#define S5L8702_DISP_GEOMETRY   0x214
+#define S5L8702_DISP_FORMAT     0x3ac
+#define S5L8702_DISP_GAMMA0     0x400
+
+/* Control-register bit that the blit path reads back. See +0x3ac above. */
+#define S5L8702_DISP_FORMAT_ROT 0x1
+
+struct IPodClassicDispState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;
+
+    /*
+     * A flat register file. Readback is the point: six functions in the osos
+     * read-modify-write +0x008 and one reads +0x200, and with the block
+     * unimplemented every one of those read zero and destroyed whatever the
+     * previous caller had set.
+     */
+    uint32_t reg[S5L8702_DISP_NREG];
+
+    /* Scratch for one source row, biggest case: 320 pixels at 32 bpp. */
+    uint8_t rowbuf[320 * 4];
+};
+
+/*
+ * Composite whatever the layer descriptors currently point at into a 320x240
+ * RGB565 image, which is what the panel behind the LCD port holds. Returns
+ * true if anything was drawn. Called by the LCD device, because on this SoC the
+ * panel's image memory is what the user finally sees -- see ipod_classic_lcd.c.
+ */
+bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
+                               unsigned width, unsigned height);
+
+#endif

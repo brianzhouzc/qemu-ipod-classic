@@ -701,6 +701,10 @@ config IPOD_CLASSIC_6G
      select PL192
      select UNIMP
      select PTIMER
+     # The two DMA controllers really are PrimeCell PL080s: Rockbox says so
+     # (firmware/target/arm/s5l8702/dma-s5l8702.h:33) and the register map the
+     # retailOS drives matches pl080.h offset for offset.
+     select PL080
      # I2C0 carries the PCF50635 power management unit, which the retailOS
      # talks to before anything else.
      select I2C

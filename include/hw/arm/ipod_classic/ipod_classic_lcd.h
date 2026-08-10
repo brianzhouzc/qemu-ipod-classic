@@ -150,8 +150,19 @@ struct IPodClassicLCDState {
     bool display_on;
     bool dirty;
 
+    /*
+     * The display pipe at 0x38900000, or NULL. On this SoC the pixels do not
+     * come through this port at all -- the retailOS pushes zero of them -- they
+     * are composed by that block and pushed into the panel's image memory by
+     * the frame engine at +0x70. So the panel asks it for a frame. Set by the
+     * machine; see ipod_classic_disp.h for what the block is and how it was
+     * found.
+     */
+    struct IPodClassicDispState *disp;
+
     /* Counters, for the trace only. */
     uint64_t pixels_this_frame;
+    uint64_t composed_frames;
 };
 
 #endif /* HW_ARM_IPOD_CLASSIC_LCD_H */
