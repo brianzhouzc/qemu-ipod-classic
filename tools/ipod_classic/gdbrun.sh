@@ -14,6 +14,8 @@ OSOS=$ROOT/assets/classic6g/osos_decrypted.bin
 pkill -9 -f qemu-system-arm 2>/dev/null || true
 sleep 1
 
+mkdir -p "$HOME/6g"   # the stderr file below lives here; set -e trips without it
+
 DRIVE=""
 [ "$DISK" != "none" ] && DRIVE="-drive if=ide,format=raw,file=$DISK"
 

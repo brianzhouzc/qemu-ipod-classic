@@ -206,6 +206,76 @@ dirección de origen en los 256 bytes de la ventana, y no hay DMA apuntándole.
 El modelo lo acepta, lo cuenta y declara `+0x8C` libre, que es lo que ya hacía
 la ventana sin implementar; la diferencia es que ahora lo dice en voz alta.
 
+Dos cosas están verificadas y acotan la búsqueda:
+
+- **La ventana de 256 bytes basta.** Con el LCD modelado en `0x38300000..0xFF` y
+  el resto del bloque cayendo al *io floor* de la máquina, un arranque sin disco
+  de 25 s no produce **ni un solo** acceso a `0x383000xx` por encima de `0xFF`
+  (`-d unimp`, cero coincidencias de `addr 0x383`). Así que el registro de
+  origen no está en el bloque de LCD.
+- **Tampoco es DMAC0.** Ningún valor `0x38300040` aparece nunca en el log de
+  `-d unimp`; los únicos destinos que DMAC0 recibe son `0x3ca00010` (FIFO de
+  I²S) y descriptores en `0x22008c5c`/`0x22010020`. Rockbox **sí** empuja el
+  cuadro por DMAC0 (`lcd-s5l8702.c:172`, `dstperi = S5L8702_DMAC0_PERI_LCD_WR`);
+  Apple no. Apple usa el motor de `+0x70`, y ésa es toda la diferencia.
+
+### La secuencia completa de "pinta un cuadro", desensamblada
+
+`0x08127f14` es la función entera, y explica por qué salen cero píxeles sin que
+nada falle:
+
+```asm
+08127f14: push {r3,r4,r5,lr}
+08127f1c: bl 0x8015710          ; (0x2080, 0, 1)
+08127f30: bl 0x8127268
+08127f3c: str r0,[r4,#0x78]     ; LCD[0x78] = 0x0005000a
+08127f54: bl 0x80bcef8          ; (64,64,0,0,0) -> escribe 0x389003AC
+08127f58: ldr r0,[0x089115e4]   ; el registro de driver de panel
+08127f64: cmp r0,#0 ; beq +     ; <- comprobación de nulo
+08127f84: blx [r0+0x0c]         ; (0,0,0,320,240)   <- EL DIBUJADO
+08127f8c: str r0,[r4,#0x74]     ; LCD[0x74] = 0x014000f0
+08127f94: str r0,[r4,#0x70]     ; LCD[0x70] = 1     <- "presenta"
+```
+
+Medido con el monitor (`xp /1wx 0x089115e4`): vale **`0x08911fe0`**, o sea **no
+es nulo**, y `[0x08911fe0 + 0x0c] = 0x080c1164`, que es justo la función que la
+cabecera de `ipod_classic_lcd.c` identifica como el `displaylcd_setup()` de
+Rockbox. Es decir: **el retailOS sí llama a "dibuja la pantalla entera", y lo
+único que esa llamada emite es `0x2A`, `0x2B`, `0x2C` y ocho bytes de
+parámetro.** Igual que en Rockbox: `displaylcd_setup()` sólo fija la ventana. Lo
+que en Rockbox viene después es `displaylcd_dma()`; lo que en Apple viene
+después es `LCD[0x70] = 1`. Los píxeles nunca pasan por la CPU en ninguno de los
+dos casos.
+
+### El candidato serio para el origen: `0x38900000`
+
+Una auditoría posterior retiró el «descartado» que llevaba este bloque. La
+prueba que lo descartaba era «ningún registro recibe un valor con pinta de
+dirección de DRAM», que es cierta pero no dice lo que parecía decir. Lo que hay
+ahí, medido en un arranque sin disco de 25 s con `-d unimp`, son **793
+direcciones distintas escritas**, y dos de ellas son inconfundibles:
+
+| Registro | Valor | Qué es |
+|---|---|---|
+| `+0x400` … `+0xFFC` | `valor == offset - 0x400`, o sea `0,4,8,…,0x3FC` | **768 palabras = 3 × 256: una tabla de gamma/paleta identidad.** Sólo un camino de vídeo escribe eso |
+| `+0x214` | `0x013f00ef` | **exactamente la geometría del panel**, `(319<<16)|239` |
+| `+0x208` | `0` | escrito justo después de la geometría — la forma de un puntero de origen que está a cero |
+| `+0x3AC` | campo de bits de `0x080bcef8(64,64,0,0,0)` | configuración |
+| `+0x0d4..0xEC` | `1`, `0x1000` | |
+| `+0x0E0` | `0x50004000` (desde `0x081459d4`) | `INDETERMINADO` |
+
+Y el código que lo maneja es **el mismo** que maneja el motor de trama del LCD:
+de los dieciocho literales `0x38900000` de la imagen, catorce están en
+`0x08127xxx`, la misma función que escribe `LCD[0x74]` y `LCD[0x70]`.
+
+- Que `0x38900000` sea el bloque de composición/salida de vídeo del que el motor
+  de `+0x70` toma el cuadro: **`INFERIDO`**, con las dos medidas de arriba a
+  favor y ninguna en contra.
+- Que `+0x208` sea la dirección de origen: **`INFERIDO`**, sin confirmar.
+- El siguiente experimento barato: mapear `0x38900000` como un dispositivo de
+  verdad (hoy cae al *io floor*), registrar quién escribe `+0x208` y con qué, y
+  ver si en algún arranque llega a valer algo distinto de cero.
+
 ### El panel, que sí está modelado
 
 `ipod_classic_lcd.c` lleva una memoria de 320×240 en RGB565, ventana con
@@ -441,7 +511,7 @@ almacenamiento funciona.
 | "La partición de firmware tiene que estar en LBA 0" | Con la imagen `Firmware-24.9.1.2` cruda en el sector 0, y `]ih[` verificado en `0x100`, las mismas dos lecturas |
 | "El disco es demasiado pequeño" | Con 64 MB, 289 MB, 512 MB y 80 GB: las mismas dos lecturas |
 | "Está bloqueado en el DMA de ATA" | Lo estuvo, y ya no: las transferencias terminan y el huésped acusa la interrupción |
-| "Está bloqueado en el LCD" | Lo estuvo, y ya no; ahora sólo toca el bloque dos veces y para |
+| "Está bloqueado en el LCD" | Lo estuvo, y ya no; ahora, **con disco**, toca el bloque exactamente cinco veces y para (`LCDTRACE=1`: `+0x00 = 0x80000000`, `+0x00 = 0x80100db1`, `+0x88`, `+0x20`, `+0x7c`, todas desde `0x080afaf4`) — no dos, como decía la versión anterior de esta línea |
 | "El click wheel lo tiene parado" | Lo sondea ~123 veces/s desde una tarea periódica (medido: 3071 lecturas en 20 s, 6770 en 50 s); no es un giro bloqueante |
 
 ### Lo siguiente que hay que averiguar
@@ -455,8 +525,11 @@ dice directamente qué tareas hay y en qué están bloqueadas.
 
 Candidatos por descartar, en orden de coste:
 
-1. El bloque `0x38900008`, que la máquina no mapea y que el retailOS lee y
-   escribe cientos de veces en el camino de error. `INDETERMINADO`.
+1. El bloque `0x38900000`, que la máquina sólo cubre con el *io floor* (así que
+   lee cero y tira las escrituras) y que el retailOS escribe en 793 direcciones
+   distintas en el camino de error. **Ya no es `INDETERMINADO` del todo: lleva
+   una tabla de gamma identidad de 768 palabras y la geometría del panel. Ver
+   §3.** Es el primer candidato de la lista, no el último.
 2. GPIO de verdad: hoy devuelve cero a todo. `PDAT(11)` bit 1 = 0 elige ATA
    paralelo, que es lo que queremos, pero `PDAT(6)` (tipo de panel) y
    `PDAT(10)` (auriculares) también leen cero y puede que no deban.
@@ -568,9 +641,18 @@ lo pidió»**, no en el ATA.
 
 Es el mismo punto con disco a ceros, con `A.img` (MBR de 512 bytes, partición de
 firmware real y FAT32 con `iPod_Control`) y con `E.img` (MBR en unidades de
-4096): las tres se paran ahí, y las tres dan trazas de ATA idénticas de 682
-líneas. El contenido del disco sigue sin importar, y ahora se sabe por qué:
-nadie llega a mirarlo.
+4096): las tres se paran ahí. El contenido del disco sigue sin importar, y ahora
+se sabe por qué: nadie llega a mirarlo.
+
+> **Matiz de auditoría, porque la frase original decía «trazas idénticas de 682
+> líneas» y eso es más de lo que se puede afirmar.** Repetido con `ATATRACE=1`
+> sobre una imagen a ceros y otra con MBR válido: **680 líneas cada una y una
+> sola diferencia**, `ATA_TBUF_START` (`+0x3c`), que sale `0x0be5d3c0` en una y
+> `0x0be5d3e0` en la otra. Y no es el contenido del disco: la misma imagen a
+> ceros da `0x0be5d3e0` en una carrera bajo `gdbpoke` y `0x0be5d3c0` en otra sin
+> depurador. Hay **variación de carrera a carrera** en dónde cae ese búfer, así
+> que «idénticas» hay que leerlo como «iguales salvo la dirección del búfer».
+> La conclusión no cambia; la palabra «idénticas» sí era demasiado fuerte.
 
 ### Lo que se arregló por el camino: GPIO pin 86
 
@@ -759,10 +841,52 @@ ejecuta en `0x00000000`, no en `0x22000000`, y el manejador de Data Abort está
 en **`0x00003400`** (`[0x22000010] = 0xEA000CFA`). Poner el breakpoint en
 `0x22003400` no dispara nunca.
 
+## 12. Auditoría independiente (agosto de 2026)
+
+Todo lo de arriba se volvió a medir desde cero. Lo que **se confirma**:
+
+| Afirmación | Cómo se comprobó |
+|---|---|
+| El panel dibuja | `lcdtest.S` → `screendump` → 76 800/76 800 píxeles, 1920 colores, y **mirando la imagen**: una rampa roja en X y verde en Y con el corte en x=256 que el `and #0x1f` del test predice |
+| El retailOS da 0 píxeles, con disco y sin él | `screendump` + `pixcount.py` en las dos configuraciones |
+| Con disco no hay ninguna excepción escondida | 40 s de `-d int` = 33 838 `Taking exception 5 [IRQ]` y nada más; `R15 = 0x22003b20`, SVC |
+| Sin disco, ciclo de caída | 28 `CPU_exception_handler` + 28 `SWRCON` en 25 s de stderr |
+| Cero píxeles por el puerto de datos | `LCDTRACE=1`: 29 arranques × (3 CMD + 8 parámetros), `0 were pixels` |
+| …y **no** es un artefacto del modelo | `-d guest_errors` no da **ni un** «Invalid access»: no hay escrituras de 8/16 bits al LCD que el filtro de `valid.min_access_size = 4` esté tirando |
+| El bloqueo con disco está en `0x080aea1c` | `gdbpoke.py`, dos *breakpoints*: `0x0827a9ac` para una vez (`r0=0x8be5d3e0`, `r2=1`, `r3=0x080aea1c`, `lr=0x0827a994`), `0x080aea1c` para una vez (`lr=0x0827a9b0`) y en 120 s no vuelve a parar ninguno |
+| Nadie llega a mirar el sector | `-d in_asm` con disco: `0x080aee04` (parser de MBR) y `0x080a38cc` (parser de APM) = **0** bloques |
+| `0x0805712c`, `0x0815b1b8`, `0x08239658` no se ejecutan con disco | `-d in_asm`, y las cuatro direcciones verificadas como prólogos (`e92d….` = `push`) antes de creerse el cero |
+| GPIO pin 86 | `0x08325584` desensamblado: `[GPIO_BASE + ((pin>>3)<<5) + 4] >> (pin&7)`, y `0x080aeca4` es `mov r0,#86; bl 0x8325584`. `GPIOTRACE=1` con disco: `rd +0x144 -> 0x40`, o sea pin 86 = 1 |
+| `"Resources/Fonts"` en `0x08380628` | leído del fichero |
+| `aupd_decrypted.bin` no toca el LCD | `LCDTRACE=1`: cero accesos |
+| Sin regresión en el 5G | `navtest.sh`: 76 548 px en los 7 fotogramas, el resaltado se mueve (12 312, 12 114, 31 632) |
+
+Lo que **se corrige**:
+
+1. «Con disco sólo toca el bloque de LCD dos veces» → son **cinco escrituras**
+   (§6).
+2. «Las tres imágenes dan trazas de ATA idénticas de 682 líneas» → 680 líneas y
+   una diferencia, y la diferencia es ruido de carrera, no del disco (§9).
+3. La cabecera de `ipod_classic_gpio.h` decía que el pin 86 era «toda la razón»
+   por la que un arranque con disco no dibujaba. **No lo es**, y la propia §9 ya
+   lo decía: el anuncio se tira después en `0x080b2ce8` porque `[0x08911ad8]`
+   sigue a cero (verificado a los 45 s con `xp /1wx`). Corregido en la cabecera.
+4. `0x38900000` estaba dado por descartado con la prueba «ningún registro recibe
+   una dirección de DRAM». Es el bloque con la tabla de gamma identidad y la
+   geometría del panel: **el mejor candidato que hay** para el origen del motor
+   de trama. Retirado el descarte y escrito en §3.
+5. La afirmación «de dónde lee el motor de `+0x70` es indeterminado» era
+   correcta pero se paró demasiado pronto: `0x08127f14` estaba a ocho
+   instrucciones de las dos que sí se documentaron, y enseña que el objeto de
+   dibujado **no es nulo** y que la llamada de dibujado **sí ocurre** (§3).
+
 ## 11. Ficheros de esta tanda
 
 | Ruta | Qué es |
 |---|---|
+| `tools/ipod_classic/findlit.py` | dónde está un literal de 32 bits en la imagen, en VA, y qué `ldr rX,[pc,#imm]` lo cargan |
+| `tools/ipod_classic/audit_run.sh` | arranca el retailOS, hace `screendump` y resume stderr |
+| `tools/ipod_classic/audit_peek.sh` | arranca, espera y lee palabras de memoria física por el monitor |
 | `hw/arm/ipod_classic/ipod_classic_lcd.c` | ahora con panel: memoria 320×240 RGB565, ventana, `0x2A/0x2B/0x2C`, `qemu_console`, y los registros `+0x70..+0x8C` del motor de trama |
 | `hw/arm/ipod_classic/ipod_classic_gpio.c` | GPIO. Un solo pin modelado, el 86, y la razón está en la cabecera |
 | `tools/ipod_classic/gdbpoke.py` | cliente del protocolo remoto de GDB: breakpoints, registros, memoria, saltos |

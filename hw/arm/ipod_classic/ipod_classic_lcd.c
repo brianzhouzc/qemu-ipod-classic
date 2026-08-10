@@ -188,7 +188,13 @@ static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
     if (s->cur_x >= s->win_x1) {
         s->cur_x = s->win_x0;
         if (s->cur_y >= s->win_y1) {
-            s->cur_y = s->win_y0;   /* the panel wraps, like the real part */
+            /*
+             * Wrap back to the top of the window. INFERRED, not measured: it
+             * is what ILI934x-family parts do, and no guest we have ever
+             * overruns the window, so nothing in this tree can tell it apart
+             * from clamping.
+             */
+            s->cur_y = s->win_y0;
         } else {
             s->cur_y++;
         }
@@ -244,11 +250,23 @@ static void panel_data(IPodClassicLCDState *s, uint32_t value)
  */
 static void panel_frame_go(IPodClassicLCDState *s, uint32_t value)
 {
-    lcd_frame_starts++;
     if (value == 0) {
         return;
     }
-    if (lcd_trace_on() || lcd_frame_starts <= 4) {
+    /*
+     * Counted here, after the zero-write filter, so the number printed by
+     * lcd_trace_totals() is starts and not writes to +0x70. Every +0x70 write
+     * measured so far is a 1, so the two agree today; they would not if the
+     * driver ever cleared the bit.
+     */
+    lcd_frame_starts++;
+    /*
+     * Instrumentation only, and gated on LCDTRACE on purpose: stderr is the
+     * channel the guest firmware itself talks on (it prints
+     * "CPU_exception_handler" there through semihosting), and lesson 1 of
+     * wiki/09-historia-5g.md is to keep that channel readable.
+     */
+    if (lcd_trace_on()) {
         fprintf(stderr, "LCDTRACE  frame engine started (+0x70 = 0x%x), "
                 "geometry +0x74 = 0x%08x (%ux%u), window %u,%u..%u,%u, "
                 "%" PRIu64 " pixels have arrived through the data port since "
@@ -319,6 +337,12 @@ static uint64_t ipod_classic_lcd_read(void *opaque, hwaddr offset,
         return s->fr_unk88;
 
     case S5L8702_LCD_FR_GO:
+        /*
+         * CONVENIENCE VALUE, not a measurement: no guest we have traced ever
+         * reads +0x70, so nothing constrains this. Zero means "not running",
+         * which is the only answer consistent with the frame engine finishing
+         * inside the store that started it.
+         */
         return 0;
 
     case S5L8702_LCD_FR_STATUS:

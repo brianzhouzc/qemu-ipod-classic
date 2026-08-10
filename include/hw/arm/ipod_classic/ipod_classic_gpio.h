@@ -30,11 +30,19 @@
  *   mov r0,#4 ; bl 0x080b2ce8                    ; post {r1} to queue 4
  *
  * MEASURED with a disk attached: the first three guards return 0 and the
- * fourth returns 0 as well, because GPIO was create_unimplemented_device() and
- * read as zero. So the mount message was never posted, 0x08122a04 never set the
- * volume-ready byte at [obj+0x28], and 0x081228c4 -- "while (!ready) wait();"
- * -- parked the UI task for ever. That is the whole reason a boot with a disk
- * reached the RTXC idle loop and never drew.
+ * fourth returned 0 as well, because GPIO was create_unimplemented_device() and
+ * read as zero. So the guard chain posted "no media" when a disk was in fact
+ * attached, which is plainly wrong and is what this device fixes. MEASURED
+ * after the fix: GPIOTRACE shows PDAT(10) -> 0x40, i.e. pin 86 reads 1, and the
+ * message becomes type 0.
+ *
+ * NECESSARY, NOT SUFFICIENT, and the earlier version of this note overstated
+ * it. Fixing the pin does NOT make a boot with a disk draw: 0x080b2ce8
+ * dispatches the announcement through [0x08911ad8], which is still 0 at 45 s
+ * (measured through the monitor, "xp /1wx 0x08911ad8"), so the message is
+ * dropped. The boot still parks in "while (!ready) wait();" at 0x081228c4 and
+ * still screendumps 0 lit pixels. See wiki/11-classic6g-retailos.md sec.9 for
+ * what actually blocks it.
  *
  * What pin 86 is CALLED is UNDETERMINED: Rockbox does not name it and no
  * datasheet we have covers it. What it DOES in Apple's firmware is verified
@@ -49,8 +57,16 @@
  *                 selects panel type 0, whose driver record is 0x08911fe0 and
  *                 whose command set is the 8-bit one -- consistent with the
  *                 LCD_CON = 0x80000c21 the guest actually writes. Leave at 0.
- *   PDAT(11)   -> read about 1200 times per 30 s by a periodic task. Leaving
- *                 it 0 is what the machine has always done.
+ *   PDAT(11)   -> read 2130 times in 30 s with no disk but only 8 times in 30 s
+ *                 with one (measured with GPIOTRACE=1; the diskless figure is
+ *                 inflated by the reboot cycle, which repeats the probe on
+ *                 every attempt). Leaving it 0 is what the machine has always
+ *                 done.
+ *
+ * GPIOCMD, +0x200, is written about 850 times in a diskless boot and is NOT
+ * modelled: the writes are logged and dropped, exactly as they were when this
+ * window was an unimplemented device. What it does is UNDETERMINED; Rockbox
+ * names the register (s5l87xx.h:1426) and nothing more.
  */
 
 #ifndef HW_ARM_IPOD_CLASSIC_GPIO_H
