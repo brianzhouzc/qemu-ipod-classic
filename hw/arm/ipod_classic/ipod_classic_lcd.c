@@ -25,14 +25,19 @@
  *     0x2A {00 00 01 3f} 0x2B {00 00 00 ef} 0x2C.
  *   - 320x240 and RGB565: see the header.
  *
- * What is NOT modelled, and is marked so below: the frame engine at +0x70.
- * Writing 1 there starts something that is meant to move a whole frame, and
- * nothing we have found says where it reads from -- there is no source-address
- * register anywhere in this 256-byte window and, measured over a whole diskless
- * boot, no DMAC0 channel is ever pointed at LCD_WDATA either (the only
- * destination programmed is the I2S FIFO at 0x3CA00010). So +0x70 is accepted,
- * counted and logged, and +0x8C reports "not busy" so the two spin loops at
- * 0x080a4090 and 0x080b0128 terminate. UNDETERMINED, and deliberately loud.
+ * WHERE THE PIXELS COME FROM, which was the open question here for a long time
+ * and is now answered. Not through this port: the retailOS pushes zero pixel
+ * words through it in a whole boot, and no DMA channel is ever pointed at
+ * LCD_WDATA either (Rockbox does that, Apple does not). The frame is composed
+ * by the display pipe at 0x38900000 from layers in DRAM, and the frame engine
+ * at +0x70 is what presents it. So gfx_update asks that block for the frame --
+ * see ipod_classic_disp.h for the whole register map, and the note in
+ * ipod_classic_lcd_gfx_update() for why the ask happens there and not on the
+ * write to +0x70.
+ *
+ * +0x74..+0x8C are still only stored: +0x74 takes the geometry, +0x8C reports
+ * "not busy" so the two spin loops at 0x080a4090 and 0x080b0128 terminate, and
+ * what +0x78, +0x7C, +0x80 and +0x88 mean is still UNDETERMINED.
  *
  * Set LCDTRACE=1 to get every access with its value and the guest PC.
  *

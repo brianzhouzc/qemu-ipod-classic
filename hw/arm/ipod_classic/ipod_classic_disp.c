@@ -220,14 +220,22 @@ static inline uint16_t disp_rgb565(unsigned r, unsigned g, unsigned b)
  *
  * PIXEL ORDER, and this is the one INFERRED thing in the whole path. A 32-bit
  * source word is read as little-endian ARGB8888, i.e. the bytes in memory are
- * B, G, R, A; a 16-bit one as RGB565. Two reasons, and neither is a datasheet:
- *   - those are the standard readings of both formats, and Apple's graphics
- *     stack uses ARGB8888 throughout;
- *   - the selection bar on the language screen comes out 0xff0484da, which
- *     under that reading is #0484da, Apple's iPod selection blue. Read the
- *     other way round it is #da8404, an orange that appears nowhere in this
- *     user interface.
- * If better evidence turns up, it is two lines below and nothing else changes.
+ * B, G, R, A; a 16-bit one as RGB565. The argument, in the order it carries
+ * weight:
+ *   - the panel is RGB565 with red in the high bits. That is not our claim:
+ *     Rockbox's config for this exact device says LCD_PIXELFORMAT RGB565
+ *     (firmware/export/config/ipod6g.h:85). So a 16-bit layer handed to it
+ *     unchanged is RGB565, and read that way the "Welcome" pane really is the
+ *     cool blue-grey gradient the iPod has.
+ *   - the 32-bit layer holds the same artwork, already composited -- the right
+ *     third of it IS that gradient. Only the ARGB8888 reading makes the two
+ *     agree; the other one turns both brown.
+ *   - and then the selection bar comes out 0xff0484da, i.e. #0484da, Apple's
+ *     iPod selection blue. Read the other way round it is #da8404, an orange
+ *     that appears nowhere in this user interface.
+ * It is still an inference: no datasheet, and the pipe does carry colour-matrix
+ * tables it could in principle swizzle with. If better evidence turns up it is
+ * two lines below and nothing else changes.
  */
 static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
                             unsigned width, unsigned height)

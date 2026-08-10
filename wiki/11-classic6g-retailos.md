@@ -16,16 +16,28 @@ saberlo). Las trazas son reproducibles con las órdenes del final.
 | 1. Se carga y ejecuta la primera instrucción | **hecho** |
 | 2. Pasa la inicialización temprana sin colgarse | **hecho** |
 | 3. Inicializa periféricos y llega a su bucle principal | **hecho** — kernel RTXC arrancado, planificador vivo, tarea idle en `0x22003b1c` |
-| 4. Dibuja algo en pantalla | **no** — pero ahora se sabe exactamente qué falta: §9 |
+| 4. Dibuja algo en pantalla | **hecho, con disco** — la pantalla de selección de idioma, 75 463 de 76 800 píxeles. Ver §13 |
 
-> **Agosto de 2026.** La máquina ya tiene panel: `ipod_classic_lcd.c` modela una
-> memoria de imagen de 320×240 RGB565 con ventana y las órdenes `0x2A/0x2B/0x2C`,
-> y la expone por `qemu_console`, así que un `screendump` mide de verdad si hay
-> dibujo. Validado con un caso de control (`tools/ipod_classic/lcdtest.S`):
-> 76 800 de 76 800 píxeles encendidos y 1920 colores distintos, exactamente la
-> rampa que escribe el test. Con el retailOS, **con disco y sin él, el
-> `screendump` sigue dando 0 píxeles encendidos**. La pantalla negra ya no es
-> "no lo sabemos": es una medida.
+> **10 de agosto de 2026 — hay imagen.** Con un disco construido por
+> `mkdisk6g4k.py` a partir del `.ipsw`, el retailOS pinta **su pantalla de
+> selección de idioma**: lista blanca a la izquierda con nueve escrituras
+> distintas (incluidos 日本語 y Ελληνικά), barra de selección azul, batería, y
+> el degradado con «Welcome» a la derecha. `screendump` + `pixcount.py`:
+> **75 463 píxeles encendidos de 76 800, 404 colores**. Y **se ha mirado la
+> imagen**, no sólo el número: es la interfaz de Apple, no basura (§13).
+>
+> **Sin disco sigue dando 0 píxeles**, y eso es del huésped, no del modelo: la
+> interfaz se muere buscando tipografías antes de componer nada (§4).
+
+Hicieron falta tres cosas a la vez, y las tres estaban en la lista de
+sospechosos del §6:
+
+1. **`0x38900000` modelado** — es el compositor de vídeo (§13).
+2. **DMAC0/DMAC1 como PL080 de verdad** — es lo que destraba el arranque con
+   disco (§14). Y corrige el §9: el ATA nunca fue el culpable.
+3. Con esas dos, el volumen `rsrc` se monta, aparecen las fuentes y la interfaz
+   compone. Medido con `-d in_asm`, y son las mismas direcciones que llevaban
+   meses dando cero.
 
 Con `-drive if=ide` el arranque es limpio: cero excepciones, cero reinicios.
 Sin disco entra en un ciclo de caída y reinicio (§4).
@@ -257,6 +269,13 @@ después es `LCD[0x70] = 1`. Los píxeles nunca pasan por la CPU en ninguno de l
 dos casos.
 
 ### El candidato serio para el origen: `0x38900000`
+
+> **RESUELTO, 10 de agosto de 2026 — ver §13.** Era. Es el compositor: cinco
+> descriptores de capa con dirección de origen, stride, formato, tamaño y
+> posición, en `+0x058 + k*0x18`. La sospecha de que `+0x208` fuese el puntero
+> de origen era **falsa** (vale 0 siempre, escrito por `0x08127428`); las
+> direcciones de origen están en `+0x060/78/90/a8/c0` y `+0x038..+0x044`. Lo que
+> sí acertó de lleno fue el método: contar valores y no sólo accesos.
 
 Una auditoría posterior retiró el «descartado» que llevaba este bloque. La
 prueba que lo descartaba era «ningún registro recibe un valor con pinta de
@@ -532,18 +551,22 @@ el depurador interactivo de RTXC, con su REPL (`"RTXCbug> "`, `"Bad command"`,
 retarget completo de semihosting, incluido `SYS_READC`. Si se consigue entrar,
 dice directamente qué tareas hay y en qué están bloqueadas.
 
-Candidatos por descartar, en orden de coste:
+Candidatos por descartar, en orden de coste. **Los números 1 y 4 eran los
+buenos, y hacían falta los dos: ver §13 y §14.**
 
-1. El bloque `0x38900000`, que la máquina sólo cubre con el *io floor* (así que
-   lee cero y tira las escrituras) y que el retailOS escribe en 793 direcciones
-   distintas en el camino de error. **Ya no es `INDETERMINADO` del todo: lleva
-   una tabla de gamma identidad de 768 palabras y la geometría del panel. Ver
-   §3.** Es el primer candidato de la lista, no el último.
+1. ~~El bloque `0x38900000`~~ **RESUELTO (§13): es el compositor.** Lo que la
+   máquina cubría con el *io floor* — leer cero y tirar las escrituras — no era
+   neutral: seis funciones hacen lectura‑modificación‑escritura sobre `+0x008`,
+   así que cada una borraba lo que había puesto la anterior.
 2. GPIO de verdad: hoy devuelve cero a todo. `PDAT(11)` bit 1 = 0 elige ATA
    paralelo, que es lo que queremos, pero `PDAT(6)` (tipo de panel) y
    `PDAT(10)` (auriculares) también leen cero y puede que no deban.
 3. El EIC (`0x39A00000`), que se programa y nunca dispara.
-4. DMAC0 (PL080), que se programa con descriptores en DRAM y nunca completa.
+4. ~~DMAC0 (PL080), que se programa con descriptores en DRAM y nunca completa.~~
+   **RESUELTO (§14), y era la causa del bloqueo con disco.** Esta línea estaba
+   escrita desde el principio y en el último lugar de la lista; el coste de
+   arreglarlo resultó ser el más bajo de los cuatro, porque QEMU ya trae
+   `hw/dma/pl080.c`.
 
 ---
 
@@ -690,6 +713,15 @@ Qué es el pin 86 en la placa: `INDETERMINADO`. Qué hace en el firmware de Appl
 verificado arriba.
 
 ### El obstáculo concreto que queda
+
+> **RESUELTO, 10 de agosto de 2026 — ver §14, y con una corrección de fondo.**
+> El diagnóstico «el agujero está entre *el DMA terminó* y *despierta a quien lo
+> pidió*» señalaba el hueco correcto pero el periférico equivocado: **el ATA no
+> tiene nada que ver**, su ciclo se cierra entero y su semáforo despierta. Quien
+> no vuelve es un `memcpy` posterior por **DMAC0**, que dormía en un semáforo sin
+> *timeout* esperando una IRQ 16 que nadie generaba porque `0x38200000` era
+> `create_unimplemented_device`. Todo lo que sigue en esta sección describe
+> síntomas reales; la conclusión sobre el ATA, no.
 
 > **Con disco, la lectura de un bloque de LBA 0 (`0x080aea1c`, llamada desde
 > `0x0827a9ac`) no vuelve nunca, aunque el DMA de ATA se completa y el huésped
@@ -902,3 +934,249 @@ Lo que **se corrige**:
 | `tools/ipod_classic/gdbrun.sh` | arranca QEMU con `-S -gdb` y lo conduce |
 | `tools/ipod_classic/lcdtest.S` | caso de control del panel: dibuja una rampa de 320×240 |
 | `tools/ipod_classic/pixcount.py` | cuenta píxeles no negros de un `screendump` |
+
+### De la tanda del 10 de agosto (§13, §14)
+
+| Ruta | Qué es |
+|---|---|
+| `hw/arm/ipod_classic/ipod_classic_disp.c` | el compositor de `0x38900000`: registros con lectura honesta, los cinco descriptores de capa y la composición sobre el panel |
+| `include/hw/arm/ipod_classic/ipod_classic_disp.h` | el mapa de registros entero, con la procedencia de cada línea marcada (V) verificado en el desensamblado, (M) además medido, (U) indeterminado |
+| `tools/ipod_classic/ppm2png.py` | convierte un `screendump` a PNG **para mirarlo**, y también lee framebuffers crudos sacados con `pmemsave` (`--raw 320x240:argb8888`) |
+| `hw/arm/ipod_classic/ipod_classic.c` | DMAC0 y DMAC1 pasan a ser `TYPE_PL080` con IRQ 16/17 y la memoria del sistema como puerto maestro |
+
+---
+
+## 13. `0x38900000` es el compositor, y de ahí salen los píxeles
+
+El §3 lo dejó como «el mejor candidato». Lo era. Es el bloque que compone el
+cuadro a partir de capas en DRAM, y el motor de trama del LCD (`+0x70`) sólo lo
+presenta.
+
+### Cómo se pasó de «793 direcciones» a un mapa de registros
+
+Con el bloque cayendo al *io floor* sólo se veía **qué** direcciones recibían
+escrituras. Dos pasos lo abrieron:
+
+1. **Los veintisiete `ldr rX,=0x38900000`.** Un escaneo de todos los `LDR`
+   relativos a PC de la imagen cuyo literal cae en `0x389xxxxx` da 27 sitios
+   para `0x38900000` más cinco bases desplazadas —`0x389000f0`, `0x38900180`,
+   `0x3890031c`, `0x38900364`, `0x38900400`—, y desensamblando esos 27 sale casi
+   todo el mapa. La lista es **completa**, no «lo que apareció».
+2. **La traza con el PC del huésped.** `DISPTRACE=1` imprime cada acceso con
+   `pc~`, y eso encontró lo que el paso 1 no podía: `+0x200..+0x214` se escriben
+   desde `0x081273f8..0x08127428`, que llega al bloque por `r6` y no por un
+   literal propio. Los dos métodos se necesitan.
+
+### El mapa, con la evidencia de cada línea
+
+Todo está en `include/hw/arm/ipod_classic/ipod_classic_disp.h`, registro a
+registro. Lo que importa aquí:
+
+| Registro | Qué es | Cómo se sabe |
+|---|---|---|
+| `+0x008` | registro de control, seis campos de bits | seis funciones distintas hacen lectura-modificación-escritura sobre él |
+| `+0x058 + k*0x18` | **los cinco descriptores de capa**, k = 0..4 | `0x08126ffc..0x0812716c`, un `switch` de cinco ramas que escribe los mismos seis registros |
+| `+0x0d8/+0xe0/+0xe8` | tres configuraciones de capa | `0x080b0140` las construye como `(fmt<<28)\|(a<<16)\|(b<<12)\|c` |
+| `+0x214` | `0x013f00ef` = 319 y 239, **la geometría del panel** | literal en `0x08127468` |
+| `+0x3ac` | `(w<<20)\|(h<<8)\|…`, bit 0 = rotado | `0x080bcef8`, y `0x08127f54` lo llama con `(64,64,0,0,0)` → `0x04004000`, que es exactamente lo que escribe el arranque |
+| `+0x400..+0xffc` | tres tablas de gamma de 256 entradas | `0x08127268` construye `tbl[i] = i*4` y `0x0806fe9c` la escribe |
+
+El descriptor de capa, que es lo que dibuja:
+
+```
++0x00  stride de origen en bytes
++0x04  (align<<24) | (fmt<<8) | ...   bit 16 puesto si NO es de 32 bpp
++0x08  DIRECCION DE ORIGEN, ya avanzada al primer píxel visible
++0x0c  (W<<16) | H     tamaño de destino
++0x10  W * bytes_por_pixel / 4
++0x14  (X<<16) | Y     posición de destino
+```
+
+Y la tabla de bits por píxel sale del `switch` de `0x08126f90`, que convierte el
+formato en un multiplicador `r1 ∈ {1,2,4,8}` y calcula el stride como
+`r1 * srcW / 2` — o sea `r1` es el doble de los bytes por píxel:
+`fmt 0 → 4 bpp, 1 → 8, 2..5 → 16, 6..7 → 32`.
+
+### Lo que un arranque real programa, medido
+
+```
+capa 0: stride 0x500 (1280 = 320*4), fmt 7 (32 bpp), origen 0x09767a24,
+        320x240 en (0,0)
+capa 1: stride 0x280 (640 = 320*2),  fmt 3 (16 bpp), origen 0x0be2326c,
+        108x240 en (212,0)          <- 212 + 108 = 320 al píxel
+```
+
+**Y ahí estaba la imagen todo el tiempo.** `pmemsave 0x09767a24 0x4b000` y
+mirarlo como 320×240 de 32 bits da la pantalla de idioma entera, ya compuesta.
+No había que inventar nada: había que copiarla al panel.
+
+`W` y `H` son **con signo**: mientras el panel derecho se desliza fuera de la
+pantalla el firmware escribe `+0x07c = 0xffc900f0`, o sea anchura −55. Un
+modelo que los lea sin signo dibuja 65 481 columnas de basura.
+
+### El orden de bytes, que es lo único INFERIDO del camino
+
+Se lee la fuente de 32 bits como ARGB8888 *little-endian* (bytes B, G, R, A) y
+la de 16 bits como RGB565. El argumento, por orden de peso:
+
+1. **El panel es RGB565 con el rojo arriba**, y eso no lo decimos nosotros:
+   `firmware/export/config/ipod6g.h:85` de Rockbox dice
+   `#define LCD_PIXELFORMAT RGB565` para este aparato exacto. Luego una capa de
+   16 bits entregada tal cual es RGB565, y leída así el panel «Welcome» es el
+   degradado azul grisáceo que el iPod tiene de verdad.
+2. **La capa de 32 bits lleva el mismo dibujo ya compuesto** — su tercio derecho
+   *es* ese degradado. Sólo la lectura ARGB8888 hace que las dos coincidan; la
+   otra vuelve marrones a las dos.
+3. Y entonces la barra de selección sale `0xff0484da` = **#0484da**, el azul de
+   selección de Apple. Al revés sale #da8404, un naranja que no aparece en
+   ninguna parte de esta interfaz.
+
+Sigue siendo una inferencia — no hay *datasheet*, y el bloque lleva tablas de
+matriz de color con las que podría permutar canales. Son dos líneas de
+`ipod_classic_disp.c` si aparece evidencia mejor.
+
+### Cuándo se compone, y por qué no en `+0x70`
+
+El modelo compone en `gfx_update`, o sea justo antes de enseñar el panel, no al
+escribir `LCD[0x70] = 1`. La razón es una medida: **con disco, `LCDTRACE` cuenta
+un solo arranque del motor de trama en 45 s**, y después la interfaz sigue
+re-apuntando los descriptores de capa durante la animación sin volver a tocar
+`+0x70`. Un modelo que sólo compusiera ahí enseñaría un cuadro congelado.
+
+Es una **decisión de modelado**, no una medida: se comporta como un motor que
+barre sus capas de forma continua, que es a lo que se parece el juego de
+registros. Está dicho en voz alta en `ipod_classic_lcd_gfx_update()` y es lo
+primero que hay que revisar si alguna vez la pantalla va un cuadro por detrás.
+
+### Lo que se guarda pero no se honra
+
+Las tablas de gamma, las cuatro tablas de coeficientes de matriz de color, el
+escalador (`+0x04c/+0x50/+0x54`), el rectángulo de destino (`+0x030/+0x034`) y
+el bit de rotación de `+0x3ac`. **Todos son la identidad en todos los arranques
+medidos** — las tablas de gamma son literalmente `tbl[i] = i*4` —, así que
+honrarlos hoy no cambiaría un píxel y no habría forma de comprobar si están
+bien. Se leen y se devuelven; nada más.
+
+---
+
+## 14. Por qué el arranque con disco estaba parado: DMAC0, no el ATA
+
+**Corrección de fondo al §9.** La frase «el agujero está entre *el DMA terminó*
+y *despierta a quien lo pidió*» apuntaba al sitio correcto pero al periférico
+equivocado. El ATA cierra su ciclo entero: las dos transferencias por DMA
+terminan, la interrupción llega y el semáforo RTXC del ATA se levanta y despierta
+a quien esperaba. Lo que no vuelve nunca es un `memcpy` **posterior**, hecho por
+DMAC0.
+
+La cadena, desensamblada:
+
+```
+0x2200844c   memcpy por DMA (r0 = destino, r1 = origen, r2 = 0x1000)
+  0x22004808.., 0x220049c4.., 0x22004b64..   programa DMAC0 canal 0
+  0x22008600   dma_wait(controlador, canal):
+                 sema = [0x2200adec + ctrl*32 + canal*4 - 32]   -> 0x5f (95)
+                 KS_wait(sema)        <- codigo 1, SIN nodo de temporizador
+```
+
+`KS_wait` sin *timeout* no expira nunca. El único que puede levantar ese
+semáforo es la ISR de fin de cuenta de DMAC0, `0x220027b4`, registrada en
+`0x080357f4` sobre **IRQ 16**, entrada `0x22002810`. Y `0x38200000` era
+`create_unimplemented_device`.
+
+Además hacía daño en silencio: `0x22004b68` hace lectura-modificación-escritura
+sobre `C0Control`, y con el bloque devolviendo cero la escritura final salía
+`0x0c000000` en vez de llevar el bit `I`, los anchos y la cuenta. **Un modelo que
+sólo generase la interrupción sin devolver bien las lecturas seguiría fallando.**
+
+Son PL080 de verdad, y lo dicen dos fuentes que coinciden: Rockbox los nombra
+(`firmware/target/arm/s5l8702/dma-s5l8702.h:33-36`, «2 PL080 DMA controllers» en
+`0x38200000` y `0x39900000`) y los desplazamientos que el retailOS usa cuadran
+byte a byte con `hw/dma/pl080.h`. QEMU ya trae el modelo, así que fue cablearlo:
+
+- región de `0x1000`, no `0x100000`, para que el resto del bloque siga cayendo
+  al *io floor* y `-d unimp` lo diga si el huésped lo toca;
+- IRQ 16 y 17, que el huésped ya tiene desenmascaradas
+  (`VIC0 INTENABLE = 0x21a3010f`);
+- y el puerto maestro tiene que ser la memoria del sistema, porque el huésped
+  programa los canales con el alias **cacheado** (`0x0be55320`) mientras la CPU
+  corre sobre el no cacheado (`0x8be55320`).
+
+### Lo que se destrabó, medido
+
+`-d in_asm` con `E.img`, contando sólo prólogos de función verificados. Todas
+estas direcciones daban **cero** en todas las trazas anteriores del proyecto:
+
+| Dirección | Qué es | Antes | Ahora |
+|---|---|---|---|
+| `0x080aee04` | parser de MBR | 0 | **1** |
+| `0x0808f8f4` | localizar la partición de firmware | 0 | **1** |
+| `0x0805712c` | **el parser `]ih[`** | 0 | **1** |
+| `0x08040cf8` | montar `rsrc` como volumen 4 | 0 | **1** |
+| `0x08122a04` | levantar la bandera de almacenamiento | 0 | **1** |
+| `0x081228d0` | la **salida** de `while (![obj+0x28]) wait();` | 0 | **1** |
+| `0x08239134` | iterar `Resources/Fonts` | 0 | **1** |
+| `0x08239658` | construir el objeto de cadena | 0 | **1** |
+| `0x0815b1b8` | el código de interfaz que dibuja texto | 0 | **1** |
+
+Es exactamente la cadena que predecían los dos informes previos, eslabón por
+eslabón, y ahora está medida de punta a punta. Que la pantalla tenga texto en
+nueve escrituras distintas es la prueba independiente: esas tipografías sólo
+existen en `\Resources\Fonts\` del volumen `rsrc` del disco.
+
+`0x080a38cc` (parser de Apple Partition Map) sigue en cero, y ahora por la razón
+buena: `E.img` lleva MBR, así que se toma la otra rama.
+
+---
+
+## 15. Cómo reproducir la imagen
+
+```bash
+wsl -d Ubuntu-24.04 -e bash -c "cd /mnt/c/Desarrollo/qemu-ios/build && ninja qemu-system-arm"
+
+# el disco, a partir del .ipsw, con MBR en unidades de 4096
+python3 tools/ipod_classic/mkdisk6g4k.py ~/6g/E.img \
+        assets/extracted/Firmware-24.9.1.2 ~/6g/fat32.img
+
+# arrancar y medir
+sh tools/ipod_classic/audit_run.sh px 45 -serial null \
+   -drive if=ide,format=raw,file=$HOME/6g/E.img
+#   => non-black: 75463 (98.3%) ; distinct colours: 404
+
+# y MIRARLA, que es la mitad de la medida
+python3 tools/ipod_classic/ppm2png.py /tmp/aud/px.ppm /tmp/px.png
+```
+
+Tiempo hasta el primer píxel: entre 22 y 30 s de reloj de pared en esta máquina
+(medido con tres `screendump` a 22, 30 y 38 s: negro, imagen, la misma imagen).
+Después se queda quieta: la animación de la interfaz termina y no hay entrada de
+rueda que la mueva.
+
+Para ver qué hace el compositor:
+
+```bash
+DISPTRACE=1 ./qemu-system-arm -M iPod-Classic ... 2>&1 | grep -E 'SOURCE|LAYER'
+```
+
+### Regresiones comprobadas
+
+| Prueba | Resultado |
+|---|---|
+| `lcdtest.S`, el caso de control del panel | 76 800/76 800 píxeles, 1920 colores — **igual que antes** |
+| retailOS **sin** disco | 0 píxeles y el mismo ciclo de caída — igual que antes, y es del huésped |
+| `tools/ipod_video/navtest.sh` (el 5G) | 76 548 px en los 7 fotogramas, el resaltado se mueve (12 312, 12 114, ~31 600) |
+
+> Nota sobre el último número: varía de carrera a carrera (31 632, 31 603,
+> 31 588 en tres pasadas) porque el test pulsa teclas por reloj de pared. Los
+> 76 548 y los dos saltos de 12 312 / 12 114 sí son estables.
+
+### Lo siguiente, en orden de coste
+
+1. **La rueda de pulsación** (`0x3C200000`, hoy sin implementar). El huésped la
+   sondea ~120 veces por segundo, así que ya hay quien escuche; falta el modelo.
+   Sin ella la interfaz se ve pero no se puede usar.
+2. **El arranque sin disco** sigue en el ciclo de caída del §4, y ahora se sabe
+   que es irreparable por ese camino: no hay tipografías dentro de la imagen.
+3. **Las capas de 4 y 8 bits** no se decodifican (falta la paleta) y ninguna se
+   ha visto usada. `-d unimp` lo dirá si aparecen.
+4. **El escalador y la matriz de color**, si alguna vez el huésped deja de
+   escribir la identidad — por ejemplo al reproducir vídeo.

@@ -76,17 +76,19 @@
  *  +0x180..+0x1c4 (V) nine 2-word entries, copied by 0x08127664
  *  +0x1ec..+0x1fc (V,M) five words copied straight out of a struct by
  *          0x080bf110. MEASURED 0, 0, 0x10, 0, 0. UNDETERMINED.
- *  +0x200  (V,M) bit 0 set/cleared by 0x08096eb8; measured 0 then 0x00010080,
- *          and it is read back three times per boot, so this one is genuinely
- *          read-modify-write and genuinely read.
- *  +0x204  (M) 2.       +0x208 (M) 0.      +0x20c (M) 2.
- *  +0x210  (M) 0x00010110.
- *  +0x214  (M) 0x013f00ef -- (319 << 16) | 239, THE PANEL GEOMETRY, to the
- *          pixel. Nothing else in this block is as unambiguous.
- *          Which instruction writes +0x200..+0x214 is UNDETERMINED: no
- *          pc-relative literal in the image resolves to a base that reaches
- *          them, so the base arrives in a register from somewhere we have not
- *          traced. The values are measured, the writer is not identified.
+ *  +0x200  (V,M) bit 0 set/cleared by 0x08096eb8, and OR'd with 0x00010080 by
+ *          0x081273f8. Both are read-modify-write and it is genuinely read
+ *          back, so a zero readback here really did lose state.
+ *  +0x204  (V,M) 2, at 0x0812740c.   +0x208 (V,M) 0, at 0x08127428.
+ *  +0x20c  (V,M) 2, at 0x08127410.
+ *  +0x210  (V,M) 0x00010110, a literal at 0x08127464.
+ *  +0x214  (V,M) 0x013f00ef -- (319 << 16) | 239, THE PANEL GEOMETRY, to the
+ *          pixel, a literal at 0x08127468. Nothing else in this block is as
+ *          unambiguous.
+ *          These six live in the init function 0x08127268, which reaches them
+ *          through r6 rather than a fresh literal, which is why scanning for
+ *          pc-relative loads of 0x38900000 did not find them. The trace found
+ *          them: DISPTRACE prints the guest PC with every access.
  *  +0x31c..+0x360 (V) nine 2-word entries, copied by 0x081275ec
  *  +0x364..+0x3a8 (V) nine 2-word entries, copied by 0x08127628
  *  +0x3ac  (V,M) 0x080bcef8 builds it as
@@ -107,12 +109,23 @@
  * 4 KB and the rest of the 1 MB block still falls to the machine's io floor,
  * where -d unimp will report it if that ever stops being true.
  *
- * WHAT THIS MODEL DOES NOT DO, and it is the whole open question: compose.
- * A boot that never gets a volume mounted never writes a source address into
- * any of the nine slots above -- MEASURED, zero writes to +0x038..+0x0c0 in a
- * 40-second diskless boot -- so there is nothing to compose from and no amount
- * of modelling here will produce a pixel. Set DISPTRACE=1 to watch for the
- * first source address that ever arrives.
+ * WHAT THIS MODEL DOES: store every register honestly, and compose the layers
+ * into the panel when the panel is about to be shown. See the layer-descriptor
+ * note below, and ipod_classic_disp.c for the composition itself.
+ *
+ * WHAT IT DOES NOT DO: the gamma tables, the four colour-matrix coefficient
+ * tables, the scaler (+0x04c/+0x50/+0x54), the destination rectangle
+ * (+0x030/+0x034) and the rotate bit in +0x3ac are all stored and read back but
+ * none of them affects the picture. Every one of them is the identity in every
+ * boot measured so far -- the gamma tables are literally tbl[i] = i * 4 -- so
+ * honouring them would change nothing today and could only be tested against a
+ * guest that stops using the identity.
+ *
+ * A boot with no disk never writes a source address into any slot at all
+ * (MEASURED: zero writes to +0x038..+0x0c0 in a 40-second diskless boot,
+ * because the user interface dies for want of fonts long before it composes
+ * anything), so it draws nothing and the panel stays black. That is the guest's
+ * behaviour, not the model's. Set DISPTRACE=1 to watch the registers.
  */
 
 #ifndef HW_ARM_IPOD_CLASSIC_DISP_H
