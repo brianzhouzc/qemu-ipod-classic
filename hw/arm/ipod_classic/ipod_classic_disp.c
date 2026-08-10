@@ -6,11 +6,11 @@
  * panel geometry, the three layer descriptors, the source-address slots and the
  * gamma tables, and it is what the LCD frame engine (LCD +0x70) presents.
  *
- * The model is a register file with honest readback and a loud trace. That is
- * deliberately less than a composition engine, and the reason is a measurement:
- * a boot that never mounts a volume never writes a source address into any of
- * the nine slots, so there is nothing to compose. Until one arrives, a
- * compositor here would be inventing pixels rather than modelling hardware.
+ * The model is a register file with honest readback, a loud trace, and a
+ * compositor that blits whichever layer slots currently carry a source address
+ * into the panel's image memory. A boot that never mounts a volume never writes
+ * a source address into any slot, so on that path it composes nothing and the
+ * panel stays black -- that is the guest's behaviour, not the model's.
  *
  * Readback alone is not cosmetic. Six functions in the osos do
  * read-modify-write on +0x008 and one on +0x200; while this block was
@@ -18,10 +18,11 @@
  * field written before it. That is the same failure mode the DMAC0 note in
  * wiki/11 describes, and it was silently true here too.
  *
- * DISPTRACE=1 prints every access with its value and the guest PC, and names
- * the register when we know its name. The first write of a source address is
- * printed unconditionally and never throttled: that is the event the whole
- * display investigation is waiting for.
+ * DISPTRACE=1 prints every access below +0x400 with its value and the guest PC,
+ * and names the register when we know its name; the 768 gamma words are counted
+ * rather than printed, and the totals go out at exit. Independently of the
+ * trace, the FIRST source-address write of a run is announced on stderr: that
+ * is the event the whole display investigation waited for.
  */
 
 #include "qemu/osdep.h"
@@ -157,24 +158,31 @@ static void ipod_classic_disp_write(void *opaque, hwaddr offset,
     }
 
     /*
-     * The one event worth shouting about, trace or no trace: a source address.
-     * Every boot measured so far writes zero of these, which is exactly why
-     * nothing appears on the panel. If this line ever prints, the display
-     * investigation has a new fact. Printed at most once per distinct value so
-     * a running UI cannot flood stderr -- the channel the firmware itself
-     * talks on (lesson 1 of wiki/09).
+     * The one event worth shouting about: a source address, i.e. the block
+     * being told where to read pixels from. A diskless boot writes zero of
+     * these and draws nothing; a boot with a disk writes one per layer per
+     * frame update, so this cannot be printed every time -- stderr is the
+     * channel the firmware itself talks on (lesson 1 of wiki/09).
+     *
+     * So: announce the FIRST one unconditionally, because that is the event the
+     * whole display investigation waited for, and after that say nothing unless
+     * DISPTRACE=1 is set. The running total is printed at exit and it counts
+     * every write, not every change -- an earlier version compared against the
+     * last value seen and so counted transitions, which undercounts any layer
+     * that is re-armed with the same address (wiki/11 §8, "a log that only
+     * announces the first occurrence cannot count").
      */
     if (disp_is_source(offset) && value != 0) {
-        static uint32_t last_src;
-        if ((uint32_t)value != last_src) {
-            last_src = value;
-            disp_src_writes++;
+        static bool announced;
+
+        disp_src_writes++;
+        if (!announced) {
+            announced = true;
             fprintf(stderr, "s5l8702.disp: SOURCE ADDRESS +0x%03" HWADDR_PRIx
                     " = 0x%08x  (pc~0x%08x) -- first time this block has been "
                     "given something to read from\n",
                     offset, (uint32_t)value, disp_trace_pc());
         }
-        return;
     }
 
     if (disp_trace_on()) {
@@ -317,11 +325,21 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
     bool drew = false;
 
     /*
-     * Slot order is Z order, lowest index at the back. INFERRED: layer 0 is the
-     * only one that is ever full-screen and the ones above it are panes that
-     * slide over it, so any other order would put the background on top. No
-     * measurement distinguishes them, because no two layers have ever
-     * overlapped in a boot we have traced.
+     * Slot order is Z order, lowest index at the back. INFERRED, but a
+     * measurement does back it, and an earlier version of this comment claimed
+     * the opposite ("no two layers have ever overlapped"), which is false:
+     * slots 0 and 1 overlap the whole time the language screen appears.
+     *
+     * MEASURED with DISPTRACE=1 over one boot with a disk. Slot 0 is 320x240 at
+     * (0,0) for the whole run. Slot 1 is a 16-bit surface whose right edge is
+     * pinned to the panel edge while its left edge slides right -- +0x084/+0x07c
+     * go (x=80, w=240), (82, 238), (95, 225), (122, 198), (168, 152), (232, 88),
+     * (310, 10), (400, -80), so x + w is 320 at every step until the surface
+     * goes negative and stops being drawn. That is a wipe, and a wipe only works
+     * if the sliding surface is IN FRONT: slot 1 holds the outgoing artwork (the
+     * bare gradient, no text -- dumped and looked at) and slot 0 the incoming
+     * one. With the Z order the other way round slot 0 would cover slot 1 from
+     * the first frame and there would be no transition at all.
      *
      * A layer is drawn when it has a source address and a positive size, and
      * nothing else gates it. The control register at +0x008 does carry three

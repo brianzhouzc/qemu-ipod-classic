@@ -51,10 +51,16 @@ y 23 `SWRCON`. El DMA de ATA entrega de verdad: con una imagen que lleva
 `55 aa` en `0x1FE`, `pmemsave 0x0be5d3e0` la encuentra ahí después del
 arranque.
 
-Y la advertencia que va con el hito 3: **«llegar al bucle idle» no es
-«arrancar»**. Todas las tareas de aplicación siguen bloqueadas, no se dibuja
-nada, y el camino *sin* disco llega más lejos en la interfaz antes de morirse
-(§4). Un sistema quieto no es necesariamente un sistema que funciona.
+Y la advertencia que iba con el hito 3, que era cierta hasta el 10 de agosto de
+2026: **«llegar al bucle idle» no es «arrancar»**. Un sistema quieto no es
+necesariamente un sistema que funciona. Con disco eso **ya no aplica** (§13,
+§14): la tarea de interfaz corre y compone. Sin disco sigue aplicando tal cual.
+
+> **Nota de lectura, por una tercera auditoría (10 de agosto de 2026).** Los
+> §3, §6 y §9 se escribieron cuando el arranque con disco se paraba, y describen
+> ese estado. **No los leas como el estado de hoy**: los §13 y §14 los corrigen,
+> y donde se contradicen manda lo de más abajo, que es lo medido después. Las
+> partes de §6 y §9 que hablan del arranque **sin** disco siguen siendo válidas.
 
 ---
 
@@ -483,9 +489,16 @@ Dos trampas que cuestan una tarde cada una:
 
 ---
 
-## 6. Dónde se para hoy
+## 6. Dónde se paraba con disco (histórico, **superado** por §13 y §14)
 
-Con disco, el sistema llega a su **bucle idle** y se queda:
+> **Esta sección describe el estado anterior al 10 de agosto de 2026.** Con
+> disco ya no se para aquí: la tabla «Lo que NO se ejecuta» de más abajo es
+> exactamente la que el §14 vuelve a medir y sale toda a **1**. Se conserva
+> porque el método (medir entradas de función, no direcciones de mitad de
+> función) es lo que hizo falta para llegar al §14. **Sin disco** todo lo de
+> esta sección sigue siendo válido.
+
+Con disco, el sistema llegaba a su **bucle idle** y se quedaba:
 
 ```
 22003b1c:  mcr p15,0,r0,c7,c0,4    ; wait for interrupt (ARM926)
@@ -570,9 +583,17 @@ buenos, y hacían falta los dos: ver §13 y §14.**
 
 ---
 
-## 9. Con disco: dónde se para la interfaz, instrucción a instrucción
+## 9. Con disco: dónde se paraba la interfaz, instrucción a instrucción (histórico)
 
-Esto es nuevo, y responde a «qué está esperando la tarea bloqueada» del §6, que
+> **Superado por el §14, que corrige el diagnóstico final.** La cadena de
+> llamadas de abajo está bien medida y sigue siendo la buena; lo que estaba mal
+> era la última línea, «el agujero está entre *el DMA terminó* y *despierta a
+> quien lo pidió*» leída como un problema del **ATA**. No lo era: quien no
+> volvía era el `memcpy` por **DMAC0** que va dentro de esa misma llamada de
+> lectura. Ver §14. Hoy, con `E.img`, la cadena entera se recorre y
+> `0x081228d0` **sí** se alcanza.
+
+Esto responde a «qué está esperando la tarea bloqueada» del §6, que
 llevaba abierto desde el principio. Todo medido con `gdbpoke.py` y un disco de
 64 MB a ceros; con `A.img` (MBR válido, partición de firmware real y FAT32 con
 `iPod_Control`) sale exactamente igual.
@@ -882,7 +903,11 @@ ejecuta en `0x00000000`, no en `0x22000000`, y el manejador de Data Abort está
 en **`0x00003400`** (`[0x22000010] = 0xEA000CFA`). Poner el breakpoint en
 `0x22003400` no dispara nunca.
 
-## 12. Auditoría independiente (agosto de 2026)
+## 12. Auditoría independiente (agosto de 2026, antes de que hubiera imagen)
+
+> Esta auditoría es **anterior** al §13/§14: sus filas «el retailOS da 0
+> píxeles» y «el bloqueo con disco está en `0x080aea1c`» describen el estado de
+> entonces. La tercera auditoría, que sí ve imagen, está en el §16.
 
 Todo lo de arriba se volvió a medir desde cero. Lo que **se confirma**:
 
@@ -1133,6 +1158,11 @@ buena: `E.img` lleva MBR, así que se toma la otra rama.
 ```bash
 wsl -d Ubuntu-24.04 -e bash -c "cd /mnt/c/Desarrollo/qemu-ios/build && ninja qemu-system-arm"
 
+# la segunda partición: un FAT32 VACÍO. No hace falta nada dentro -- las
+# tipografías están en la partición de FIRMWARE, no aquí (ver la nota de abajo)
+truncate -s 64M ~/6g/fat32.img
+mkfs.vfat -F 32 -n IPOD ~/6g/fat32.img
+
 # el disco, a partir del .ipsw, con MBR en unidades de 4096
 python3 tools/ipod_classic/mkdisk6g4k.py ~/6g/E.img \
         assets/extracted/Firmware-24.9.1.2 ~/6g/fat32.img
@@ -1145,6 +1175,18 @@ sh tools/ipod_classic/audit_run.sh px 45 -serial null \
 # y MIRARLA, que es la mitad de la medida
 python3 tools/ipod_classic/ppm2png.py /tmp/aud/px.ppm /tmp/px.png
 ```
+
+> **De dónde salen las tipografías, y conviene decirlo porque el §4 se puede
+> leer mal.** El volumen FAT32 de esa receta está **vacío** (`mdir` no lista
+> nada) y aun así la pantalla sale con texto en nueve escrituras. El volumen 4
+> `rsrc` con `Resources/Fonts` **no está en el FAT32**: es una de las cuatro
+> imágenes de la partición de firmware, `fwtool.py list
+> assets/extracted/Firmware-24.9.1.2` la enseña como
+> `[0] rsrc off=0x00007000 len=0x04e00000` (81 MB). O sea que el único
+> ingrediente real es el `Firmware-24.9.1.2` del `.ipsw`; el FAT32 sólo tiene
+> que existir para que la segunda entrada del MBR apunte a algo. Comprobado
+> creando el FAT32 desde cero con las dos órdenes de arriba: misma imagen,
+> mismos 75 463 píxeles.
 
 Tiempo hasta el primer píxel: entre 22 y 30 s de reloj de pared en esta máquina
 (medido con tres `screendump` a 22, 30 y 38 s: negro, imagen, la misma imagen).
@@ -1180,3 +1222,109 @@ DISPTRACE=1 ./qemu-system-arm -M iPod-Classic ... 2>&1 | grep -E 'SOURCE|LAYER'
    ha visto usada. `-d unimp` lo dirá si aparecen.
 4. **El escalador y la matriz de color**, si alguna vez el huésped deja de
    escribir la identidad — por ejemplo al reproducir vídeo.
+
+---
+
+## 16. Tercera auditoría independiente (10 de agosto de 2026)
+
+Se volvió a medir todo lo del §13, §14 y §15 desde cero, con el árbol tal cual
+está y sin creerse ninguna cifra de antes.
+
+### Lo que se **confirma**
+
+| Afirmación | Cómo se comprobó aquí |
+|---|---|
+| **Hay imagen, y es la interfaz de Apple** | `audit_run.sh px 45` con `E.img` → **75 463/76 800 píxeles, 404 colores**, y la imagen **mirada**: barra de título «Language» con batería y candado, lista de nueve idiomas con 日本語 y Ελληνικά, barra de selección azul sobre «English», y el panel «Welcome/Bienvenue/Willkommen» a la derecha. No es basura ni un patrón de prueba |
+| Reproducible | Cuatro arranques distintos dan el **mismo** 75 463; uno de ellos con un disco **construido desde cero** con la receta del §15 (`truncate` + `mkfs.vfat` + `mkdisk6g4k.py`) |
+| **Dibuja y no se muere** | 50 s de `-d int,guest_errors,unimp` con disco: **0 `Taking exception 4`**, 0 `SWRCON`, 0 `CPU_exception_handler`, 43 840 IRQ y nada más. Los cambios de modo a `abt`/`fiq`/`und`/`irq` son uno de cada, del `msr cpsr` con el que el firmware monta las pilas por modo; no son excepciones |
+| Sin disco no cambia nada | 30 s → **0 píxeles**, 30 *Data Abort* + 30 semihosting + 30 `SWRCON`: el mismo ciclo de caída del §4 |
+| Caso de control del panel intacto | `lcdtest.S` → **76 800/76 800, 1920 colores**, y la rampa mirada |
+| Sin regresión en el 5G | `navtest.sh` → **76 548 px** en los 7 fotogramas y el resaltado se mueve: 12 312, 12 114, 31 598 |
+| La ventana de 4 KB basta | En el arranque de 50 s con `-d unimp` **no aparece ni una línea `s5l8702.io:`**: cero accesos al *io floor* en todo el arranque |
+| El *switch* de descriptores de capa | Desensamblado a mano: tabla de saltos en `0x08127068`, cinco ramas en `0x08127080/b0/e0/110/140`, todas escribiendo `base + 0x00/04/0c/10/14` |
+| La tabla de bytes por píxel | El *switch* de `0x08126f90` da `r1 ∈ {1,2,4,8}` para `fmt` 0 / 1 / 2‑5 / 6‑7 y luego `mul r2,r1,r2 ; lsr r2,r2,#1`, o sea `r1 = 2 × bpp`. Cuadra con `disp_bpp()` entrada por entrada |
+| El bit 16 de `+0x04` | `cmp r1,#8 ; orrcc r3,r3,#0x10000` en `0x08127050`: puesto exactamente cuando **no** es de 32 bpp |
+| Las direcciones del §14 son entradas de verdad | `0x0805712c`, `0x080aee04` y `0x08040cf8` empiezan por `push`; `0x081228d0` no es un prólogo pero **sí** es cabeza de bloque de traducción (es el destino de caída del `beq` de `0x081228cc`), así que medirlo con `-d in_asm` es válido |
+| DMAC0/1 son PL080 y van en IRQ 16/17 | Rockbox, fuente independiente: `s5l87xx.h:1893`, `#define IRQ_DMAC(d) (16+(d))` |
+
+### El experimento de control que faltaba: ¿de verdad hacían falta las dos?
+
+El §13 y el §14 afirman que la imagen necesitaba el compositor **y** los PL080.
+El compositor es evidente, es lo único que dibuja; lo del DMAC0 era una
+inferencia sobre una cadena larga. Se comprobó quitándolo:
+
+> Con el compositor puesto y los dos PL080 fuera, arranque con `E.img` de 45 s:
+> **0 píxeles, 0 colores, y ni una sola línea de `SOURCE ADDRESS`**. El
+> compositor está ahí y nadie le da nunca una dirección de origen.
+
+O sea: **las dos hacían falta**, y el §14 no es una historia bonita sino una
+causa. (El parche era un `getenv` provisional; se revirtió, no está en el árbol.)
+
+### Lo que se **corrige**
+
+1. **La cabecera de `ipod_classic_disp.c` decía lo contrario de lo que hace el
+   fichero**: «un fichero de registros… deliberadamente menos que un motor de
+   composición… un compositor aquí estaría inventando píxeles», treinta líneas
+   encima de `ipod_classic_disp_compose()`. Reescrita.
+2. **`ipod_classic_disp_compose()` decía «no two layers have ever overlapped in
+   a boot we have traced». Es falso**, y era justo el dato que sostiene el orden
+   Z. Medido con `DISPTRACE=1`: la capa 1 va `(x=80,w=240)`, `(82,238)`,
+   `(95,225)`, `(122,198)`, `(168,152)`, `(232,88)`, `(310,10)`, `(400,−80)`, con
+   `x + w = 320` en todos los pasos, encima de una capa 0 de 320×240 en (0,0).
+   Es un **barrido** y solapa siempre. Corregido, y con ello el orden Z pasa de
+   «no hay medida» a «hay una medida a favor»: la capa que se desliza tiene que
+   ir **delante** o no hay transición.
+3. **El aviso de fin de trama del LCD mentía.** `panel_frame_go()` seguía
+   emitiendo por `LOG_UNIMP` «no source address exists anywhere in this window
+   and no DMA channel points at LCD_WDATA, so where it would read from is
+   UNDETERMINED», que dejó de ser cierto en el §13. Reescrito: lo que sigue
+   siendo INDETERMINADO no es de dónde lee, es si `+0x70` **engancha** un cuadro
+   o sólo habilita el barrido.
+4. **El contador de direcciones de origen contaba transiciones, no escrituras.**
+   `if (value != last_src)` con dos ranuras que se turnan imprime una línea por
+   escritura, no «una por valor distinto» como decía el comentario: salían 21
+   líneas por arranque a `stderr`, que es justo el canal que la lección 1 pide
+   mantener limpio. Ahora se anuncia **la primera** y punto, y el total del final
+   cuenta **todas** las escrituras. De paso, esas escrituras ya no se saltan la
+   traza: `DISPTRACE=1` decía «cada acceso» y se dejaba fuera `+0x060` y `+0x078`
+   por un `return` temprano.
+5. **`composed_frames` se incrementaba y no se imprimía nunca.** Ahora sale en
+   los totales de `LCDTRACE`, junto a los arranques del motor de trama.
+6. **La cabecera decía que el *switch* de capas escribe «los mismos seis
+   registros».** Escribe **cinco**: `+0x08`, la dirección de origen, viene de
+   otro sitio (`0x081276dc`). Es la diferencia entre «esta capa tiene geometría»
+   y «esta capa tiene algo que leer», que es exactamente lo que distingue un
+   arranque sin disco de uno con disco.
+7. **La receta del §15 no era reproducible**: pedía un `~/6g/fat32.img` sin decir
+   cómo hacerlo. Se documenta, y con ello un hecho que no estaba escrito: ese
+   FAT32 está **vacío** y da igual, porque las tipografías están en la imagen
+   `rsrc` de la partición de **firmware**, no en el volumen FAT.
+8. **`0x00001000` como valor de las tres configuraciones de capa** es de un
+   arranque **sin** disco. Con disco `+0x0e0` y `+0x0e8` se reescriben 17 y 21
+   veces. Anotado en la cabecera.
+9. **Los §3, §6, §9 y §12 describían el estado anterior sin decirlo**, y el §6
+   contradice de plano la tabla del §14 (las mismas nueve direcciones, «nunca» en
+   uno y «1» en el otro). Marcados como históricos.
+
+### Lo que **no** se pudo verificar, y hay que decirlo
+
+- **La composición de varias capas nunca se ha visto en una imagen.** La capa 0
+  sola ya contiene la pantalla entera: se volcó con
+  `pmemsave 0x09767a24 0x4b000` y `ppm2png.py --raw 320x240:argb8888`, y es lo
+  mismo que sale por pantalla. La capa 1, volcada igual (`0x0be2326c`,
+  `rgb565`), es sólo el degradado **sin texto**. O sea que los 75 463 píxeles
+  prueban muy bien la ranura 0 —dirección, *stride*, formato y orden de bytes— y
+  **no prueban** el orden Z ni el recorte, porque el barrido de la capa 1 dura
+  menos de un segundo y ningún `screendump` lo ha cogido (probado a 20, 21, …,
+  28, 30 y 32 s: negro hasta 28 s, la pantalla ya quieta a 30 s). Si alguien
+  quiere cerrarlo, lo barato es un contador por ranura en `disp_draw_layer()` y
+  un `screendump` disparado desde el propio modelo la primera vez que dos capas
+  se solapen.
+- **Los «~120 sondeos por segundo» de la rueda** son una cifra de antes. En el
+  arranque con disco de esta auditoría salen 3 175 lecturas de `0x3C200000` en
+  50 s, pero con `-d int` puesto, que cambia el reloj de pared. La conclusión
+  («ya hay quien escuche») no depende del número.
+- **El orden de bytes sigue siendo INFERIDO**, y bien marcado en el código. La
+  imagen lo respalda de una forma que cuesta discutir —la barra de selección sale
+  `#0484da` y no `#da8404`—, pero eso es un argumento sobre los colores de Apple,
+  no un *datasheet*.

@@ -98,14 +98,16 @@ static uint64_t lcd_wdata_writes;
 static uint64_t lcd_wcmd_writes;
 static uint64_t lcd_pixels_total;
 static uint64_t lcd_frame_starts;
+static uint64_t lcd_composed_frames;
 
 static void lcd_trace_totals(void)
 {
     fprintf(stderr, "LCDTRACE  totals: %" PRIu64 " writes to the command port "
             "+0x04, %" PRIu64 " to the data port +0x40..0x5C, of which %"
-            PRIu64 " were pixels; %" PRIu64 " frame-engine starts (+0x70)\n",
+            PRIu64 " were pixels; %" PRIu64 " frame-engine starts (+0x70); %"
+            PRIu64 " frames composed from the display pipe\n",
             lcd_wcmd_writes, lcd_wdata_writes, lcd_pixels_total,
-            lcd_frame_starts);
+            lcd_frame_starts, lcd_composed_frames);
 }
 
 /* ------------------------------------------------------------------ panel */
@@ -247,12 +249,18 @@ static void panel_data(IPodClassicLCDState *s, uint32_t value)
 }
 
 /*
- * The frame engine. UNDETERMINED and deliberately inert: see the file header.
- * The guest writes the geometry to +0x74 and a 1 to +0x70, then spins on
- * +0x8C bits [1:0] until they clear. We report "done" immediately, which is
- * what the previous read-as-zero behaviour did, so nothing regresses -- but
- * now the event is counted and named, and the count of pixels that actually
- * arrived through the data port is printed with it.
+ * The frame engine: the guest writes the geometry to +0x74 and a 1 to +0x70,
+ * then spins on +0x8C bits [1:0] until they clear. We report "done"
+ * immediately, which is what the previous read-as-zero behaviour did.
+ *
+ * Where the frame comes from is no longer a mystery -- it is composed by the
+ * display pipe at 0x38900000 out of layers in DRAM (ipod_classic_disp.h). What
+ * is still UNDETERMINED is the TIMING: whether +0x70 latches one frame or just
+ * enables a continuous scan-out. Measured, a boot with a disk writes +0x70 once
+ * in 45 s and then keeps re-pointing the layer descriptors as the user
+ * interface animates, so latching here would freeze the picture on the first
+ * frame. The model therefore composes in gfx_update instead and this write only
+ * gets counted -- see ipod_classic_lcd_gfx_update() for that argument in full.
  */
 static void panel_frame_go(IPodClassicLCDState *s, uint32_t value)
 {
@@ -281,9 +289,10 @@ static void panel_frame_go(IPodClassicLCDState *s, uint32_t value)
                 s->win_y1, s->pixels_this_frame);
     }
     qemu_log_mask(LOG_UNIMP, "s5l8702.lcd: frame engine start (+0x70 = 0x%x) "
-                  "is not modelled -- no source address exists anywhere in "
-                  "this window and no DMA channel points at LCD_WDATA, so "
-                  "where it would read from is UNDETERMINED\n", value);
+                  "does not latch a frame here; the picture is composed from "
+                  "the display pipe at 0x38900000 on every refresh instead. "
+                  "Whether real hardware latches on this write is "
+                  "UNDETERMINED\n", value);
 }
 
 /* ------------------------------------------------------------------- mmio */
@@ -497,12 +506,18 @@ static void ipod_classic_lcd_gfx_update(void *opaque)
      *
      * Nothing composes when no layer has a source address, so the panel's own
      * image memory -- and with it tools/ipod_classic/lcdtest.S, the control
-     * case that proves this panel works -- behaves exactly as before.
+     * case that proves this panel works -- behaves exactly as before. Once a
+     * layer does have one, the composed frame OVERWRITES anything that arrived
+     * through the data port. That ordering is a model choice too, and it is
+     * untested because no guest we have traced ever uses both paths: the
+     * retailOS pushes zero pixels through the port, and lcdtest.S programs no
+     * layers.
      */
     if (s->disp && ipod_classic_disp_compose(s->disp, s->fb,
                                              S5L8702_PANEL_WIDTH,
                                              S5L8702_PANEL_HEIGHT)) {
         s->composed_frames++;
+        lcd_composed_frames++;
         s->dirty = true;
     }
 

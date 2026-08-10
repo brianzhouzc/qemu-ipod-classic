@@ -68,10 +68,15 @@
  *  +0x0e8  (V,M) LAYER 2 config, +0x0ec LAYER 2
  *          The config word is built by 0x080b0140 as
  *          (fmt << 28) | (a << 16) | (b << 12) | c, and the second word is set
- *          by 0x080a9614 to a plain value. MEASURED: the init path calls
- *          0x080b0140(i, 0, 0, 1, 0) and 0x080a9614(i, 0) for i in 0..2, so all
- *          three configs are 0x00001000 and all three second words 0 -- which
- *          is what the boot trace shows, decode confirmed.
+ *          by 0x080a9614 to a plain value. MEASURED on a diskless boot: the
+ *          init path calls 0x080b0140(i, 0, 0, 1, 0) and 0x080a9614(i, 0) for
+ *          i in 0..2, so all three configs are 0x00001000 and all three second
+ *          words 0 -- which is what that trace shows, decode confirmed. A boot
+ *          WITH a disk goes further and rewrites +0x0e0 and +0x0e8 as the user
+ *          interface runs (MEASURED: 17 and 21 writes in 45 s, +0x0e8 ending on
+ *          0x50004000); +0x0d8 is never written again. Nothing here gates the
+ *          picture in this model -- see the note on the control register in
+ *          ipod_classic_disp_compose().
  *  +0x0f0..+0x17c (V) nine 4-word entries, copied by 0x081276a0
  *  +0x180..+0x1c4 (V) nine 2-word entries, copied by 0x08127664
  *  +0x1ec..+0x1fc (V,M) five words copied straight out of a struct by
@@ -144,15 +149,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
 /*
  * THE FIVE LAYER DESCRIPTORS, and this is what puts pixels on the panel.
  *
- * 0x08126ffc..0x0812716c is one function with a five-way switch on the layer
- * index; every arm writes the same six registers at base 0x058 + k * 0x18:
+ * 0x0812705c..0x0812716c is one five-way switch on the layer index (jump table
+ * at 0x08127068, arms at 0x08127080, 0x081270b0, 0x081270e0, 0x08127110 and
+ * 0x08127140); every arm writes the same FIVE registers at base 0x058 + k*0x18:
  *
  *   +0x00  source stride in bytes            (r2 = bpp * srcW / 2 ... see below)
  *   +0x04  (align << 24) | (fmt << 8) | ...  bit 16 set when NOT 32 bpp
- *   +0x08  SOURCE ADDRESS, already advanced to the first visible pixel
  *   +0x0c  (W << 16) | H          destination size
  *   +0x10  W * bytes-per-pixel / 4          (a cross-check, not used here)
  *   +0x14  (X << 16) | Y          destination position
+ *
+ * The sixth word of the descriptor, and the one that matters most --
+ *
+ *   +0x08  SOURCE ADDRESS, already advanced to the first visible pixel
+ *
+ * -- is NOT written by this switch. It comes from a separate five-way switch in
+ * 0x081276dc, which is why a boot can program a descriptor's geometry without
+ * ever giving it something to read from.
  *
  * VERIFIED against a real boot with a disk. Layer 0:
  *   +0x058 = 0x00000500 (1280 = 320 * 4), +0x05c = 0x00000700 (fmt 7, and bit

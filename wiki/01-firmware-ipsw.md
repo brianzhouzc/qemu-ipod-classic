@@ -66,8 +66,47 @@ dentro del payload, así que `dir_real = 0x1000 + dir_offset`. `fwtool.py` prueb
 
 - `osos` es el sistema operativo de Apple (Pixo/RetailOS).
 - `aupd` es el updater.
-- `rsrc` y `hash` están rellenos de `0xFF` en este `.ipsw` — se generan en el
-  dispositivo, no vienen aquí.
+- `hash` está relleno de `0xFF` — se genera en el dispositivo, no viene aquí.
+- **`rsrc` NO está vacío.** Esta línea decía durante días que `rsrc` y `hash`
+  estaban ambos rellenos de `0xFF`; era falso, y costó caro. Ver abajo.
+
+### CORREGIDO (2026-08-10) — `rsrc` es un volumen FAT16 con las tipografías
+
+Un vistazo a `dev_offset` sin el sesgo de `0x1000` cae en el relleno y se lee
+como una imagen vacía. Aplicándolo, `rsrc` empieza en `0x7000`, y el sector de
+arranque FAT está `0xe00` más adelante:
+
+```
+0x00007e00  sector de arranque FAT16
+            OEM "MTOOL399", etiqueta "IPODRESOURC", 159 744 sectores (78 MB)
+0x0002f000  directorio raíz  ->  RESOUR~1/  ("Resources")
+```
+
+Y dentro, exactamente lo que el retailOS busca en `"Resources/Fonts"`:
+
+| Fichero | Bytes | |
+|---|---|---|
+| `HELVET~1.TTF` | 457 656 | Helvetica, la tipografía de la interfaz |
+| `HELVET~2.TTF` | 453 452 | |
+| `CJK16.TTF` | 2 919 256 | chino, japonés y coreano |
+| `CJK11.TTF` | 1 920 848 | |
+| `MONOHO~1..4.SBI` | 22–40 KB | mapas de bits |
+
+Más `Games/`, `Trainers/` (los entrenamientos Nike+ en XML) y `Voices/` con las
+locuciones de Lance Armstrong y Paula Radcliffe.
+
+Sin esto la pantalla se queda negra: el cargador de tipografías itera un
+directorio de verdad, no encuentra nada, devuelve NULL, y el firmware llama a
+la vtable de ese NULL y muere. **De aquí salen los caracteres de la pantalla de
+idiomas** — los kanji y el griego son estas dos TTF. Ver
+[11-classic6g-retailos.md](11-classic6g-retailos.md).
+
+Para verlo:
+
+```bash
+python tools/ipod_classic/fwtool.py list assets/extracted/Firmware-24.9.1.2
+#  [0] rsrc off=0x00007000 len=0x04e00000
+```
 
 > **Dato clave:** `addr = 0x08000000` confirma la base de SDRAM del S5L8702, y
 > coincide con `DRAM_ORIG` de Rockbox. Ver [02-s5l8702-hardware.md](02-s5l8702-hardware.md).
