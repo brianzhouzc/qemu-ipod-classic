@@ -271,7 +271,7 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.eic",      EIC_MEM_BASE,      0x100000 },
     { "s5l8702.int",      INT_MEM_BASE,      0x100000 },
     { "s5l8702.ecc",      ECC_MEM_BASE,      0x100000 },
-    { "s5l8702.wheel",    WHEEL_MEM_BASE,    0x100000 },
+    /* The click wheel is a real device now; see the machine init. */
     { "s5l8702.usb-phy",  USBPHYS_MEM_BASE,  0x100000 },
     { "s5l8702.wdt",      WDT_MEM_BASE,      0x100000 },
     { "s5l8702.i2s",      I2S_MEM_BASE,      0x100000 },
@@ -621,6 +621,34 @@ static void ipod_classic_machine_init(MachineState *machine)
     qdev_prop_set_bit(dev, "media-present", drive_get(IF_IDE, 0, 0) != NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, GPIO_MEM_BASE);
+
+    /*
+     * The click wheel at 0x3C200000, and with it the keyboard. This is what
+     * makes the user interface usable rather than merely visible.
+     *
+     * It is interrupt driven, not polled, and that is a measurement rather
+     * than a preference: in a 60 s boot the guest writes WHEELTX exactly five
+     * times -- one polled transaction with its five retries -- and then never
+     * touches the block again. What it does instead is register 0x080479a8 on
+     * IRQ 23 (0x08047a68: mov r1,#23) and park its wheel task on kernel event
+     * 5 for ever. With no interrupt there is no input, however honestly the
+     * registers read back.
+     *
+     * The line itself was checked end to end before a byte of this was
+     * written, because the 5G taught us that raising an IRQ proves nothing
+     * (hw/arm/ipod_video/ipod_video_intc.c, the HI_IRQ gate): VIC0 INTENABLE
+     * reads 0x01A3010F with the machine running, bit 23 set, and the IRAM
+     * dispatcher at 0x22004DA0 reads both banks with no cross-condition.
+     *
+     * Keys, the same as the iPod-Video machine: q/e turn the wheel, enter is
+     * SELECT, w is MENU, a/d are previous/next, s is play. See the header.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_WHEEL);
+    nms->wheel = IPOD_CLASSIC_WHEEL(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, WHEEL_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_WHEEL_IRQ));
 
     /*
      * The random number generator at 0x3C100000. See the long note above it:

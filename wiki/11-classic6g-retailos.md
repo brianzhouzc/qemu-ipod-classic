@@ -17,6 +17,16 @@ saberlo). Las trazas son reproducibles con las órdenes del final.
 | 2. Pasa la inicialización temprana sin colgarse | **hecho** |
 | 3. Inicializa periféricos y llega a su bucle principal | **hecho** — kernel RTXC arrancado, planificador vivo, tarea idle en `0x22003b1c` |
 | 4. Dibuja algo en pantalla | **hecho, con disco** — la pantalla de selección de idioma, 75 463 de 76 800 píxeles. Ver §13 |
+| 5. Se puede **navegar** | **hecho a medias** — la rueda mueve el resaltado y el botón central entra en la pantalla siguiente (§17). MENU todavía no vuelve atrás |
+
+> **10 de agosto de 2026, más tarde — y ahora se puede usar.** Con la rueda de
+> clic modelada (§17), `e` mueve la barra de selección de **English** a
+> **日本語**, `q` la devuelve, y Enter **cambia de pantalla**: aparece el icono
+> de la nota musical con el texto **「ミュージックが…」**, es decir, en el idioma
+> que estaba resaltado. Cada giro cambia **8 000 píxeles** sobre un suelo de
+> ruido de **0**. Y hubo que arreglar una segunda cosa que no era la rueda: el
+> **interruptor de bloqueo** del PMU, que tiraba en silencio todos los botones
+> (§17.4).
 
 > **10 de agosto de 2026 — hay imagen.** Con un disco construido por
 > `mkdisk6g4k.py` a partir del `.ipsw`, el retailOS pinta **su pantalla de
@@ -1213,9 +1223,11 @@ DISPTRACE=1 ./qemu-system-arm -M iPod-Classic ... 2>&1 | grep -E 'SOURCE|LAYER'
 
 ### Lo siguiente, en orden de coste
 
-1. **La rueda de pulsación** (`0x3C200000`, hoy sin implementar). El huésped la
+1. ~~**La rueda de pulsación** (`0x3C200000`, hoy sin implementar). El huésped la
    sondea ~120 veces por segundo, así que ya hay quien escuche; falta el modelo.
-   Sin ella la interfaz se ve pero no se puede usar.
+   Sin ella la interfaz se ve pero no se puede usar.~~ **HECHO, §17.** Y la
+   frase estaba mal: el huésped **no** sondea. Hace una sola transacción
+   sondeada en el arranque y después espera la **IRQ 23**. Corregido en §17.6.
 2. **El arranque sin disco** sigue en el ciclo de caída del §4, y ahora se sabe
    que es irreparable por ese camino: no hay tipografías dentro de la imagen.
 3. **Las capas de 4 y 8 bits** no se decodifican (falta la paleta) y ninguna se
@@ -1328,3 +1340,266 @@ causa. (El parche era un `getenv` provisional; se revirtió, no está en el árb
   imagen lo respalda de una forma que cuesta discutir —la barra de selección sale
   `#0484da` y no `#da8404`—, pero eso es un argumento sobre los colores de Apple,
   no un *datasheet*.
+
+---
+
+## 17. La rueda de clic, y la pantalla que por fin se puede mover (10 de agosto de 2026)
+
+Hasta aquí el retailOS **se veía**. Ahora **se navega**: la rueda mueve la barra
+de selección por la lista de idiomas, y se puede demostrar con una medida que
+distingue "se movió un elemento" de "parpadeó un icono".
+
+Piezas nuevas:
+
+| Fichero | Qué es |
+|---|---|
+| `hw/arm/ipod_classic/ipod_classic_wheel.c` | el bloque `0x3C200000`, IRQ 23, y el manejador de teclado |
+| `include/hw/arm/ipod_classic/ipod_classic_wheel.h` | el mapa de registros y de dónde sale cada línea |
+| `tools/ipod_classic/navtest.sh` | la prueba: arranca, espera, pulsa, captura y decide |
+
+Y una corrección de una línea en `ipod_classic_pmu.c` que resultó valer tanto
+como todo el modelo de la rueda; ver §17.4.
+
+### 17.1 El mapa de registros
+
+Nombres de Rockbox (`firmware/export/s5l87xx.h:1642-1651`); la semántica es del
+desensamblado de Apple, con `--adjust-vma=0x07FF51B8`.
+
+| Off | Nombre | Qué hace el retailOS | Estado |
+|---|---|---|---|
+| `0x00` | `WHEELCON` | init `0x08056198`: `&=0xFFFF0000`, `&=~0x70000`, `&=~0x80000`, `&=~0x400000`, `\|=0x100000`, `\|=0x200000`. Antes de cada TX apaga y enciende el bit 21 | secuencia **VERIFICADA**, bits **DESCONOCIDOS** |
+| `0x04` | `WHEELGO` | `\|= 1` lanza la transferencia (`0x0832797c`) | **VERIFICADO** |
+| `0x08` | `WHEELDIV` | `= 0x0003A980` una vez (`0x080561e4`) | valor **VERIFICADO**, sentido **DESCONOCIDO** |
+| `0x0C` | `WHEELSTAT` | bit 0 «hay palabra», bit 3 «TX en curso» (`0x08327994`) | **VERIFICADO por uso** |
+| `0x10` | `WHEELMASK` | init `\|= 1`; guardado/puesto a 0/restaurado alrededor de cada transacción sondeada (`0x080afb48`) | máscara **INFERIDA**; ver §17.4 |
+| `0x14` | `WHEELPEND` | init `= 7`; el ISR escribe 7 al final (`0x08047a38`); el bucle escribe 1 para limpiar | **VERIFICADO**, escribir-1-para-limpiar |
+| `0x18` | `WHEELRX` | la palabra recibida (`0x080479bc`) | **VERIFICADO** |
+| `0x1C` | `WHEELTX` | `0x80000000 \| (cmd >> 1)`. Medido en el bus: `0xC000011D` | **VERIFICADO** |
+
+Los cuatro pines: el init llama a `0x08325468(pin, 2, 0)` para `0x72..0x75`, que
+es el `PCON14 = (PCON14 & ~0x00ffff00) | 0x00222200` de Rockbox
+(`button-clickwheel.c:386`). Confirmado en el bus: el modelo de GPIO registra
+`0xe0202/0xe0302/0xe0402/0xe0502` en `+0x200`.
+
+### 17.2 Los dos paquetes
+
+**El que mueve la interfaz** — el ISR `0x080479a8` lo acepta si
+`(rx & 0xBC0000FF) == 0x8000001A`:
+
+```
+ 31    30        25..16          12..8        7..0
+ +---+------+---------------+-----------+-----------+
+ | 1 | dedo |   posición    |  botones  |   0x1A    |
+ +---+------+---------------+-----------+-----------+
+```
+
+Rockbox describe el mismo paquete con la máscara más floja `0x800000FF`
+(`button-clickwheel.c:121`): dos fuentes independientes de acuerdo.
+
+**La respuesta a una orden sondeada** — validada en `0x0832783c` con
+`bic #0x7F000000` + `bic #0x00FF0000` + `cmp`: bit 31 y bits 15..0 iguales a la
+orden, bits 30..16 libres para los datos.
+
+Botones, bits 8..12 del paquete, y el código de tecla que emite `0x0805c11c`:
+SELECT→3, adelante→1, atrás→2, PLAY→4, MENU→0. Los bits son los de Rockbox.
+
+### 17.3 Por qué el modelo se marca el ritmo con un temporizador
+
+El decodificador de giro `0x0807a670` impone tres condiciones duras:
+
+1. **96 posiciones por vuelta** (los `±96` de `0x0807a6a4`, y el
+   `WHEELCLICKS_PER_ROTATION` de Rockbox).
+2. Hacen falta **dos paquetes seguidos con el bit 30 puesto** antes de que se
+   calcule ningún delta: el primero sólo arma.
+3. El umbral vuelve a **6** con cada paquete sin dedo, y la ventana aceptada es
+   **−35..+35** (`0x0807a6dc`).
+
+De la 2 sale la decisión de diseño que no es evidente: **los paquetes se
+espacian con un temporizador, uno cada 40 ms de reloj virtual, en vez de
+encolarse de golpe**. El ISR sobrescribe `0x089116d8+0x20` en cada paquete; si
+dos entran antes de que la tarea de rueda corra una vez, el paquete de armado
+desaparece y el movimiento se lee como un primer toque y se tira. Una FIFO no
+basta: hace falta que el huésped vea cada paquete como su propia interrupción.
+
+Una pulsación de tecla son `IPOD_WHEEL_STEP` posiciones, por defecto **6**, que
+no es un número redondo elegido a ojo sino el umbral que el propio firmware
+tiene en `0x089116d8+0x04` en reposo, leído por el monitor.
+
+### 17.4 Las dos trampas, y la segunda costó una tarde
+
+**Primera: `WHEELMASK` tiene que leerse honradamente.** El firmware lo guarda,
+lo pone a cero alrededor de una transacción sondeada y lo restaura. Mientras el
+bloque era `create_unimplemented_device` toda lectura daba cero, así que lo que
+restauraba era **cero**, y en el log se ve: doce escrituras de `0` a `+0x10`
+frente a una sola de `1`. Sin lectura honrada la interrupción queda enmascarada
+para siempre y ninguna pulsación llega jamás.
+
+**Segunda, y es la lección `HI_IRQ` del 5G otra vez: el INTERRUPTOR DE BLOQUEO
+del PMU.** Con la rueda ya modelada, el giro funcionaba y **los botones no**.
+Medido, con la tecla mantenida tres segundos y leyendo el bloque de estado del
+propio firmware:
+
+```
+0x089116d8+0x1C = 1   el paquete llegó y el ISR lo decodificó
+0x089116d8+0x14 = 1   la tarea de rueda corrió el detector de flancos
+                      0x0805c0e4 y llamó al despachador 0x0803f390
+```
+
+...y la pantalla no cambiaba. La causa está una instrucción después de la
+entrada del despachador: `0x0803f3e0` llama a `0x08030d48` → `0x080634a4` →
+`0x08294f80`, que lee **un byte del registro `0x87` del PMU por I2C** y se queda
+con `(byte >> 1) & 1`; `0x080634a4` devuelve `1 − eso`; y `0x0803f3e4` **vuelve
+inmediatamente si es distinto de cero**. Con el registro a cero, cada botón se
+tiraba en silencio.
+
+Rockbox dice qué es ese bit, y llega a la misma polaridad desde el otro lado
+(`firmware/target/arm/s5l8702/ipod6g/pmu-6g.c:244`):
+
+```c
+pmu_input_holdswitch = !(pmu_read(PCF50635_REG_GPIOSTAT)
+                            & PCF50635_GPIOSTAT_GPIO2);
+```
+
+O sea: **bit puesto = bloqueo desactivado**. El arreglo es una línea en
+`ipod_classic_pmu_reset()`, marcada como VALOR DE CONVENIENCIA: una máquina sin
+interruptor físico que mover tiene que arrancar con él desactivado o no se puede
+usar.
+
+Y la moraleja, que es la misma del `HI_IRQ`: **el giro no pasa por
+`0x0803f390`**, así que no se veía afectado. El fallo parecía de la rueda y era
+del PMU. Comprobar el camino entero significa comprobarlo para cada tipo de
+evento, no una vez.
+
+
+### 17.5 Lo que se ve, medido y mirado
+
+`sh tools/ipod_classic/navtest.sh`, con `~/6g/E.img`. Teclas: `q`/`e` giran,
+Enter selecciona, `w` es MENU, `a`/`d` son atrás/adelante, `s` es play — las
+mismas del 5G, más las dos que faltaban, para que una sola costumbre valga para
+las dos máquinas.
+
+```
+00-idle             75463 px encendidos
+01-idle-again       75463 px encendidos        0 px distintos
+02-wheel-fwd        75432 px encendidos     8000 px distintos (8000 en la lista, 0 en el panel)
+03-wheel-fwd2       75463 px encendidos     8000 px distintos (8000 en la lista, 0 en el panel)
+04-wheel-back       75432 px encendidos     8000 px distintos (8000 en la lista, 0 en el panel)
+05-select           76800 px encendidos    50540 px distintos (38400 en la lista, 12140 en el panel)
+06-select-later     76800 px encendidos        0 px distintos
+07-menu             76800 px encendidos        0 px distintos
+```
+
+Y **mirado**, que es la otra mitad de la medida:
+
+- `00-idle`: la lista de idiomas con la barra azul sobre **English**.
+- `02-wheel-fwd`: la barra sobre **日本語**. Un golpe de `e`, un elemento.
+- `04-wheel-back`: `q` la devuelve a **日本語** desde **Čeština**.
+- `05-select`: **otra pantalla entera** — el icono de la nota musical sobre el
+  degradado gris y el texto **「ミュージックが…」**. Es decir: la selección no
+  sólo cambió de pantalla, cambió al **idioma que estaba resaltado**. Esa
+  coincidencia es lo que convierte "cambiaron muchos píxeles" en "la interfaz
+  hizo lo que se le pidió".
+
+Los **8000 píxeles** son exactamente lo que cuesta mover la barra: dos cajas de
+160×25 encendiéndose y apagándose. El suelo de ruido de esta pantalla es
+**0** —`01-idle-again` lo comprueba en cada carrera antes de creerse nada—, así
+que no hay forma de confundirlo con el reloj de la barra de estado, que además
+esta pantalla no tiene.
+
+Del lado del modelo, en la misma carrera:
+
+```
+WHEELTRACE first command: tx 0xc000011d -> cmd 0x8000023a
+WHEELTRACE first packet queued: 0x8000023a
+WHEELTRACE irq 23 raised for the first time (pend 0x1, mask 0x1)
+WHEELTRACE totals: 14 packets queued, 0 dropped with the FIFO full,
+                   1 commands, 13 rising edges on IRQ 23
+```
+
+Tres cosas que decir de ahí:
+
+- **`pend 0x1, mask 0x1`**: la máscara vale 1 y no 0. Es la prueba directa de
+  que la lectura honrada de `WHEELMASK` era lo que faltaba (§17.4).
+- **`1 commands`**: antes eran **cinco** escrituras de `WHEELTX`, los cinco
+  reintentos de `0x0832780c` contra un bloque mudo. Ahora la primera responde.
+- **`0 dropped`**: la FIFO nunca se llenó, o sea que el huésped drena al ritmo
+  al que el modelo produce. Ese contador está puesto justo para que, si algún
+  día el ISR deja de correr, lo diga en vez de dejarnos adivinando.
+
+Repintados: **417** escrituras de la dirección de origen de la capa 0 en la
+carrera, contra **10** en una carrera en reposo.
+
+### 17.6 Correcciones a lo escrito antes
+
+1. **§6, §15 y §16: «el huésped sondea la rueda ~120 veces por segundo, así que
+   ya hay quien escuche».** Retirado. El firmware hace **una sola** transacción
+   sondeada en el arranque (con cinco reintentos) y a partir de ahí es
+   **puramente por interrupción**, IRQ 23: registra `0x080479a8` en
+   `0x08047a68` y su tarea se duerme para siempre en `wait_event(5)`. Las miles
+   de lecturas de `+0x14` que se contaban eran el giro de espera de esa única
+   transacción contra un registro que devolvía cero. La conclusión de entonces
+   («ya hay quien escuche») era casualmente correcta; el mecanismo, no. Un
+   modelo que sólo devolviera datos en `WHEELRX` sin levantar la línea no habría
+   producido **ni un solo** evento.
+2. **§15, «lo siguiente en orden de coste», punto 1.** Hecho.
+
+### 17.7 Lo que sigue sin saberse
+
+- **MENU no vuelve atrás desde la pantalla que sigue a elegir idioma.** Medido
+  dos veces, con esperas de 15 y de 25 s, y en las dos: **0 píxeles**. Si es
+  porque esa pantalla del primer arranque no tiene a dónde volver, o porque
+  falta algo, es **DESCONOCIDO**. Lo que sí está medido es que la tecla llega
+  entera: con `gdbpoke.py` y breakpoints a lo largo de `0x0803f390`, el código
+  remapeado (`0x6f` para SELECT) atraviesa el despachador, llega a
+  `0x08170e94`, construye el mensaje `'kDwn'` y lo mete en la cola del
+  EventManager, y la suelta hace lo mismo con `'kUp '`. El evento llega; lo que
+  la pantalla decide hacer con él es de la aplicación. **Es el hito que falta.**
+- **El panel derecho no cambia al girar** (0 píxeles a la derecha en los tres
+  giros). La regla `list.pid.….delayedselected1 -> ShowSetting_Language` dice
+  que debería. Que no se dispare apunta a la mitad temporizada de la interfaz
+  —`TimerEventManager`, `0x081059c4`— y es el hilo más prometedor que queda.
+- **Los bits 1 y 2 de `WHEELPEND`/`WHEELMASK`**, el significado de cada bit de
+  `WHEELCON`, el `0x3A980` de `WHEELDIV` y la orden `0x8000062A`: todos
+  **DESCONOCIDOS**, y ninguno hace falta.
+- **Por qué el hardware real acepta las dos codificaciones de `WHEELTX`**
+  (`0x8000023A` de Rockbox y `0xC000011D` de Apple): **DESCONOCIDO**. El modelo
+  acepta las dos y lo dice en el código.
+- **El ritmo real de la rueda** (los 40 ms del temporizador) es una constante de
+  ajuste, no un dato del aparato. `IPOD_WHEEL_TICK_MS`, `IPOD_WHEEL_UNTOUCH_MS`
+  e `IPOD_WHEEL_STEP` la dejan mover para experimentar.
+
+### 17.8 Regresiones comprobadas
+
+| Prueba | Resultado |
+|---|---|
+| `tools/ipod_classic/navtest.sh` | los tres giros dan 8000 px cada uno, y el suelo en reposo sigue siendo 0 |
+| retailOS en reposo, dos capturas seguidas | 0 px de diferencia, igual que antes de la rueda |
+| **`tools/ipod_video/navtest.sh` (el 5G)** | **76 548 px en los siete fotogramas, y el resaltado se mueve: 12 312, 12 114, 31 602.** Idéntico a lo que registra el §15. Sin regresión |
+| El bloque `0x3C200000` ya no está en `ipod_classic_unimplemented[]` | la ventana modelada son 4 KB, no 1 MB: el resto del bloque sigue cayendo al *io floor* y `-d unimp` lo diría. No lo dice |
+
+### 17.9 Cómo reproducirlo
+
+```bash
+wsl -d Ubuntu-24.04 -e bash -c "cd /mnt/c/Desarrollo/qemu-ios/build && ninja qemu-system-arm"
+
+# el disco, igual que en el sec.15
+truncate -s 64M ~/6g/fat32.img && mkfs.vfat -F 32 -n IPOD ~/6g/fat32.img
+python3 tools/ipod_classic/mkdisk6g4k.py ~/6g/E.img \
+        assets/extracted/Firmware-24.9.1.2 ~/6g/fat32.img
+
+# la prueba entera: arranca, espera, comprueba que la pantalla esta quieta,
+# pulsa, captura y decide. Sale 0 si los tres giros movieron el resaltado.
+sh tools/ipod_classic/navtest.sh
+
+# y MIRAR los PNG que deja en ~/6g/nav, que es la otra mitad
+```
+
+A mano, para jugar:
+
+```bash
+cd build && ./qemu-system-arm -M iPod-Classic \
+    -kernel ../assets/classic6g/osos_decrypted.bin -serial null \
+    -drive if=ide,format=raw,file=$HOME/6g/E.img -snapshot
+# q / e giran la rueda, Enter selecciona, w es MENU, a / d atras / adelante,
+# s es play. WHEELTRACE=1 cuenta paquetes, ordenes e interrupciones.
+```

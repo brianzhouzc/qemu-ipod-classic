@@ -59,6 +59,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
 #define PCF5063X_ADCS3_ADCRDY     0x80
 
 /*
+ * GPIOSTAT bit 1, PCF50635_GPIOSTAT_GPIO2 in Rockbox's pmu-target.h:43. It is
+ * the hold switch, inverted: pmu-6g.c:244 reads it as
+ * "holdswitch = !(GPIOSTAT & GPIO2)", so SET means hold is OFF. Apple's
+ * keycode dispatcher reaches the same conclusion from the other direction --
+ * see the long note at the reset function. Clear it and no button on the
+ * click wheel does anything at all.
+ */
+#define PCF50635_GPIOSTAT_HOLD_OFF  0x02
+
+/*
  * ASSUMED. 844 of 1023 is 3900 mV through Rockbox's own conversion in
  * pmu-6g.c (raw * 2000 / 1023 + 2250). Nothing in our sources says what a real
  * cell reads; this is chosen to be an ordinary value rather than an

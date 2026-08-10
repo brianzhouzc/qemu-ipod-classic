@@ -161,6 +161,38 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
     s->addr = 0;
     s->addr_pending = false;
     pmu_start_adc(s);
+
+    /*
+     * THE HOLD SWITCH, and it is not decoration: with this bit at zero every
+     * button press on the click wheel is silently thrown away.
+     *
+     * Two independent sources say what GPIOSTAT bit 1 means, and they agree.
+     * Rockbox, firmware/target/arm/s5l8702/ipod6g/pmu-6g.c:244 --
+     *
+     *     pmu_input_holdswitch = !(pmu_read(PCF50635_REG_GPIOSTAT)
+     *                                 & PCF50635_GPIOSTAT_GPIO2);
+     *
+     * -- so the bit SET means the hold switch is OFF and input is allowed.
+     * Apple's retailOS, disassembled: 0x08294f80 reads one byte of register
+     * 0x87 over I2C and stores (byte >> 1) & 1; 0x080634a4 turns that into
+     * "1 - it"; and 0x0803f3e0, the second instruction of the keycode
+     * dispatcher 0x0803f390, returns immediately when that is non-zero. Same
+     * polarity, arrived at from the other end.
+     *
+     * MEASURED, before and after. With the register at 0 the wheel worked and
+     * the buttons did not: holding ENTER down for three seconds and reading
+     * the firmware's own state block showed 0x089116d8+0x1C = 1 (the packet
+     * arrived) and +0x14 = 1 (the edge detector ran and called the dispatcher)
+     * -- and the screen never changed, because the dispatcher dropped the key
+     * one instruction later. The turn of the wheel does not pass through
+     * 0x0803f390 at all, which is exactly why it was not affected and why the
+     * failure looked like a wheel bug rather than a hold switch.
+     *
+     * CONVENIENCE VALUE, and marked as one: a machine with no hold switch to
+     * flip has to boot with it off or it cannot be used. The other two bits
+     * stay zero -- Rockbox marks both "TBC" and nothing we have reads them.
+     */
+    s->reg[PCF50635_REG_GPIOSTAT] = PCF50635_GPIOSTAT_HOLD_OFF;
 }
 
 static const VMStateDescription vmstate_ipod_classic_pmu = {
