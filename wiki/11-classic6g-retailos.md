@@ -237,11 +237,20 @@ nada falle:
 08127f94: str r0,[r4,#0x70]     ; LCD[0x70] = 1     <- "presenta"
 ```
 
-Medido con el monitor (`xp /1wx 0x089115e4`): vale **`0x08911fe0`**, o sea **no
-es nulo**, y `[0x08911fe0 + 0x0c] = 0x080c1164`, que es justo la función que la
-cabecera de `ipod_classic_lcd.c` identifica como el `displaylcd_setup()` de
-Rockbox. Es decir: **el retailOS sí llama a "dibuja la pantalla entera", y lo
-único que esa llamada emite es `0x2A`, `0x2B`, `0x2C` y ocho bytes de
+Ese puntero **está a cero en la imagen** (`0x089115e4` vale `0x00000000` en el
+fichero), así que lo pone alguien en tiempo de ejecución, y la comprobación de
+nulo de `0x08127f64` es real. Tres medidas dicen que pasa:
+
+- Con disco, a los 45 s, `xp /1wx 0x089115e4` devuelve **`0x08911fe0`**, uno de
+  los tres registros de driver de panel. `[0x08911fe0 + 0x0c] = 0x080c1164`.
+- Sin disco, `-d in_asm` de 25 s: `0x08127f14` entra **22 veces** y
+  `0x080c1164` entra **22 veces** — una por intento de arranque. La rama nula
+  no se toma nunca.
+- Y `0x080c1164` es justo la función que la cabecera de `ipod_classic_lcd.c`
+  identifica como el `displaylcd_setup()` de Rockbox.
+
+Es decir: **el retailOS sí llama a "dibuja la pantalla entera" en cada arranque,
+y lo único que esa llamada emite es `0x2A`, `0x2B`, `0x2C` y ocho bytes de
 parámetro.** Igual que en Rockbox: `displaylcd_setup()` sólo fija la ventana. Lo
 que en Rockbox viene después es `displaylcd_dma()`; lo que en Apple viene
 después es `LCD[0x70] = 1`. Los píxeles nunca pasan por la CPU en ninguno de los
