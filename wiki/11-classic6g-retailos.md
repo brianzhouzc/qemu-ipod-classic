@@ -513,11 +513,48 @@ Sin disco, esa tarea recibe mensajes y monta (falla el sondeo, pero **levanta la
 bandera igual** y la interfaz sigue). Con disco **no recibe ninguno**:
 `0x083287b4` no se alcanza en 90 s.
 
-El único emisor de mensajes de tipo 0 en los 9,4 MB de imagen es `0x0813b160`
-(mensaje estático en `0x0813b21c`, `[msg+0x10] = 0`), al que se llega por
-`0x0813b220`, que es un manejador de la tarea **`"ATAWorkLoopTask"`** (la cadena
-está en `0x0813b2bc`, y `0x0813b234` es quien crea la tarea). Sin disco se
-ejecuta; con disco no.
+### Y el mensaje sí se envía: el que no llega a escuchar es el receptor
+
+Esto hay que decirlo con cuidado porque la primera lectura fue la equivocada. El
+único emisor de mensajes de tipo 0 de la imagen es `0x0813b160` (mensaje
+estático en `0x0813b21c`, `[msg+0x10] = 0`), al que se llega desde `0x0813b220`,
+que es el cuerpo de la tarea **`"ATAWorkLoopTask"`** (cadena en `0x0813b2bc`,
+creada en `0x0813b234` con prioridad 24). Parecía razonable pensar que con disco
+no se ejecutaba. **Es falso, y medirlo cuesta un minuto:** con `A.img` y sin
+disco las cuatro primeras paradas de `0x0813b160`, `0x0813b1ac` y `0x0813b1c0`
+son **idénticas registro a registro**. El mensaje se envía en los dos casos.
+
+Lo que cambia es el **receptor**. Antes de su primer `KS_receive(4)`, la tarea
+`0x0832878c` hace dos llamadas:
+
+```asm
+832878c: push {r4,r5,r6,lr}
+8328790: mov r0,#1
+8328794: bl 0x081c207c        ; coger el dispositivo 1     <- vuelve
+8328798: mov r5,r0
+832879c: bl 0x08126638        ; <- CON DISCO NO VUELVE
+83287a0: mov r1,#0 ; mov r0,#4 ; bl 0x080159a0   ; recibir  <- nunca se llega
+```
+
+Medido en las dos configuraciones: sin disco las paradas llegan hasta
+`0x083287a0` y se repiten; con disco se paran en `0x0832879c` y ahí acaban.
+
+Y de ahí hacia abajo, cada eslabón es otra parada real:
+
+```
+0x08126638   lock([dev+0x10]) ; blx [[dev+4]+0x18] -> 0x0823d420
+0x0823d420     el sondeo de almacenamiento: reserva 4096 B, LBA 0
+0x0823d52c       bl 0x0827aad0                       <- CON DISCO NO VUELVE
+0x0827aad0         bl 0x0827a3f8 ; blx [r0+8]        <- vuelve (r0 = 0)
+0x0827ab10         bl 0x0827aa1c                     <- AQUÍ SE PARA
+```
+
+`0x0827aa1c` es el que interpreta el mapa de particiones sobre el búfer de 4096
+bytes que acaba de leerse de LBA 0. **Ese es el obstáculo concreto de hoy**, y
+es el mismo con disco a ceros, con `A.img` (MBR de 512 bytes, partición de
+firmware real y FAT32 con `iPod_Control`) y con `E.img` (MBR en unidades de
+4096): las tres se paran en el mismo sitio, y las tres dan trazas de ATA
+idénticas de 682 líneas.
 
 ### Lo que se arregló por el camino: GPIO pin 86
 
@@ -547,25 +584,38 @@ verificado arriba.
 
 ### El obstáculo concreto que queda
 
-> **Con disco, la tarea `ATAWorkLoopTask` nunca encola el trabajo que hace que
-> `0x0813b160` anuncie «monta el volumen».** Sin disco sí. Todo lo demás
-> —proveedores de recursos, contenedor empotrado, panel, ventana— está
-> comprobado y funcionando.
+> **Con disco, `0x0827aa1c` — el intérprete del mapa de particiones — no
+> vuelve.** Se le llama con el búfer de 4096 bytes leído de LBA 0. Todo lo que
+> hay aguas arriba y aguas abajo está comprobado y funciona: el ATA entrega, los
+> proveedores de recursos están montados, el contenedor empotrado está en RAM, el
+> panel dibuja lo que se le mande y la ventana se fija bien.
 
 Lo que se sabe del ATA en ese momento (`ATATRACE=1`, disco a ceros, `A.img` y
 `E.img`: **las tres trazas son idénticas, 682 líneas**):
 
 - La orden `0xEC` (IDENTIFY) se completa.
 - Dos lecturas por DMA, las dos en LBA 0: `0x1000` bytes a `0x0be5d3e0` y
-  `0x8000` bytes a `0x0be55320`.
-- Después el driver cierra limpiamente (`+0x18 = 0x640`, lee `+0x70`/`+0x7c`) y
-  **no vuelve a hablar**. No está girando sobre ningún registro.
-- Sin disco la traza acaba en `WR +0x70 = 0xec` sin respuesta: el IDENTIFY falla,
-  y **ese fallo es lo que dispara el anuncio**.
+  `0x8000` bytes a `0x0be55320` — que son justo el búfer de 4096 de
+  `0x0823d420` y su segunda pasada.
+- Después el driver cierra limpiamente (`ATA_CFG = 0x640`, lee `+0x70`/`+0x7c`)
+  y **no vuelve a hablar**. No está girando sobre ningún registro: el bloqueo
+  está por encima del driver.
+- Sin disco la traza acaba en `WR +0x70 = 0xec` sin respuesta. El IDENTIFY falla,
+  `0x0823d420` sale por su rama temprana (`0x0823d44c`) sin llegar nunca a
+  `0x0827aad0`, y por eso el camino sin disco no se bloquea: **se bloquea el que
+  encuentra un disco, no el que no lo encuentra.**
 
-Es decir: el camino de error del ATA anuncia y el de éxito no. La pieza que
-falta está entre «el IDENTIFY salió bien» y «encola el trabajo de llegada de
-medio», y es lo primero que hay que mirar mañana.
+Lo primero que hay que hacer mañana es entrar en `0x0827aa1c` con
+`gdbpoke.py` y ver en qué se para: si es un giro sobre un registro que no
+modelamos, si espera otra lectura que nunca pide, o si está bloqueado en un
+objeto del kernel.
+
+`INFERIDO`, y hay que comprobarlo antes de creérselo: si eso se destraba, se
+monta un volumen; si el volumen es la partición `rsrc` del `.ipsw`, aparece
+`\Resources\Fonts\Helvetica.ttf`; con eso `0x082393ec` deja de devolver `{0,0}`
+y la composición de la interfaz puede terminar. Sólo entonces se sabrá de dónde
+lee el motor de trama de `+0x70`, que es la última incógnita del camino a
+píxeles.
 
 ---
 
