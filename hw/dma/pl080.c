@@ -262,6 +262,20 @@ void pl080_pace_request(PL080State *s, int line)
      */
     s->req_burst |= (1u << line);
     pl080_run(s);
+    /*
+     * One-shot request. pl080_run's consume logic clears the request bit at a
+     * terminal-count, but if this pulse moved nothing -- the channel was not
+     * enabled yet, or was stalled between tasks -- the bit would LINGER. A
+     * lingering request then drains a whole task the instant the guest enables
+     * the channel (measured: Rockbox's dmac_ch_run for the first audio task,
+     * followed at once by a terminal-count that clears the channel E-bit, so
+     * the guest's very next dmac_ch_queue_2d link check sees E=0 and panics
+     * "DMA ch link error"). Dropping the pulse here keeps pacing honest: the
+     * channel only advances on a live request, so it stays enabled between
+     * ticks and the guest can extend the LLI chain in time. Paced lines only.
+     */
+    s->req_burst &= ~(1u << line);
+    s->req_single &= ~(1u << line);
 }
 
 static uint64_t pl080_read(void *opaque, hwaddr offset,

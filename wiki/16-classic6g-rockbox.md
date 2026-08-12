@@ -9,9 +9,9 @@ reproducen.
 > Por qué Rockbox: el retailOS ya arranca, dibuja y lista la música, pero **no
 > suena** porque decodifica el MP3 en el DSP CalmADM2E, que no está modelado
 > (ver [14-classic6g-audio.md](14-classic6g-audio.md)). Rockbox decodifica el
-> MP3 **en el ARM**, así que el PCM real saldría por el mismo FIFO del I²S que
-> ya capturamos a WAV. Este documento es el primer paso: **arrancar Rockbox**.
-> Reproducir y capturar el audio es el siguiente frente.
+> MP3 **en el ARM**, así que el PCM real sale por el mismo FIFO del I²S que ya
+> capturamos a WAV. Empezó por **arrancar Rockbox** (§1–4) y ya llega hasta el
+> final: **reproduce un MP3 y el WAV capturado es la canción** (§7, medido).
 
 ---
 
@@ -23,6 +23,7 @@ reproducen.
 | 2. Pasa el init temprano (system, clocks, MMU) sin colgarse | **hecho** — hand-off del bootloader (§2) |
 | 3. Inicializa el LCD y DIBUJA | **hecho** — la ruta de píxeles por DMA al LCD (§3) |
 | 4. Llega a su menú principal navegable | **hecho** — menú cabbiev2, la rueda mueve el resaltado, SELECT entra (§4) |
+| 5. Reproduce un MP3 y el PCM capturado ES la canción | **hecho** — WAV con correlación 1.000 contra el original (§7) |
 
 Captura del hito 4 (disco con `/.rockbox`, tema cabbiev2 completo): el menú
 "Rockbox" con **Files / Database / Resume Playback / Settings / Recording /
@@ -217,12 +218,75 @@ Trazas útiles: `-d unimp,guest_errors` (periférico no modelado), `LCDTRACE=1`
 
 ---
 
-## 7. Siguiente frente: que suene
+## 7. Hito 5 — SUENA: el MP3 decodificado, capturado a WAV y **medido**
 
-El menú ya está. Para **audio**: entrar en *Files* / *Database*, seleccionar un
-MP3, y que Rockbox lo decodifique (`mpa.codec`, en ARM) y saque el PCM por el
-I²S. La infraestructura de captura a WAV (`AUDIOWAV=`, FIFO del I²S en
-`0x3CA00000`) ya existe (ver [14-classic6g-audio.md](14-classic6g-audio.md)); a
-diferencia del retailOS, aquí el PCM debería ser real, no silencio, porque no
-depende del DSP no modelado. Riesgos a medir uno a uno: el pacing del DMA de
-audio (línea *paced* del I²S) y que la reproducción arranque desde la UI.
+**Hecho.** Rockbox monta el disco, lista los MP3 en *Files*, y al darle SELECT
+entra en la pantalla *Now Playing* (WPS) y **reproduce**: `mpa.codec` decodifica
+el MP3 **en el ARM**, deja PCM s16le estéreo en DRAM, DMAC0 canal 2 lo empuja al
+FIFO del I²S en `0x3CA00010`, y `AUDIOWAV=` lo vuelca a un WAV. Ese WAV **es la
+canción**, no silencio ni ruido — demostrado midiéndolo contra el MP3 original.
+
+**El WAV entregable:** `~/6g/rockbox_numb_encore.wav` (4.9 MB, 48000 Hz, 16-bit,
+estéreo, ~25.7 s de "Numb / Encore" de Linkin Park). Fuera de git a propósito.
+
+### La prueba (medida, no inferida)
+
+Decodificando el MP3 original con `ffmpeg` a la misma tasa y correlacionando:
+
+```
+python3 tools/ipod_classic/wavcheck.py ~/6g/rockbox_numb_encore.wav \
+        ~/6g/tracks/'Numb - Encore.mp3'
+```
+
+- **RMS 7014** (−13.4 dBFS), **pico 29128** (−1.0 dBFS), **99.9 %** de muestras
+  no nulas → hay señal con dinámica real (un WAV de ceros da RMS 0).
+- **Estéreo de verdad:** L RMS 7780, R RMS 6971, RMS(L−R) 4634 (0 sería
+  falso-mono); L==R exacto sólo en el 0.15 % de los frames.
+- **Correlación cruzada normalizada = 1.000** contra el decode del MP3, a un lag
+  constante de ~18 ms (el *priming* del decodificador de Rockbox frente al de
+  ffmpeg). Trozos de la captura a t=3,8,13,18,23 s casan **exactamente** con
+  3.016, 8.016, 13.016, 18.016, 23.016 s del original (lag +5.00 s por trozo):
+  es un decode **continuo** de la canción real, no un bucle ni una casualidad.
+- Espectrograma de la captura ≈ espectrograma del original
+  (`tools/ipod_classic/specimg.py`; ver `~/6g/rockbox_numb_encore_spec.png` vs
+  `~/6g/ref_numb_encore_spec.png`).
+- Pantallas: `1-files.png` (Rockbox lista `InTheEnd` y `Numb`), `2-wps.png`/
+  `5-wps.png` (*NOW PLAYING* "Numb / Encore … Linkin Park", el reloj avanza
+  0:04 → 0:17 entre capturas).
+
+### Cómo reproducirlo
+
+```sh
+# disco con /.rockbox + los MP3 en la FAT: ~/6g/Erbmusic.img (ya fabricado)
+# AUDIOPACE=1 es OBLIGATORIO (ver abajo).
+env AUDIOPACE=1 sh tools/ipod_classic/rbplay.sh \
+        $HOME/6g/Erbmusic.img $HOME/6g/rbfinal $HOME/6g/rbfinal/play.wav
+python3 tools/ipod_classic/wavcheck.py $HOME/6g/rbfinal/play.wav \
+        $HOME/6g/tracks/'Numb - Encore.mp3'   # VERDICT: MATCH
+```
+
+### Lo que hubo que ajustar en el modelo (un solo cambio)
+
+`hw/dma/pl080.c`, en `pl080_pace_request()`: tras `pl080_run()` se **suelta** el
+bit de petición one-shot de la línea. Sin esto, una petición que no movió nada
+(canal aún no habilitado, o parado entre tasks) quedaba **colgada** y, al
+habilitar el guest el canal, drenaba una task entera de golpe; el terminal-count
+que seguía apagaba el bit E del canal y el `dmac_ch_queue_2d` de Rockbox veía
+E=0 y entraba en pánico *"DMA ch link error"*. Soltando el pulso, el canal sólo
+avanza con una petición viva y sigue habilitado entre ticks, así que el guest
+puede extender la cadena de LLIs a tiempo. **Sólo afecta a líneas *paced***
+(único llamador: `ipod_classic_i2s_drain()`), y ésas sólo existen bajo
+`AUDIOPACE` — de modo que el retailOS y el 5G, que nunca marcan la línea ni
+llaman a la función, quedan **byte-idénticos** (verificado leyendo el gateo
+`i2s_pace_on()`; navtest 6G: la rueda mueve el resaltado 5/5, y el fallo de
+SELECT es la fluctuación ya documentada del arnés, no una regresión; 5G: navega).
+
+### Dos correcciones a lo que se predijo
+
+- **`AUDIOPACE=1` es necesario**, no opcional. Sin pacing el DMA drena el anillo
+  al instante, la reproducción hace *underrun* antes de que el codec decodifique
+  el segundo buffer y sólo se capturan ~512 B. Medido: `rbverify_np` (sin pace)
+  = 556 B; con pace = WAV completo. El pacing no cambia el *contenido* muestra a
+  muestra, pero sí es lo que mantiene el flujo vivo lo bastante para capturarlo.
+- **La tasa es 48000 Hz**, no 44100: este MP3 es de 48 kHz, Rockbox pone
+  `I2SCLKDIV=0xfa` (=250 → 12 MHz/250 = 48000) y el WAV queda etiquetado bien.
