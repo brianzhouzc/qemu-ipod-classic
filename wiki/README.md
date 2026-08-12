@@ -30,6 +30,7 @@ Para una introducción de una página, empezar por el
 | Documento | Contenido |
 |---|---|
 | [12-historia-6g.md](12-historia-6g.md) | **Cronología técnica del iPod classic 6G**: desde un firmware que era un bloque cifrado ilegible hasta una pantalla de idiomas navegable. Cada obstáculo con su síntoma, su causa y **cómo se encontró**; el catálogo de hipótesis retiradas; y el capítulo de **las tres veces que un descarte resultó ser la pista buena** — qué tienen en común y qué habría que haber hecho distinto. |
+| [13-classic6g-musica.md](13-classic6g-musica.md) | **Meterle música al 6G emulado**: por qué copiar el MP3 no basta, cómo se construye el `iTunesDB` con `libgpod`, y de dónde salen el modelo y el número de serie (del `SysCfg` de la NOR, con las etiquetas invertidas). Con el punto de riesgo dicho claro: el identificador FireWire está **inventado**, y si el firmware valida el hash contra el suyo, la lista saldrá vacía. |
 | [09-historia-5g.md](09-historia-5g.md) | Lo mismo para el iPod Video 5G: cada obstáculo, su síntoma y su causa, **incluidas las hipótesis que resultaron falsas** y por qué se sostuvieron. Con el catálogo de errores retirados, las técnicas de depuración ordenadas por lo que rindieron, y las cuestiones abiertas. |
 
 ### El iPod classic 6G (S5L8702)
