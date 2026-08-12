@@ -150,13 +150,43 @@ funciones** que selecciona `0x082465xx`: el firmware identifica el tipo de
 volumen y despacha al driver correspondiente, y ese driver es el que valida (o
 descarta) la cabecera FAT.
 
+### Más adentro: la lectura tiene éxito; el rechazo es de contenido
+
+Bajando la cadena a mano (2026-08-12):
+
+- **La lectura del sector de arranque NO falla.** `0x0827a6b0` es la lectura
+  FS y devuelve 0 (éxito); su envoltorio `0x0824690c` sólo mapea errores *de
+  lectura* (compara el resultado con 31 y 0, códigos de E/S). Así que los bytes
+  de la cabecera llegan bien al buffer. Lo que rechaza el volumen es el
+  **examen** de esos bytes, no la lectura.
+
+- **El detector de tabla de particiones es `0x0827a980`.** Lee un sector y mira
+  su `+0x1FE`: si es `0xAA55` lo trata como **MBR** y salta al parser
+  `0x080aee04`; si empieza por `"ER"` lo trata como **APM** (mapa de particiones
+  de Apple) y salta a `0x080a38cc`; si ninguno, error. Las direcciones de los
+  dos parsers coinciden con las que la §15 del [11](11-classic6g-retailos.md)
+  ya había visto ejecutarse.
+
+- El examen que decide FAT-válido-o-no está **detrás del despacho por vtable**
+  de `0x082465xx` (elige driver por tipo, `cmp #1/#4/#5`), y ahí es donde se
+  cortó esta sesión: resolver ese puntero en ejecución necesita el depurador.
+
 ### Lo que falta, acotado para retomarlo
 
 Poner un breakpoint (con `tools/ipod_classic/gdbpoke.py`) en el driver de FAT
-que la vtable selecciona en `0x082465xx`, y ver **qué campo de la cabecera
-rechaza**. Es una tarea de una sola sesión. Candidatos a mirar de camino: el
-byte que `0x0824659c` lee en `+6` y compara con `8`, y la cadena `"FAT32   "`
-en `+0x52` del sector de arranque.
+que la vtable selecciona en `0x082465xx`, volcar el buffer del sector de
+arranque ya leído, y ver **qué campo rechaza**. Es una tarea de una sola
+sesión. Candidatos a mirar de camino: el byte que `0x0824659c` lee en `+6` y
+compara con `8`, la cadena `"FAT32   "` en `+0x52` del sector de arranque, y —
+por descartar— si el firmware corre el detector `0x0827a980` sobre la propia
+partición de datos y, al ver el `0xAA55` que todo sector de arranque FAT lleva,
+la confunde con un MBR anidado.
+
+Instrumentos que ayudaron y se pueden rehacer (fueron temporales, no están en
+el árbol): en `ipod_classic_ata.c`, imprimir en `dma_go` el PC y la pila del
+huésped (`current_cpu` → `ARM_CPU(cs)->env.regs[13..15]`,
+`cpu_memory_rw_debug`) cuando `ide_get_sector(is) >= 181568`; eso dio la cadena
+de montaje entera de un tiro.
 
 > **Hipótesis de trabajo, sin verificar:** que un iPod classic 6G de fábrica
 > formatea su partición de datos con parámetros que nuestra `mkfs.vfat` no
