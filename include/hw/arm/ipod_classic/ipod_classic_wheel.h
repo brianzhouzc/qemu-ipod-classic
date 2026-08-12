@@ -262,13 +262,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
  *   one shot         1 of 3                       2 of 3
  *   repeated         5 of 10                      5 of 5
  *
- * The real wheel does not have this problem because it streams: while anything
- * is happening it reports at its own rate and the current button state is in
- * every packet. So does this now -- the state is repeated one packet per tick
- * while a button is held, and for a while after the release so that the UP
- * edge gets the same treatment. Tunable with IPOD_WHEEL_BTN_REPEAT_MS; 400 ms
- * is ten ticks, and a monitor "sendkey ret 150" therefore lands about four
- * DOWN packets and ten UP ones.
+ * So the state is repeated one packet per tick while a button is held, and for
+ * a while after the release so that the UP edge gets the same treatment.
+ * Tunable with IPOD_WHEEL_BTN_REPEAT_MS; 400 ms is ten ticks, and a monitor
+ * "sendkey ret 150" therefore lands about four DOWN packets and ten UP ones.
+ *
+ * 400 MS IS NOT A FACT ABOUT THE HARDWARE. It is a model choice, and it is
+ * held to the same standard as the two constants above: the real wheel's
+ * reporting rate is UNDETERMINED and so is whether it keeps reporting after a
+ * button comes back up. What IS known is only that the state of every button
+ * travels in every packet the wheel sends (button-clickwheel.c:273 decodes all
+ * five bits out of one status word), so repeating the state is at worst
+ * harmless and at best exactly what the part does. The window was picked long
+ * enough that the guest's wheel task cannot miss both edges and short enough
+ * that it is over before the next keystroke; the measurement it bought is the
+ * MENU column of the table above, and nothing here claims more than that.
  *
  * AND IT IS NOT THE WHOLE STORY, which is why the table above is printed with
  * its bad column: SELECT is still lost about half the time and this did not

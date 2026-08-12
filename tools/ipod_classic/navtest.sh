@@ -61,9 +61,23 @@
 # thrown away by the guest. Measured with a dedicated run of five round trips
 # (wiki/11 s.18.8): SELECT from the main menu landed 5 times out of 10, MENU 5
 # out of 5, with the wheel model reporting every packet queued and none dropped.
-# The cause is NOT found. If this script fails ONLY on 09-into-music, run it
-# again before looking for a regression -- and if you want to chase it, the
-# suspect and the experiment are written down in that same section.
+# The cause is NOT found; the suspect and the experiment are in that section.
+#
+# IT IS NOT ONLY 09-into-music, and an earlier version of this header said it
+# was. Measured over four runs (wiki/11 s.19.5): SELECT landed 5 times out of
+# 7, and one of the two it lost was 05-select, the FIRST one, on the language
+# screen. Losing that one is the nastiest case because it does not look like
+# itself: every later screenshot lands on the language screen instead of the
+# main menu, so 07/08 still show ~8 000 px of list movement -- the language
+# list really is moving -- with 0 px in the panel, and that reads like "the
+# preview pane is broken" when it is the correct behaviour for the screen we
+# are accidentally still on (s.18.5). Before believing any panel or MENU
+# failure below, check that 05-select is above 3 000 px.
+#
+# So: if this run fails at 05-select or ONLY at 09-into-music, repeat it before
+# looking for a regression. MENU itself has not been seen to fail since the
+# button state started being repeated: 2 of 2 where there was somewhere to go
+# back to, and 4 of 4 correctly doing nothing at the top of the stack.
 #
 # The second signal, and it is independent of the pixels: DISPTRACE=1 prints a
 # line every time the guest hands the compositor a new source address, which is
@@ -102,6 +116,29 @@ rm -f "$out"/*.ppm "$out"/*.png "$out"/disp.txt "$out"/qemu.err
 # launched this script. That self-kill costs a whole boot to work out.
 pkill -9 -x qemu-system-arm 2>/dev/null || true
 sleep 1
+
+# AND NOW LOOK FOR THE ONES THAT PKILL CANNOT SEE, because this has now cost
+# four runs across two sessions. The line above only matches the NAME
+# "qemu-system-arm"; this tree also produces private copies under other names
+# on purpose, so that one session cannot kill another's -- ~/evt/qemu-evt for
+# evtrace.py, and ~/6g/ipod-classic-run has been seen too. Those survive, sit
+# at 90-plus per cent of a core, and the guest then misses its own boot
+# deadlines and software-resets to diskmode: the run below produces a full set
+# of screenshots of the wrong screens (wiki/11 s.18.9 and s.19.5).
+#
+# So do not kill them -- they may be another session's work in flight -- but do
+# NOT let this run pretend afterwards that its numbers meant something. Say it
+# up front, where it is still cheap to stop.
+strays=$(ps -eo comm= 2>/dev/null | grep -c -i -E 'qemu|ipod-classic-run' || true)
+[ -n "$strays" ] || strays=0
+if [ "$strays" -gt 0 ]; then
+    echo "*** ATENCION: hay $strays proceso(s) tipo QEMU corriendo ADEMAS de"
+    echo "*** este. 'pkill -x qemu-system-arm' no toca los que se llaman de"
+    echo "*** otra forma (qemu-evt, ipod-classic-run). Con la maquina cargada"
+    echo "*** el huesped se reinicia a diskmode y el veredicto NO valdra."
+    echo "*** Mira 'ps aux | grep -i qemu' y 'uptime' antes de seguir."
+    echo
+fi
 
 # The first pixel lands between 22 and 30 s of wall clock and there is one
 # late repaint at about 39 s; 48 s is past both with room to spare. Keys are

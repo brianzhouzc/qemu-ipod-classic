@@ -17,7 +17,7 @@ navegan.**
 | Máquina | SoC | Estado |
 |---|---|---|
 | `iPod-Video` | PP5022C | **Arranca los dos firmwares del aparato real**: Rockbox hasta el menú, navegable; y el retailOS de Apple dibujando su interfaz, con menús y submenús navegables |
-| `iPod-Classic` | S5L8702 | **Arranca el retailOS de Apple**: kernel RTXC, ATA con DMA, volumen `rsrc` montado, tipografías, y **la pantalla de selección de idioma — 75 463 de 76 800 píxeles — que la rueda mueve y el botón central atraviesa**. MENU todavía no vuelve atrás |
+| `iPod-Classic` | S5L8702 | **Arranca el retailOS de Apple y se navega**: kernel RTXC, ATA con DMA, volumen `rsrc` montado, tipografías, la pantalla de selección de idioma — 75 463 de 76 800 píxeles — que la rueda mueve, y desde ella **el menú principal en el idioma elegido, con el panel derecho siguiendo al resaltado, Enter entrando en Música y MENU volviendo al mismo fotograma**. Falta: el huésped tira un SELECT de cada tres o cuatro, sin causa encontrada |
 
 Para una introducción de una página, empezar por el
 [README de la raíz](../README.md). Para compilarlo, ejecutarlo y probarlo:

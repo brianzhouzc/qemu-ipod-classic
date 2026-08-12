@@ -1229,10 +1229,20 @@ una bootrom esta se queda con la dirección.
 
 > **Cumplido con el retailOS.** La rueda mueve el resaltado (**8 000 píxeles por
 > giro sobre un suelo de ruido de 0**) y el botón central entra en la pantalla
-> siguiente (**50 540 píxeles**), en el idioma que estaba resaltado.
-> `sh tools/ipod_classic/navtest.sh` lo comprueba y decide. **MENU todavía no
-> vuelve atrás**, y ése es el hito que falta. Ver [11](11-classic6g-retailos.md)
-> §17.
+> siguiente, en el idioma que estaba resaltado.
+> `sh tools/ipod_classic/navtest.sh` lo comprueba y decide.
+>
+> **Y MENU ya vuelve atrás**, desde el §18 de [11](11-classic6g-retailos.md):
+> no era la entrada, era el compositor, que seguía dibujando una capa que el
+> huésped había apagado y que tapaba la interfaz entera. Medido y **mirado**:
+> desde el menú principal, Enter entra en Música y MENU devuelve **el mismo
+> fotograma** del que se salió (0 px de diferencia en la carrera buena). Al
+> destaparse la interfaz cambiaron las cifras: entrar con Enter son ahora
+> **~19 340 px**, no los 50 540 de cuando la capa muerta estaba encima, y un
+> giro en el menú principal mueve **la lista y el panel a la vez**.
+>
+> **Lo que falta:** el huésped tira un SELECT de cada tres o cuatro y no se sabe
+> por qué; el sospechoso está en el §18.8. Ver también el §19.
 >
 > Y la mitad del trabajo no era la rueda: el despachador de teclas del retailOS
 > consulta el **interruptor de bloqueo del PMU** y tiraba todos los botones en
@@ -1306,10 +1316,18 @@ se intentó y H6 (audio) sigue sin hacerse.
 - La pantalla de selección de idioma: **75 463 de 76 800 píxeles, 404 colores**,
   entre 22 y 30 s de reloj de pared. `sh tools/ipod_classic/navtest.sh` la
   arranca, la mueve con la rueda y **decide**.
-- **Lo que falta, en orden**: (1) **MENU no vuelve atrás**, y la tecla llega
-  entera hasta la cola del EventManager, así que lo que falta está por encima de
-  la capa de entrada; (2) el **panel derecho no cambia al girar**, lo que apunta
-  al `TimerEventManager`; (3) audio, USB, NAND y CE-ATA.
+- **Se navega de verdad**: la pantalla de idiomas lleva al menú principal, un
+  giro allí mueve **la lista y el panel derecho a la vez**, Enter entra en
+  Música y **MENU vuelve al fotograma exacto** del que se salió. Los dos puntos
+  que aquí figuraban como pendientes —«MENU no vuelve» y «el panel no cambia»—
+  eran **un solo fallo nuestro y no del `TimerEventManager`**: el compositor
+  dibujaba una capa que el huésped había apagado. Ver
+  [11](11-classic6g-retailos.md) §18.
+- **Lo que falta, en orden**: (1) el huésped **tira un SELECT de cada tres o
+  cuatro**, sin causa encontrada (§18.8, §19.6); (2) `TICNTH`/`TICNTL` del
+  bloque de temporizadores no están decodificados y leen cero — inofensivo para
+  el retailOS, mortal para quien gire sobre `FIVE_USEC_TIMER` (§19.3); (3)
+  audio, USB, NAND y CE-ATA.
 - **Sin disco no hay imagen**, y es del huésped: no hay ninguna tipografía
   dentro de la imagen del firmware.
 

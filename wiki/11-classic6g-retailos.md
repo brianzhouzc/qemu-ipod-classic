@@ -2086,3 +2086,258 @@ veredicto no vale para nada. Repítela.
   vale `'1'` en las 1 380 reglas de la imagen. **DESCONOCIDO** para qué es.
 - **La pantalla «Low Battery» intermitente** de los 46 s sigue sin explicación
   propia; ver la sospecha del §18.9.
+
+---
+
+## 19. Quinta auditoría independiente: el temporizador, medido de una vez (10 de agosto de 2026)
+
+La tanda del §18 dejó `tools/ipod_classic/tests/timer_audit.c` en el árbol **sin
+escribir en ninguna parte lo que la prueba contesta**. Esta sección lo arregla:
+la prueba se ejecutó, dice cinco cosas, y **tres de ellas son fallos del
+modelo**.
+
+```
+$ sh tools/ipod_classic/tests/build.sh
+$ ./build/qemu-system-arm -M iPod-Classic -kernel assets/tests/timer_audit.bin \
+      -display none -monitor none -serial stdio
+```
+
+### 19.1 La hipótesis de partida queda REFUTADA, y con la medida en la mano
+
+La orden de trabajo traía una sospecha fuerte heredada de una auditoría
+anterior: «`TBCNT` no avanza en el modelo, lee `0x1` dos veces», y de ahí que
+cualquier cosa **retardada** —`delayedselected`, `TimerEventManager`— se quedase
+esperando para siempre. **No es cierto.** Los tres contadores libres avanzan, y
+**a la frecuencia correcta**, que es la mitad que de verdad importa:
+
+| contador | programado | medido en 200 ms | esperado | error |
+|---|---|---|---|---|
+| `TECNT` | 1 MHz (`ECLK/12`) | 200 091 | 200 000 | +0,05 % |
+| `TFCNT` | 12 MHz (`ECLK/1`) | 2 401 271 | 2 400 000 | +0,05 % |
+| `TGCNT` | 10 kHz (`ECLK/16/75`) | 2 001 | 2 000 | +0,05 % |
+
+Y `tools/ipod_classic/tests/timer_irq.c`, el que dio pie a la sospecha, hoy
+imprime `counter runs: yes 0x00000003 0x00000004`.
+
+**Y no es un contador cualquiera: es el que usa el retailOS.** Buscando el
+literal de la base del bloque en la imagen (`findlit.py ... 3C700000`) salen
+tres sitios, y dos son el temporizador E:
+
+```
+0x08324e48   TECON   = 0x440        (ECLK, /1)
+             TEPRE   = 11           -> 12 MHz / 12 = 1 MHz
+             TEDATA0 = 0xffffffff   (libre)
+             TECMD   = 3            (CLR | EN)
+0x08324e38   ldr r0, [r0, #0xb4]    <- lee TECNT, y no hace nada mas
+```
+
+O sea: el retailOS se fabrica **exactamente el `USEC_TIMER` de Rockbox**
+(`clocking-s5l8702.c:401`) y lo lee con una función de una instrucción. Ese
+contador corre bien. La hipótesis del temporizador queda **descartada con medida
+directa sobre el contador que el huésped consulta de verdad**, no por parecido.
+
+### 19.2 Fallo real 1: un `ack` reiniciaba la cuenta, y costaba el 14 % del reloj
+
+En los temporizadores de 16 bits los bits de estado viven **en `CON`**, así que
+acusar recibo obliga a escribir `CON` —`TBCON = TBCON`, que es literalmente lo
+que hace `INT_TIMERB` de Rockbox (`kernel-s5l8702.c:31`)—. Y en el modelo
+**toda** escritura de `CON` llamaba a `chan_reload()`, que termina en
+`ptimer_set_limit(..., reload = 1)`: **la cuenta volvía arriba**. En la máquina
+de verdad sólo `TB_CLR` de `CMD` inicializa el contador.
+
+Consecuencia: cada periodo salía **una latencia de interrupción más largo**.
+
+```
+ack TBCON=TBCON: TBCNT 3289 -> 139   COUNTER WAS RESET
+timer B interrupts in 2000042 us: 1713   expect 2000
+timer F interrupts in 2000040 us: 1997   expect 2000 (ack via TSTAT, CON untouched)
+```
+
+La tercera línea es **el experimento de control**, y es lo que convierte esto en
+una prueba en vez de una sospecha: el temporizador F tiene el mismo periodo, el
+mismo VIC y el mismo manejador, y se diferencia **sólo** en que su estado vive
+en `TSTAT` y su `ack` no toca `CON`. F mantuvo la hora; B no.
+
+**ARREGLADO** en `ipod_classic_timer.c`: el caso `CON` sólo recarga si los bits
+de **configuración** —fuente de reloj, modo, habilitación de interrupciones—
+cambian de verdad. Una escritura que sólo limpia estado deja la cuenta en paz.
+
+```
+ack TBCON=TBCON: TBCNT 3364 -> 3513   kept counting
+timer B interrupts in 2000047 us: 1999   expect 2000
+```
+
+**Sin regresión, y con la razón de por qué:** el retailOS **no usa** los
+temporizadores de 16 bits —sus únicos usos del bloque son el temporizador E de
+arriba y una lectura suelta de `+0x08` dentro de una función que suma bytes—,
+así que este arreglo le es inerte, y `navtest.sh` da después las mismas cifras
+al píxel que antes (§19.5). Quien lo cobra es Rockbox y cualquier prueba
+desnuda.
+
+### 19.3 Fallo real 2: `TICNTH`/`TICNTL` no están decodificados
+
+`s5l87xx.h:782` pone un contador libre de 64 bits en `TIMER_BASE+0x80/0x84`, y
+`s5l87xx.h:793` lo llama `FIVE_USEC_TIMER`. `decode_offset()` cubre A..D en
+`0x00..0x7f` y E..H desde `0xa0`: **`0x80` y `0x84` caen en el hueco**, así que
+se registran como «bad offset» y **leen cero para siempre**.
+
+```
+TICNTH/L 0x00000000/0x00000000 -> 0x00000000/0x00000000  FROZEN
+```
+
+Esto sí es, literalmente, la avería que la orden de trabajo describía —un
+contador de tiempo que no corre— pero **no le pasa al retailOS**: no hay ni un
+literal `0x3c700080` ni `0x3c700084` en los 9,9 MB de la imagen. Le pasaría a un
+huésped que girase sobre `FIVE_USEC_TIMER`, que se quedaría colgado para
+siempre.
+
+**NO ARREGLADO, a propósito.** Añadir el registro es fácil; saber qué vale al
+reiniciar, si se puede parar y a qué frecuencia va exactamente no lo dice
+ninguna fuente que tengamos, y **un contador inventado que corre al ritmo
+equivocado es peor que uno que no está**, porque el segundo se nota y el primero
+no.
+
+### 19.4 Fallo real 3: escribir `DATA0` o `PRE` también reinicia la cuenta
+
+Mismo origen que el §19.2 y misma discrepancia con la máquina real:
+
+```
+rewrite TBDATA0: TBCNT 3872 -> 403   COUNTER WAS RESET
+rewrite TBPRE:   TBCNT 5411 -> 119   COUNTER WAS RESET
+```
+
+**NO ARREGLADO**, y la razón está anotada en `chan_reload()`: ni Rockbox ni el
+retailOS escriben `DATA0` o `PRE` con el temporizador en marcha —los escriben
+parados, justo antes de `CMD_CLR`—, así que no hay nada medible que ganar, y
+diferir el límite rompería el caso contrario (un controlador que ponga `DATA0` y
+luego `EN` sin `CLR` y necesite el límite nuevo ya vivo).
+
+### 19.5 Cuatro carreras de `navtest.sh`, y lo que dicen de verdad
+
+Dos antes del arreglo del temporizador y dos después. **Las cifras no se mueven
+al píxel**, que es lo que se esperaba del §19.2.
+
+| carrera | temporizador | veredicto |
+|---|---|---|
+| 1 | antes | **pierde SELECT en `09-into-music`** (875 px). Todo lo demás pasa |
+| 2 | antes | **pasa entera.** `10-menu-back` a **898 px** de `08-menu-wheel-back` |
+| 3 | después | **pasa entera.** `10-menu-back` a **0 px** de `08-menu-wheel-back` |
+| 4 | después | **pierde SELECT en `05-select`** (0 px), y con eso arrastra toda la segunda mitad |
+
+Las cifras de la carrera 3, que es la buena y la de después: giros **8 000 /
+8 000 / 8 000** px sobre suelo **0 px**, `05-select` **19 340** px, `07` y `08`
+**lista 7 952 + panel 7 176** px, `09-into-music` **6 963** px, `10-menu-back`
+**6 963** px y **0 px de diferencia** con `08-menu-wheel-back`, `11-menu-at-top`
+**0 px** en la lista.
+
+**Mirado en PNG, no sólo contado**, que es la otra mitad de la medida:
+
+- `08-menu-wheel-back`: el menú principal, barra «iPod», **ミュージック**
+  resaltado con su flecha, y el panel con la nota musical.
+- `09-into-music`: la pantalla de **Música** —barra ミュージック, **Cover Flow**
+  resaltado, y debajo プレイリスト, アーティスト, アルバム, コンピレーション,
+  曲, ジャンル, 作曲者, オーディオブック—. SELECT entró de verdad.
+- `10-menu-back`: **otra vez el menú principal**, barra «iPod», ミュージック
+  resaltado. Lo único que lo separa de `08` es la etiqueta que se desplaza sola
+  en el panel. **MENU vuelve, y vuelve a la pantalla de la que se salió.**
+
+Y **`stderr` de esa carrera son dos líneas**: la carga de la imagen y el primer
+`SOURCE ADDRESS`. Ni una excepción, ni un reinicio por software. *Volver y morir
+no es volver*, y aquí no murió.
+
+Otras regresiones:
+
+| Prueba | Resultado |
+|---|---|
+| `tools/ipod_video/navtest.sh` (el 5G) | **76 548 px** en los siete y **12 312 / 12 114 / 31 629**. Los dos primeros clavados a los del §17.8; el tercero dentro del «~31 600» que esa pantalla mueve por su reloj. **Sin regresión** |
+| `timer_audit.bin` y `timer_irq.bin` | ambas pasan; las cifras están arriba |
+
+**La trampa del §18.9 volvió a cobrar, y con un nombre nuevo.** Dos carreras más
+salieron con las capturas en pantallas equivocadas y **3 y 1 reinicios por
+software**. No era el parche: era un proceso `ipod-classic-run` —una copia
+privada del binario, con otro nombre— al **93 % de un núcleo** durante veinte
+minutos. `pkill -9 -x qemu-system-arm` no lo ve, igual que no ve `qemu-evt`, y
+por el mismo motivo deliberado: que una sesión no mate a otra.
+
+Lo que sí valió: **el aviso de reinicios que el §18 metió en `navtest.sh`
+funcionó las dos veces** y evitó que esas cifras se leyeran como una regresión
+del temporizador. Se le añade ahora el aviso que faltaba —**contar procesos tipo
+QEMU antes de arrancar y decirlo**—, porque el que había sólo se enteraba
+*después*, cuando la carrera ya se había gastado. No los mata: pueden ser el
+trabajo en curso de otra sesión.
+
+### 19.6 La pérdida de SELECT es más ancha de lo que decía el §18.8
+
+El §18.8 y la cabecera de `navtest.sh` avisaban de que la carrera puede
+suspender **en `09-into-music`**. Medido aquí: **también se pierde el primer
+SELECT, el de la pantalla de idiomas** (carrera 4, `05-select` = 0 px, sin
+reinicio ni excepción en `stderr`). Y cuando se pierde ése, **arrastra toda la
+segunda mitad de la prueba**, porque las capturas siguientes caen en la pantalla
+de idiomas: `07`/`08` siguen dando ~8 000 px en la lista y **0 en el panel**, que
+es exactamente lo correcto para esa pantalla (§18.5) y parece un fallo del panel
+si no se mira dónde se está.
+
+Recuento de esta auditoría, contando sólo pulsaciones con destino:
+
+| | aciertos |
+|---|---|
+| SELECT (`05` y `09` juntos) | **5 de 7** |
+| MENU con sitio a donde volver (`10`) | **2 de 2** |
+| MENU en lo alto de la pila (`11`), donde lo correcto es no hacer nada | **4 de 4** |
+
+La conclusión del §18.8 se mantiene y se refuerza: **la repetición del estado de
+botones no arregló la pérdida, y la pérdida no distingue pantalla**. La cabecera
+de `navtest.sh` queda corregida para decir que puede suspender en `05-select`
+igual que en `09-into-music`.
+
+### 19.7 Lo que se confirma de la tanda del §18, comprobándolo aparte
+
+- **La puerta de las capas es real y los bits son los que dice.** Desensamblado
+  otra vez desde cero, con la base de carga del §1 (`0x08000000 + (offset -
+  0xAE48)`; con la base ingenua `0x08000000` se cae en un *thunk* de C++ y
+  parece que la evidencia esté inventada): `0x081271c8` carga `0x38900000` del
+  pozo de literales de `0x081272ac`, lee `[r3, #8]`, salta por
+  `cmp r1, #5 / addls pc, pc, r1, lsl #2`, y las seis ramas hacen `bic`/`orrne`
+  con `0x40, 0x20, 0x10, 0x08, 0x04, 0x80` y guardan en `0x08127250`.
+  **VERIFICADO instrucción a instrucción.**
+- **El orden de escrituras también.** En una carrera propia: `+0x060 =
+  0x089d42d4` y después `+0x008: 0x41118101 -> 0x41118141` (bit 6); `+0x078 =
+  0x0be2326c` y después `-> 0x41118161` (bit 5). **VERIFICADO.**
+- **El descriptor de la capa 2 es el que se quedaba encima.** `+0x094 =
+  0x014000f0` (320×240), `+0x09c = 0` (en el origen), `+0x090 = 0x0bfb4ff8`,
+  escrito **una sola vez en toda la carrera** y nunca borrado. **VERIFICADO.**
+- **La regla vacía de MENU es de esa pantalla, y ahora por una razón mejor que
+  la etiqueta.** `uirules.py` avisa de que el nombre de la izquierda es «el más
+  cercano hacia atrás», y hace bien: bajo la misma etiqueta salen también
+  `button.menu.up1 -> HandleExit` (`0x0073e774`) y una regla de **cronómetro**
+  (`button.playpause.up1 -> Stopwatch_Screen_Running`), que no puede ser de una
+  pantalla de idiomas. Leyendo los bytes, los grupos son `u32 count;
+  RULE[count]`, y el `count = 3` que empieza en `0x0073e624` contiene **la regla
+  vacía de MENU, `controller.GotoScreen_Language1` y
+  `list.pid.229444595.chosen1`**: las tres de la pantalla de idiomas.
+  `HandleExit` cae en el grupo **siguiente**, de `count = 5`, que es el del
+  cronómetro. La conclusión del §18.4 se sostiene, pero **la prueba buena es la
+  pertenencia al grupo, no la etiqueta**.
+- Los recuentos de `uirules.py` salen: **1 380** reglas, **108**
+  `button.menu.up` de las que **46** no tienen ni manejador ni acciones, y
+  `list.pid.229444595` aparece **una sola vez** y sólo con `.chosen1`.
+
+### 19.8 Una corrección menor de anotación
+
+`S5L8702_WHEEL_BTN_REPEAT_MS` se presentaba apoyado en «el aparato de verdad
+transmite», cuando dos constantes más arriba en el mismo fichero dicen que **el
+ritmo de la rueda real es INDETERMINADO**. Lo comprobable es sólo que el estado
+de los cinco botones viaja en cada palabra de estado
+(`button-clickwheel.c:273`); que la rueda siga informando **después** de soltar
+no lo dice ninguna fuente. Los 400 ms quedan marcados como **elección de
+modelo**, como sus vecinos.
+
+### 19.9 Lo que sigue abierto
+
+- **La pérdida de SELECT**, §19.6. Sigue sin causa, y el experimento del
+  interruptor de bloqueo del PMU del §18.8 **sigue sin hacerse**.
+- **`TICNTH`/`TICNTL`**, §19.3.
+- **La recarga en `DATA0`/`PRE`**, §19.4.
+- **Los modos de `CON[MODE]` distintos de 0**, que se registran como no
+  modelados y se tratan como intervalo.
+- Todo lo del §18.11, que sigue igual.

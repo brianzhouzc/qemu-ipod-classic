@@ -303,12 +303,28 @@ sh tools/ipod_classic/navtest.sh    # Classic, el retailOS, ~2 min
 ```
 
 **La del Classic sí es una aserción**, a diferencia de las otras dos: comprueba
-que la pantalla está quieta antes de tocar nada (dos capturas seguidas, 0 px de
-diferencia — esta pantalla no dibuja reloj), pulsa `e`, `e`, `q`, Enter y `w`, y
-**suspende** si algún giro no mueve el resaltado **o si el suelo de ruido deja de
-ser 0**, que es la premisa de la que cuelgan todos sus umbrales. Cifras de
-referencia: **8 000 px por giro**, **50 540 px** al entrar con Enter. Deja los
-PNG en `~/6g/nav` y **hay que mirarlos**, que es la otra mitad de la medida.
+que la pantalla está quieta antes de tocar nada, recorre la pantalla de idiomas
+(`e`, `e`, `q`, Enter) y **sigue hasta el menú principal**, donde vuelve a
+comprobar que está quieta, gira, entra en Música con Enter y sale con `w`.
+**Suspende** si algún giro no mueve el resaltado, si el suelo de ruido se pasa
+de **200 px** —que es la premisa de la que cuelgan todos sus umbrales—, o si
+MENU no devuelve **el mismo fotograma** del que se salió. Deja los PNG en
+`~/6g/nav` y **hay que mirarlos**, que es la otra mitad de la medida.
+
+Cifras de referencia, **de después de la puerta de capas del §18 de
+[11](11-classic6g-retailos.md)**: **8 000 px por giro** sobre un suelo de
+**0 px**, **~19 340 px** al entrar con Enter desde la pantalla de idiomas,
+**~7 950 px en la lista + ~7 180 px en el panel** por giro en el menú principal,
+y **menos de 1 000 px** entre el fotograma al que MENU vuelve y el que se dejó.
+Las cifras viejas que circulan por ahí —**76 800 px encendidos y 50 540 al
+seleccionar**— son de **antes** de esa puerta, cuando una capa muerta tapaba la
+interfaz: no son una regresión, son otra imagen.
+
+Y **una carrera de cada tres o cuatro suspende sola** porque el huésped tira un
+SELECT, sin que nada esté roto; la cabecera del script dice cómo reconocerlo.
+Antes de creerse un fallo: `ps aux | grep qemu` y `uptime`, porque con la
+máquina cargada el huésped se reinicia a *diskmode* y el script avisa a gritos
+de que el veredicto no vale.
 
 `navtest.sh` arranca, sale de *Now Playing* con MENU, gira la rueda y
 selecciona. `appletest.sh` hace dos arranques del retailOS: uno que fotografía
