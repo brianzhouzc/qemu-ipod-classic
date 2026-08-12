@@ -17,7 +17,42 @@ import os
 BS = 4096
 out, fwp, fat = sys.argv[1], sys.argv[2], sys.argv[3]
 fwb = open(fwp, 'rb').read()
-fatb = open(fat, 'rb').read()
+fatb = bytearray(open(fat, 'rb').read())
+
+
+def mark_fat_volume(fatb):
+    """Make the retailOS accept the data partition as a FAT volume.
+
+    Measured (wiki/13, 2026-08-12): the firmware's generic volume classifier
+    0x0808253c reads block 0 of the partition, sees the 0x55AA at +0x1FE that
+    every FAT boot sector carries, and hands it to the "sector with 0xAA55"
+    handler 0x0806a128 -- i.e. it treats the FAT boot sector as if it might be
+    a nested MBR. That handler finds no valid partition entry (buf+0x1BE is
+    zeros on a FAT VBR) and falls through to a last-resort ASCII probe:
+    memcmp(boot+0x34,"FAT",3) then memcmp(boot+0x2b,"FAT",3). mkfs.vfat leaves
+    both spots zero (the real "FAT32   " sits at +0x52, which this path never
+    looks at), so both memcmps miss and 0x0806a218 rejects the volume with
+    code 31 -> "No Music", the directory is never read.
+
+    Writing the three bytes "FAT" into BPB_Reserved (+0x34, reserved-for-future,
+    ignored by every real FAT driver) flips 0x0806a128 to success and the
+    classifier from reject(31) to accept(0). VERIFIED end to end: with this
+    marker a keyless boot reads the FAT, the root directory and iPod_Control
+    (30 DMA reads past the boot sector, plus write-backs) instead of the single
+    boot-sector read a rejected volume gets. Apply it to the primary boot sector
+    and its backup (BkBootSec).
+    """
+    if len(fatb) < 0x54 or fatb[0x1fe:0x200] != b'\x55\xaa':
+        return fatb
+    bps = struct.unpack('<H', fatb[0x0b:0x0d])[0] or 512
+    bk = struct.unpack('<H', fatb[0x32:0x34])[0]
+    for base in {0, bk * bps}:
+        if base + 0x37 <= len(fatb):
+            fatb[base + 0x34:base + 0x37] = b'FAT'
+    return fatb
+
+
+fatb = mark_fat_volume(fatb)
 
 
 def pad(b):

@@ -98,10 +98,22 @@ mirar la pantalla, **mátala tú** antes de fiarte de una carrera de pruebas.
 
 ## 5. Por qué no sale la música: el volumen de datos NO se monta
 
-La primera versión de esta sección culpaba a la firma del `iTunesDB`. **Era
-falso, y lo probamos midiendo.** El firmware no llega ni a mirar la base de
-datos. La pantalla enseña "No Music" porque **rechaza el volumen FAT32 entero
-al leer su cabecera**, mucho antes de la firma.
+> **SUPERADO el 2026-08-12 — el volumen YA se monta. Ver §6 y §7.** Esta sección
+> describía el estado en que el firmware rechazaba la FAT32 en la cabecera. Eso
+> **está resuelto** (§6): con tres bytes `"FAT"` en `boot+0x34` el clasificador
+> acepta el volumen y el firmware lee el directorio, la FAT y `iPod_Control`
+> (medido: 30 lecturas por DMA dentro de la partición contra 2 cuando se
+> rechaza). El firmware **ahora sí lee y parsea el `iTunesDB`**; donde se para
+> hoy es en la **firma** de esa base de datos (§7) — justo lo que la primera
+> versión de §5 sospechaba y la segunda descartó por prematuro. La rueda ha
+> dado la vuelta entera. Lo de abajo se conserva como el diagnóstico que llevó
+> al §6.
+
+La primera versión de esta sección culpaba a la firma del `iTunesDB`. Resultó
+ser **la pregunta correcta hecha demasiado pronto**: el firmware no llegaba a
+mirar la base de datos porque **rechazaba el volumen FAT32 entero al leer su
+cabecera**, mucho antes de la firma. Resuelto el rechazo del volumen (§6), la
+firma vuelve a ser el problema (§7).
 
 ### Lo que está VERIFICADO, ejecutando
 
@@ -199,3 +211,131 @@ de montaje entera de un tiro.
 Aunque la pista aparezca en la lista, reproducirla es otro problema. El I²S no
 está modelado —hoy se tiran al suelo unos 6 000 accesos por arranque— así que
 el audio es un frente aparte. Ver [04-roadmap.md](04-roadmap.md).
+
+---
+
+## 6. El volumen SÍ se monta: el truco del `"FAT"` en `+0x34` (2026-08-12)
+
+Todo **VERIFICADO ejecutando**. Base VA = fichero + `0x07FF51B8`.
+
+### La cadena del rechazo, desensamblada y medida
+
+El firmware rechazaba la FAT32 **porque su sector de arranque lleva `0x55AA` en
+`+0x1FE`**, la firma que todo VBR de FAT trae. El clasificador genérico de
+volúmenes `0x0808253c` lee el bloque 0 de la partición, ve ese `0x55AA` y la
+trata como si pudiera ser una **tabla de particiones (MBR)** — no como un
+sistema de ficheros:
+
+```
+0x080825d4  ldrb ...[r4,#1] / [r4] ; buf[0..1]  (¿"ER" = mapa de particiones Apple?)
+0x080825f4  ldrh r0,[r4,#0x1FE]    ; buf[0x1FE]
+0x080825f8  cmp  r0,#0xAA55        ; -> r6 = 2 (tipo "sector con 0xAA55")
+0x080826d8  bl   0x0806a128        ; handler del "sector con 0xAA55"
+0x080826f4  mov  r0,#31            ; RECHAZO del clasificador
+```
+
+`0x0806a128` intenta parsear el MBR (cuatro entradas en `buf+0x1BE`); en un VBR
+de FAT esa zona es **todo ceros**, así que no hay entrada válida y cae a un
+último recurso ASCII:
+
+```
+0x0806a1f8  bl 0x800f484 ; memcmp(buf+0x34, "FAT", 3)   -> beq ÉXITO
+0x0806a210  bl 0x800f484 ; memcmp(buf+0x2b, "FAT", 3)
+0x0806a218  bne 0x0806a240                              ; <<< AQUÍ RECHAZA
+0x0806a240  mov r0,#0    ; return 0 -> clasificador devuelve 31 -> "No Music"
+```
+
+`mkfs.vfat` deja `+0x34` y `+0x2b` a cero (el `"FAT32   "` de verdad está en
+`+0x52`, que este camino **no mira**), así que los dos `memcmp` fallan. La
+cadena arriba de `0x0806a128`: `0x0827a6b0` (lectura FS) → `0x0824690c`
+(compara con 31) → despacho VFS `0x082465xx`. El detector `0x0827a980` (la
+hipótesis del "MBR anidado") corre sólo sobre LBA0 al arrancar; el "MBR
+anidado" de verdad ocurre en `0x0808253c`/`0x0806a128` corriendo sobre la
+**propia partición de datos**.
+
+### El arreglo, y la prueba de que monta
+
+Escribir tres bytes `46 41 54` (`"FAT"`) en **`boot+0x34`** (zona
+`BPB_Reserved`, reservada e ignorada por cualquier driver FAT real) hace que
+`0x0806a128` devuelva éxito y el clasificador pase de **rechazar (31)** a
+**aceptar (0)**. Lo hace `mkdisk6g4k.py` ahora (`mark_fat_volume`), en el sector
+de arranque y en su copia (`BkBootSec`).
+
+**Medido con un instrumento temporal** (LBA de cada DMA en `dma_go`, ya
+revertido), arranque **sin teclas**:
+
+| Disco | Lecturas dentro de la partición de datos (LBA512 ≥ 181568) |
+|---|---|
+| Sin el truco (`E4k.img`) | **2**, las dos en LBA 181568 (sólo el sector de arranque). Rechazado. |
+| Con el truco (`E4kfat.img`) | **30**: FAT (181824), directorio raíz (183872), `iPod_Control`, zona del `iTunesDB` (200544), **y escrituras de vuelta**. Montado. |
+
+Un volumen montado lee el directorio; el rechazado no. 30 contra 2 lo zanja.
+
+> **Matiz honesto.** El `"FAT"@0x34` **no** es lo que escribe Apple: sus dos
+> plantillas de formato en `0x0884c3c4`/`0x0884c5c4` (OEM `MSDOS5.0`, etiquetas
+> `iPod`/`NO NAME`) tienen `+0x34` a cero (VERIFICADO, volcado). Es un cambio de
+> **layout de disco** que satisface el clasificador de Apple, sancionado por el
+> encargo. Por qué el firmware sondea la partición con `0x0808253c` en vez de
+> montarla por el tipo `0x0B` del MBR de LBA0 queda como pregunta abierta (la
+> palanca está aguas arriba de `0x0806a128`), pero para el objetivo —que el
+> volumen se monte— esto está medido y funciona.
+
+## 7. Dónde se para HOY: la firma del `iTunesDB` (2026-08-12)
+
+Con el volumen montado, el firmware **lee y parsea** el `iTunesDB`. La base de
+datos que escribe `libgpod` es estructuralmente correcta (VERIFICADO,
+`mhbd` → `mhsd` tipo 1 con `mhlt` count=1 y un `mhit`, referenciado por la
+lista maestra `mhyp`/`mhip`). Pero el parseo **falla en la validación de la
+firma** y la biblioteca sale vacía ("No Music", captura mirada en el menú
+principal: nota musical + "No Music" en el panel).
+
+Medido con `gdbpoke.py`/`fatprobe.py` (base VA = fichero + `0x07FF51B8`):
+
+| Dirección | Qué es |
+|---|---|
+| `0x08041360` | parser de secciones del `iTunesDB` (magic `"mhsd"` en `0x8041600`, bucle sobre `r4[0x2c]` secciones) |
+| `0x08041364` | `bl 0x08082810` — capta el GUID FireWire (8 bytes), lo *byte-swap*ea a big-endian y lo cachea en `device+0x400f4` |
+| `0x08041384` | **`bl 0x08073cf8`** — **el validador de la firma**; usa la zona del GUID (`device+0x400f0/f4`) |
+| `0x08041388` | medido: **`r0 = 0xffff5bda`** (error) al volver de `0x08073cf8` |
+| `0x080415a8` | salida del parser con `sl = 0xffff5bda` → biblioteca vacía |
+
+**De dónde sale el GUID, y por qué es 0.** El getter `0x08323ac8` lee
+`obj[0x38]`(bajo)/`obj[0x3c]`(alto) de un objeto `"SysI"` (`obj` por defecto
+`0x0896d6fc`). Ese objeto vive en `.bss` (más allá del final de `osos`, que mide
+`0x976A3C`) y **nadie lo puebla**: el arranque es por `-kernel` del `osos`
+descifrado, **sin la NOR**, que es donde el aparato real guarda su identidad.
+Medido en el contexto de hash (`sl="mhbd"`, `r1="guid"`): el getter devuelve
+`r0=0, r1=0`. **El GUID del firmware emulado es `0x0000000000000000`.**
+
+**Y no es (sólo) el valor del GUID.** Se construyó un disco `E4kG.img` cuyo
+`iTunesDB` `libgpod` firmó con `FirewireGuid: 000A270019B4C3D2`, y se **forzó**
+por gdb el getter para devolver ese mismo GUID (`r0=0x19B4C3D2, r1=0x000A2700`)
+en cada llamada. El parser **falló idéntico** (`sl=0xffff5bda`). Es decir: hacer
+coincidir el *valor* del GUID no basta. La firma que produce la `libgpod` de
+este Ubuntu (4.3.2) para el modelo `MB147` **no satisface a este `retailOS`
+concreto (24.9.1.2)** — sea por una diferencia de algoritmo/versión, por la
+codificación exacta del GUID que entra al hash (el firmware lo *byte-swap*ea en
+`0x08082810`), o por un segundo hash que falta. Esta es la protección que
+[§1](#1-por-qué-no-basta-con-copiar-el-mp3) describe: la que "durante años
+impidió que las herramientas de terceros escribieran música" en estos modelos.
+
+### Cómo retomarlo (acotado)
+
+El camino independiente de algoritmo: poner un breakpoint dentro de
+`0x08073cf8` en el `memcmp`/comparación final, **leer la firma que el firmware
+ESPERA** (no la que trae el disco), y escribir esos bytes en el campo de firma
+del `iTunesDB` (el campo suele excluirse de su propio hash). `0x08073cf8`
+reserva memoria (`0x80c6614`), procesa la zona del GUID con `0x0803f4f0`
+(`device+0x400f0`, `0x6c` bytes) y de ahí sale el `0xffff5bda` — ése es el
+subárbol a diseccionar. Alternativa de fondo: modelar la NOR/`SysInfo` para que
+el firmware tenga un GUID real y **medir** si con eso `libgpod` (alimentada con
+el mismo GUID) produce una firma aceptada — el experimento de forzado por gdb
+sugiere que no bastaría, pero no descarta un problema de codificación del GUID.
+
+### Herramientas nuevas (no tocan el modelo)
+
+`tools/ipod_classic/fatprobe.py` (breakpoints con volcado relativo a registro),
+`fatrun.sh` (arranca QEMU `-S -gdb` y conduce `fatprobe`), `navsongs.sh`
+(navega a Music→Songs con captura en cada paso), `navmusic.sh`. El disco que
+monta y trae la biblioteca: `~/6g/E4kfat.img` (GUID 0) y `~/6g/E4kG.img`
+(GUID `000A2700…`). El truco de `+0x34` ya lo aplica `mkdisk6g4k.py`.
