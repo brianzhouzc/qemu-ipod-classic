@@ -24,18 +24,20 @@ IR="python3 $T/iremote.py"
 bash "$T/irun.sh" "$DISK"
 sleep 50
 
-# Wake the panel (it sleeps within ~15 s of boot) and settle on the language
-# list, lit, so the next step's baseline is not a black frame.
-$IR seq e:120 wait:3 S00-lang
+# Wake the panel until it is lit (a slow boot or the ~15 s sleep leaves it
+# black); a black baseline would make the next step's right-half diff read the
+# black->lit relight as a false SELECT and drift the whole run.
+$IR wake e
+$IR shot S00-lang
 # Language -> main menu. Retry wake(e, scrolls+touches) + SELECT until the RIGHT
 # half changes: the "Welcome" panel is static under scrolling and only a real
 # selection redraws it, so --region right tells a landed SELECT from a mere
 # highlight move (a full-frame diff cannot, and drifts the whole run). Lands on
 # whatever language is highlighted -- cosmetic, the title/artist are Latin.
-$IR press ret 250 -u -w e --region right -r 10 -t 3000 -s 5 --name S01-main
+$IR press ret 250 -u -w e --region right -r 15 -t 3000 -s 5 --name S01-main
 # Main -> Music. THE flaky SELECT. Retry wake(q holds the top row in place) +
 # centre until the submenu replaces the menu.
-$IR press ret 250 -u -w q -r 10 -t 1500 -s 5 --name S02-music
+$IR press ret 250 -u -w q -r 15 -t 1500 -s 5 --name S02-music
 # Music submenu -> highlight Songs (Cover Flow=0 ... Songs=5): five steps down.
 $IR seq e:120 wait:2 e:120 wait:2 e:120 wait:2 e:120 wait:2 e:120 wait:3 S03-songsel
 # Songs -> the song list. q,e re-touches the wheel and stays on Songs, then
@@ -44,7 +46,7 @@ $IR seq e:120 wait:2 e:120 wait:2 e:120 wait:2 e:120 wait:2 e:120 wait:3 S03-son
 $IR seq q:120 wait:1 e:120 wait:1 ret:250 wait:5 q:120 wait:2 S04-songs
 
 echo "done; song list is ~/6g/remote/S04-songs.png (resets: $(grep -c 'software reset' ~/6g/remote/qemu.err))"
-# NOTE: the last SELECT is open-loop, so the ~5/7 SELECT-loss flake (wiki/11
-# s.18.8) or a missed-deadline reset can occasionally leave S04 on the Songs
-# submenu or a black frame. Re-run, or drive the last step by hand with
-# iremote.py -- that is how the verified capture in ~/6g/song_listed/ was taken.
+# NOTE: three SELECT gates, each ~5/7-lossy (wiki/11 s.18.8) and retried here;
+# a bad streak or a missed-deadline reset can still leave a step short. Re-run,
+# or drive by hand with iremote.py -- how the verified ~/6g/song_listed/ capture
+# was taken. The primitives (press -w / --region / wake) are the reliable part.

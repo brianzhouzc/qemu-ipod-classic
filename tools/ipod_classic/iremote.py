@@ -23,6 +23,7 @@ Usage (each call connects, acts, screenshots, prints diff, disconnects):
                                          so the retailOS honours SELECT (a cold
                                          press is ignored); WAKE may be a comma
                                          pair like q,e that nets zero mid-list.
+    iremote.py wake [KEY] [MINNONBLACK]  press KEY until the panel is lit
     iremote.py seq TOK...                one connection; TOK = NAME (screendump)
                                          | K:HOLD (sendkey) | wait:SECONDS
     iremote.py raw 'MONITOR CMD'         arbitrary monitor command
@@ -172,6 +173,24 @@ def main():
     elif op == 'raw':
         out = cmd(s, a[1])
         sys.stdout.write(out.decode('latin1'))
+
+    elif op == 'wake':
+        # wake [KEY] [MINNONBLACK] -- press KEY until the panel is lit. The
+        # panel sleeps ~15 s after boot and a diff against a black frame reads
+        # as a false transition, so steps that pixel-diff need a lit baseline.
+        key = a[1] if len(a) > 1 else 'e'
+        minnb = int(a[2]) if len(a) > 2 else 5000
+        ppm = os.path.join(OUT, '_wake.ppm')
+        nb = 0
+        for k in range(12):
+            cmd(s, 'sendkey %s 120' % key)
+            time.sleep(1.5)
+            screendump(s, ppm)
+            _, _, px = read_ppm(ppm)
+            nb = nonblack(px)
+            if nb > minnb:
+                break
+        print('wake: nonblack=%d after %d press(es)' % (nb, k + 1))
 
     elif op == 'seq':
         # seq TOK...  where TOK is 'NAME' (screendump) or 'KEY:HOLD' (sendkey)
