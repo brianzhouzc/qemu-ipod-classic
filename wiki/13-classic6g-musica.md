@@ -353,3 +353,90 @@ sugiere que no bastaría, pero no descarta un problema de codificación del GUID
 (navega a Music→Songs con captura en cada paso), `navmusic.sh`. El disco que
 monta y trae la biblioteca: `~/6g/E4kfat.img` (GUID 0) y `~/6g/E4kG.img`
 (GUID `000A2700…`). El truco de `+0x34` ya lo aplica `mkdisk6g4k.py`.
+
+## 8. Resuelto: la firma que este firmware espera son 20 ceros, porque la SHA‑1 es hardware sin modelar (2026‑08‑12)
+
+**La canción ya aparece listada en Música → 曲 (Songs).** Captura mirada:
+`~/6g/song_listed/53-songs.png` y `54-songs2.png` — la lista muestra la pista con
+su título (el nombre del MP3, en marquesina: «…Encore (Official Audio) - Linkin
+Park _ JAY‑Z…») y, debajo, el artista **Linkin Park**. Base VA = fichero +
+`0x07FF51B8`.
+
+El §7 dejó dos sospechas —«el algoritmo de `libgpod` no es el que espera el
+retailOS» y «es el valor del GUID»—. **Las dos son falsas.** Medido:
+
+- **Sólo cuenta `hash58`.** Sin `iTunesDB.p7b` (no existe en el disco) el
+  validador `0x08073cf8` toma el camino `hash58` y ninguno más. VERIFICADO
+  (`~/6g/sigprobe1.txt`).
+- **El algoritmo del firmware ES `itdb_hash58` de `libgpod`, byte a byte.** Las
+  dos S‑boxes (`table1`/`table2`) y el magic `fixed[18]` de la derivación de
+  clave están literalmente en `osos_decrypted.bin`, contiguos y en orden
+  (`0x08388a10` / `0x08388b10` / `0x08388c10`); y el validador cero‑ea *los
+  mismos tres campos* antes de hashear —`db_id` (`+0x18`, 8 B), `unk_0x32`
+  (`+0x32`, 20 B), `hash58` (`+0x58`, 20 B)— que `itdb_hash58.c:265‑267`. Es
+  HMAC‑SHA1 con clave derivada del GUID FireWire. VERIFICADO (desensamblado +
+  fuente `libgpod` 0.8.3).
+
+**La causa real del muro:** la SHA‑1 del S5L8702 **no es cómputo del firmware,
+es un acelerador hardware en `0x38000000`** (`SHA1_MEM_BASE`; su driver es
+`0x08068b64`: `r6=0x38000000`, escribe control `[r6+0x80]`, puntero `[r6+0x84]`,
+longitud `[r6+0x8c]`, comando `[r6]`, y hace *busy‑poll* de `[r6]&1`). **QEMU no
+lo modela:** está en la tabla *«peripherals we know the address of but have not
+modelled»* de `hw/arm/ipod_classic/ipod_classic.c` (`{ "s5l8702.sha1",
+SHA1_MEM_BASE, 0x100000 }`), y sus lecturas devuelven 0. Consecuencia: **cada
+digest SHA‑1 que pide el firmware sale a cero** → la clave HMAC sale 0 → **la
+firma que el firmware ESPERA colapsa a 20 bytes cero**. VERIFICADO por los dos
+lados (traza del huésped + fuente de QEMU).
+
+**La medida decisiva** (`~/6g/sigprobe2.txt`, en el `memcmp` final `0x08328598`):
+la firma que el firmware **calcula/espera** = `00 00 … 00` (20 ceros); la que
+trae el disco (la que `libgpod` escribió para el GUID del `SysInfo`) =
+`28 db 9f 20 …`. Por eso `E4kfat.img` —firmado *correctamente* por `libgpod`— se
+rechaza: el firmware nunca llega a computar `28db…`, computa ceros. Y por eso el
+forzado por gdb del §7 no cambió nada: con la SHA a 0 la clave es 0 **sea cual
+sea el GUID** (aparte de que aquel forzado escribía `r0/r1`, cuando el getter
+`0x08082810` deja el GUID en memoria `device+0x400f4`, no en registros).
+
+**El arreglo, VERIFICADO end to end:** poner `mhbd+0x58 = 20 ceros` en las dos
+copias del `iTunesDB`. El retorno del validador en `0x08041388` pasa de
+`0xffff5bda` a `r0=0`; el parser `0x080415a8` sale con éxito; el panel de Música
+pasa de «No Music» a «1 曲/Song»; y la lista Música→曲 muestra la pista. Lo
+aplica ahora `mkdisk6g4k.py` (`zero_itunesdb_hash58`, junto al truco `"FAT"@0x34`).
+Disco reproducido por el pipeline y comprobado: `~/6g/E4kzero_rebuilt.img`
+(construido con `mkdisk6g4k.py … Firmware‑24.9.1.2 fat4k.img`).
+
+> **Stub de conveniencia, anotado** (regla del encargo). Los 20 ceros **no** son
+> lo que firma un iPod de fábrica; son la única firma que este emulador acepta
+> *mientras* `0x38000000` no esté modelado. Está escrito así en
+> `zero_itunesdb_hash58()`. Cuando se modele la SHA‑1 hay que quitarlo y firmar
+> con `libgpod` para el GUID real del aparato.
+
+### El otro muro de esta sesión: entrar de verdad a la lista (teclas)
+
+El conteo «1 Song» ya salía; **entrar** a la lista fallaba por la pérdida de
+SELECT (wiki/11 §18.8/§19.6). Medido aquí, y es la clave para navegar fiable:
+**una pulsación de centro «en frío» —sin actividad de rueda previa— el retailOS
+la IGNORA**; sólo honra SELECT con la rueda activa (recién tocada). Con eso la
+navegación se vuelve determinista: **«girar para tocar la rueda, LUEGO pulsar
+centro»**, y verificar cada paso con un *diff* de píxeles de dos `screendump`.
+Como Música es la fila de arriba y los menús no dan la vuelta, un `q` (subir) la
+toca sin moverse de ella; para llegar a 曲 se baja cinco pasos.
+
+### Herramientas nuevas (no tocan el modelo)
+
+`tools/ipod_classic/iremote.py` (control por el monitor TCP: `press`/`seq` con
+verificación por *diff*), `irun.sh` (arranca una copia `qmus` —nombre propio,
+para que el `pkill -x` de `navtest.sh` no la toque— con monitor en
+`127.0.0.1:4455`) e `isongs.sh` (conduce idioma→menú→Música→曲 con captura por
+paso). Sólo leen/teclean; **no modifican el modelo ni recompilan QEMU** (el
+arreglo de la firma es de disco, no de emulación).
+
+### Camino de fondo, pendiente (INFERIDO)
+
+Modelar el acelerador SHA‑1 en `0x38000000` (referencia: el Touch ya lo hace en
+`hw/arm/ipod_touch_sha1.c`). Con la SHA real el firmware computaría un HMAC‑SHA1
+no trivial, y entonces `hash58` habría que firmarlo con el **GUID real** del
+aparato —hoy `0`, porque se arranca por `-kernel` sin la NOR/`SysInfo`—. Como el
+algoritmo coincide, `libgpod` firmaría bien *una vez* que (a) la SHA esté
+modelada y (b) el GUID del modelo y el del `SysInfo` sean el mismo. No probado —
+es la vía si se quiere fidelidad al hardware en vez del atajo de los 20 ceros.

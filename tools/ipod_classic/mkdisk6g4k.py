@@ -52,7 +52,51 @@ def mark_fat_volume(fatb):
     return fatb
 
 
+def zero_itunesdb_hash58(fatb):
+    """Blank every iTunesDB hash58 so THIS emulator accepts the music library.
+
+    From the 2007 models on (Classic 6G, Nano 3G) the retailOS refuses to load
+    an iTunesDB unless its hash58 field (mhbd+0x58, 20 bytes) equals an
+    HMAC-SHA1 the firmware recomputes over the whole file, keyed off the
+    device's FireWire GUID. VERIFIED byte for byte (wiki/13 s.8): the validator
+    0x08073cf8 derives the key from the GUID zone, runs the HMAC, and does
+    memcmp(computed, mhbd+0x58, 20) at 0x08328598; a miss returns 0xffff5bda
+    and the library shows "No Music".
+
+    The catch is not the algorithm or the GUID -- it is that the S5L8702 SHA-1
+    is a hardware accelerator at SHA1_MEM_BASE (0x38000000, driver 0x08068b64)
+    which QEMU does NOT model: it sits in the "peripherals we know the address
+    of but have not modelled" table (hw/arm/ipod_classic/ipod_classic.c), so its
+    reads return 0. With the SHA engine stuck at zero every digest is zero, the
+    HMAC key is zero, and the signature the firmware EXPECTS collapses to 20
+    zero bytes. MEASURED at the memcmp: expected = 00..00. So the one signature
+    this firmware accepts today is 20 zeros -- which is exactly what libgpod does
+    not write (it writes a real HMAC for the SysInfo GUID). Blank it here, in
+    every copy (libgpod keeps the live DB plus a mirror).
+
+    CONVENIENCE STUB, not hardware behaviour. Once 0x38000000 is modelled this
+    must go and the DB be signed (libgpod) for the device's real GUID instead.
+    Proven end to end: a disk built this way lists the track in Music -> Songs
+    (wiki/13 s.8, ~/6g/song_listed/).
+    """
+    n, off = 0, 0
+    while True:
+        i = fatb.find(b'mhbd', off)
+        if i < 0:
+            break
+        off = i + 4
+        # Guard against a stray "mhbd" in audio data: a real header carries a
+        # small header length at +4 and its hashing_scheme at +0x30.
+        hdrlen = struct.unpack('<I', fatb[i + 4:i + 8])[0]
+        if not (0x40 <= hdrlen <= 0x400) or i + 0x6c > len(fatb):
+            continue
+        fatb[i + 0x58:i + 0x58 + 20] = b'\0' * 20
+        n += 1
+    return n
+
+
 fatb = mark_fat_volume(fatb)
+n_hash = zero_itunesdb_hash58(fatb)
 
 
 def pad(b):
@@ -85,6 +129,8 @@ with open(out, 'wb') as f:
     f.write(fwb)
     f.write(fatb)
 
-print("4K-unit MBR: fw block %d (+%d), fat block %d (+%d); %d MB"
+print("4K-unit MBR: fw block %d (+%d), fat block %d (+%d); %d MB; "
+      "hash58 blanked in %d iTunesDB cop%s"
       % (fw_start, fw_blocks, fat_start, fat_blocks,
-         os.path.getsize(out) // (1024 * 1024)))
+         os.path.getsize(out) // (1024 * 1024),
+         n_hash, "y" if n_hash == 1 else "ies"))
