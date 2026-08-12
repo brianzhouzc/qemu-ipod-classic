@@ -271,6 +271,20 @@ revertido), arranque **sin teclas**:
 
 Un volumen montado lee el directorio; el rechazado no. 30 contra 2 lo zanja.
 
+> **Corrección del auditor (2026-08-12).** Los discos `E4k.img` y `E4kfat.img`
+> de la tabla de arriba **no** se diferencian sólo en el marcador: `cmp -l` da
+> **518 bytes distintos** (contenido de la FAT/directorio), porque se
+> fabricaron de imágenes FAT distintas. Es decir, ese A/B **no aísla** la
+> variable, aunque la conclusión sea correcta. Rehecho con un A/B limpio —dos
+> discos construidos de la **misma** `fat4k.img`, uno con el marcador y otro con
+> esos 6 bytes puestos a cero, **sólo 6 bytes de diferencia**— y medido igual
+> (LBA de cada DMA en `dma_go`, arranque sin teclas, 60 s): **marcado = 85
+> lecturas** dentro de la partición (181568 arranque, 181824 FAT, 183872
+> directorio raíz, 200520–200552 `iTunesDB`); **sin marcar = 3 lecturas, todas
+> en 181568** (sólo el sector de arranque). El marcador es la única causa. Los
+> LBA coinciden con los de arriba; sólo el conteo cambia por la ventana de
+> medida.
+
 > **Matiz honesto.** El `"FAT"@0x34` **no** es lo que escribe Apple: sus dos
 > plantillas de formato en `0x0884c3c4`/`0x0884c5c4` (OEM `MSDOS5.0`, etiquetas
 > `iPod`/`NO NAME`) tienen `+0x34` a cero (VERIFICADO, volcado). Es un cambio de
