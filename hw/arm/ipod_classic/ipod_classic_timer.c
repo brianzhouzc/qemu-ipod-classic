@@ -140,6 +140,27 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
     return base / div / (c->pre + 1);
 }
 
+/*
+ * Reprogram a channel and PUT THE COUNT BACK TO THE TOP. The second half is a
+ * known deviation, kept deliberately and written down here rather than fixed
+ * blind:
+ *
+ *   ptimer_set_limit(..., 1) reloads the counter there and then. On the
+ *   hardware only TB_CLR in CMD initialises it, so a write of DATA0 or of PRE
+ *   that lands mid-period ought to take effect at the NEXT reload and leave
+ *   the current count running. MEASURED as wrong with
+ *   tools/ipod_classic/tests/timer_audit.c: rewriting TBDATA0 with the value
+ *   it already held took TBCNT from 3872 to 403, and rewriting TBPRE took it
+ *   from 5411 to 119.
+ *
+ * It is left alone because no driver we run does it in a hot path -- Rockbox
+ * and the retailOS both write DATA0 and PRE while the timer is stopped, right
+ * before CMD_CLR -- so fixing it would change nothing we can measure while
+ * risking the one case that matters, a driver that sets DATA0 and then EN
+ * without CLR and needs the new limit to be live. The ack path through CON is
+ * the one that was measurably wrong, and that one IS fixed; see the CON case
+ * in ipod_classic_timer_write().
+ */
 static void chan_reload(IPodClassicTimerChannel *c)
 {
     uint64_t limit = c->data0;
@@ -263,9 +284,48 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
         uint32_t status_mask = S5L8702_TIMER_CON_INT_MASK <<
                                S5L8702_TIMER_CON_INT_STAT_SHIFT;
         uint32_t kept = c->con & status_mask & ~(uint32_t)value;
+        uint32_t old_cfg = c->con & ~status_mask;
+        uint32_t new_cfg = (uint32_t)value & ~status_mask;
 
-        c->con = ((uint32_t)value & ~status_mask) | (chan_is_32bit(c) ? 0 : kept);
-        chan_reload(c);
+        c->con = new_cfg | (chan_is_32bit(c) ? 0 : kept);
+        /*
+         * AN ACK IS NOT A RESTART, and getting this wrong cost 14% of the
+         * clock. chan_reload() ends in ptimer_set_limit(..., reload = 1),
+         * which puts the count back to the top immediately; on the hardware
+         * only TB_CLR in CMD initialises the counter. So an interrupt handler
+         * that acks with "TBCON = TBCON" -- which is exactly what Rockbox's
+         * INT_TIMERB does (kernel-s5l8702.c:31), and the idiom the status bits
+         * living in CON force on everyone -- used to restart the period from
+         * wherever the handler happened to run, and every period came out one
+         * interrupt latency too long.
+         *
+         * MEASURED with tools/ipod_classic/tests/timer_audit.c, timer B at
+         * 1 kHz (ECLK/2, DATA0 = 6000), counted against USEC_TIMER over two
+         * seconds:
+         *
+         *     acking through CON     1713 interrupts   expected 2000
+         *     acking through TSTAT   1997 interrupts   expected 2000
+         *
+         * The second line is the control: timer F, same period, same VIC, same
+         * handler, differing only in that its status lives in TSTAT so its ack
+         * never touches CON. It kept time; timer B did not. That pins it on
+         * this write and nothing else.
+         *
+         * So reload only when the configuration -- clock source, mode,
+         * interrupt enables -- actually changed. A write that only clears
+         * status bits now leaves the count alone, which is what the hardware
+         * does. Writes of DATA0 and of PRE still reload; see the note in
+         * chan_reload().
+         *
+         * The retailOS does not notice either way: the only timer it uses is
+         * E, free-running at 1 MHz, set up at 0x08324e48 and read at
+         * 0x08324e38, and E is 32-bit so its status never lived in CON. The
+         * three navtest.sh runs across this change give the same pixel counts.
+         * Who collects is Rockbox and the bare-metal tests. See wiki/11 s.19.2.
+         */
+        if (new_cfg != old_cfg) {
+            chan_reload(c);
+        }
         ipod_classic_timer_update_irq(s);
         break;
     }

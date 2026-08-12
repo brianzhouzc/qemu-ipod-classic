@@ -36,6 +36,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicTimerState, IPOD_CLASSIC_TIMER)
 #define S5L8702_TIMER_AD_BASE   0x00
 #define S5L8702_TIMER_EH_BASE   0xA0
 
+/*
+ * THE HOLE BETWEEN THEM IS NOT EMPTY, and nothing here decodes it.
+ *
+ * A..D end at 0x7f and E..H begin at 0xa0. In the gap Rockbox puts a 64-bit
+ * free-running counter: TICNTH at +0x80 and TICNTL at +0x84 (s5l87xx.h:782),
+ * which s5l87xx.h:793 turns into FIVE_USEC_TIMER and :794 into its USEC_TIMER.
+ * decode_offset() covers neither, so both answer zero for ever and log a
+ * guest error. MEASURED with tools/ipod_classic/tests/timer_audit.c:
+ *
+ *     TICNTH/L 0x00000000/0x00000000 -> 0x00000000/0x00000000  FROZEN
+ *
+ * It costs the retailOS nothing -- the image does not contain the literal
+ * 0x3c700080 or 0x3c700084 anywhere in its 9.9 MB, and the time it measures it
+ * measures with timer E at 1 MHz (set up at 0x08324e48, read at 0x08324e38) --
+ * but a guest that span on FIVE_USEC_TIMER would hang for ever.
+ *
+ * NOT MODELLED ON PURPOSE. Adding the register is easy; no source we have says
+ * what it reads out of reset, whether it can be stopped, or its exact rate, and
+ * a counter invented at the wrong rate is worse than one that is missing --
+ * the missing one is noticed. See wiki/11 s.19.3.
+ */
+
 /* Shared status register for the 32-bit timers. */
 #define S5L8702_TIMER_TSTAT     0x118
 
