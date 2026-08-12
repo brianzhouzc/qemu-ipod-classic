@@ -142,12 +142,25 @@ again:
             case 0:
                 break;
             case 1:
-                // if ((req & (1u << dest_id)) == 0)
-                //     size = 0;
+                /*
+                 * mem -> peripheral, DMAC is the flow controller. The stock
+                 * model transferred unconditionally (the request check was
+                 * commented out), which drains the whole buffer at once. We now
+                 * honour the request, but ONLY for lines a peripheral has marked
+                 * paced -- every other line keeps the old full-speed behaviour,
+                 * so this cannot change any DMA that worked before. See
+                 * paced_lines in the header.
+                 */
+                if ((s->paced_lines & (1u << dest_id))
+                        && (req & (1u << dest_id)) == 0) {
+                    size = 0;
+                }
                 break;
             case 2:
-                // if ((req & (1u << src_id)) == 0)
-                //     size = 0;
+                if ((s->paced_lines & (1u << src_id))
+                        && (req & (1u << src_id)) == 0) {
+                    size = 0;
+                }
                 break;
             case 3:
                 if ((req & (1u << src_id)) == 0
@@ -208,6 +221,19 @@ again:
                 if (ch->ctrl & PL080_CCTRL_I) {
                     //printf("Setting interrupt status of channel %d\n", c);
                     s->tc_int |= 1 << c;
+                    /*
+                     * A paced peripheral gets exactly one chunk per request
+                     * pulse: consume the request so the next iteration stalls
+                     * until the peripheral asks again. Only touches paced lines.
+                     */
+                    if (s->paced_lines & (1u << dest_id)) {
+                        s->req_burst &= ~(1u << dest_id);
+                        s->req_single &= ~(1u << dest_id);
+                    }
+                    if (s->paced_lines & (1u << src_id)) {
+                        s->req_burst &= ~(1u << src_id);
+                        s->req_single &= ~(1u << src_id);
+                    }
                 }
             }
             goto again;
@@ -216,6 +242,26 @@ again:
             s->running = 1;
     }
     pl080_update(s);
+}
+
+void pl080_set_paced_line(PL080State *s, int line, bool on)
+{
+    if (on) {
+        s->paced_lines |= (1u << line);
+    } else {
+        s->paced_lines &= ~(1u << line);
+    }
+}
+
+void pl080_pace_request(PL080State *s, int line)
+{
+    /*
+     * Assert a burst request and let the controller run. pl080_run transfers
+     * until the next terminal-count on this line, then the consume logic above
+     * clears the bit and the channel stalls until the next call.
+     */
+    s->req_burst |= (1u << line);
+    pl080_run(s);
 }
 
 static uint64_t pl080_read(void *opaque, hwaddr offset,

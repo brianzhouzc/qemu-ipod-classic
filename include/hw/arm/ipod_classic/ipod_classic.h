@@ -24,6 +24,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_gpio.h"
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
+#include "hw/arm/ipod_classic/ipod_classic_i2s.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 
@@ -211,6 +212,7 @@ typedef struct {
     IPodClassicLCDState *lcd;
     IPodClassicDispState *disp;
     IPodClassicWheelState *wheel;
+    IPodClassicI2SState *i2s;
     Clock *sysclk;
     bool semihosting;
     /*

@@ -27,6 +27,7 @@
 #include "hw/arm/exynos4210.h"
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
+#include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
@@ -274,7 +275,7 @@ ipod_classic_unimplemented[] = {
     /* The click wheel is a real device now; see the machine init. */
     { "s5l8702.usb-phy",  USBPHYS_MEM_BASE,  0x100000 },
     { "s5l8702.wdt",      WDT_MEM_BASE,      0x100000 },
-    { "s5l8702.i2s",      I2S_MEM_BASE,      0x100000 },
+    /* s5l8702.i2s is a real device now; see the machine init. */
     { "s5l8702.spdif",    SPDIF_MEM_BASE,    0x100000 },
     { "s5l8702.spi0",     SPI0_MEM_BASE,     0x100000 },
     { "s5l8702.adc",      ADC_MEM_BASE,      0x100000 },
@@ -511,6 +512,17 @@ static void ipod_classic_machine_init(MachineState *machine)
                             S5L8702_PMU_I2C_ADDR);
 
     /*
+     * The CS42L55 audio codec, also on I2C0, at 7-bit 0x4A. The retailOS talks
+     * to it when it brings up or starts the audio engine (osos cscodec_write at
+     * 0x0808e1ac, and set_freq's cscodec_write(5, code)); while it did not exist
+     * every write was NACKed and every read returned bus garbage, which is a
+     * candidate for why selecting a song never engages playback. See
+     * ipod_classic_cs42l55.c and wiki/14.
+     */
+    i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_CS42L55,
+                            S5L8702_CS42L55_I2C_ADDR);
+
+    /*
      * The disk. -drive if=ide,file=... attaches one; with none the controller
      * still answers, which is what lets the retailOS find out there is no
      * disk instead of spinning on ATA_PIO_READY for ever.
@@ -569,6 +581,7 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, DMAC0_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_DMAC0_IRQ));
+    PL080State *dmac0 = PL080(dev);
 
     dev = qdev_new(TYPE_PL080);
     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem),
@@ -649,6 +662,22 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, WHEEL_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_WHEEL_IRQ));
+
+    /*
+     * The I2S transmitter at 0x3CA00000, the audio data path. It was
+     * create_unimplemented_device() until now, and that threw ~6144 PCM samples
+     * per boot on the floor (the DMA target FIFO is +0x10) and made every
+     * I2STXCOM readback zero, so the firmware could never confirm the
+     * transmitter started. See ipod_classic_i2s.c and wiki/14.
+     *
+     * The window is 0x1000; the rest of the 1 MB block still falls to the io
+     * floor. It is given DMAC0 so it can pace the audio DMA (hito 2).
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_I2S);
+    nms->i2s = IPOD_CLASSIC_I2S(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, I2S_MEM_BASE);
+    ipod_classic_i2s_set_dmac0(nms->i2s, dmac0);
 
     /*
      * The random number generator at 0x3C100000. See the long note above it:
