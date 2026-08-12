@@ -97,6 +97,80 @@ static void ipod_classic_cpu_reset(void *opaque)
     ipod_classic_write_bootinfo(nms);
 }
 
+/*
+ * The scratch stack the -kernel hand-off seeds: the top of IRAM0. crt0.S's
+ * memory_init() runs on it for a handful of pushes and the app switches to its
+ * own stacks the moment it returns, so nothing lives here for long. IRAM0's top
+ * keeps it clear of the SYSINFO block, which sits at the top of IRAM1.
+ */
+#define S5L8702_HANDOFF_SP   (IRAM0_MEM_BASE + IRAM0_MEM_SIZE)
+
+static void ipod_classic_poke32(hwaddr addr, uint32_t value)
+{
+    uint32_t le = cpu_to_le32(value);
+    cpu_physical_memory_write(addr, &le, sizeof(le));
+}
+
+/*
+ * Reproduce the state the bootrom + Rockbox/emCORE bootloader leave behind when
+ * they hand control to a raw OS image, for the -kernel path that skips them.
+ * Two things the firmware relies on that a cold ARM reset does not provide:
+ *
+ *  - A valid stack pointer. Rockbox's crt0.S (non-BOOTLOADER) calls
+ *    memory_init() -- whose first instruction is "push {r4,lr}" -- BEFORE it
+ *    sets up its own stacks (firmware/target/arm/s5l8702/crt0.S:143 vs :184), so
+ *    it runs on whatever SP the bootloader left in SVC mode. With SP=0 from
+ *    reset that push writes to 0xfffffff8 and takes an unhandled data abort into
+ *    a still-zero vector table -- MEASURED: pc then walks 0x10,0x14,... The
+ *    retailOS is unaffected because it sets its own SP before pushing anything
+ *    (it boots today with SP=0, which would fault the same way if it did not).
+ *
+ *  - A running microsecond timer. USEC_TIMER == TECNT of timer E, and udelay()
+ *    spins on it with no timeout (system-target.h). The only thing that starts
+ *    timer E is usec_timer_init(), which is #ifdef BOOTLOADER
+ *    (clocking-s5l8702.c:381), so the app never starts it and the first I2C
+ *    transfer in pmu_preinit() -- udelay(5) -- would hang. We program timer E
+ *    exactly as usec_timer_init() does: source ECLK/1, prescaler 11 so
+ *    12 MHz / 12 = 1 MHz, DATA0 = ~0, free-running, CLR|EN. The retailOS drives
+ *    timer E at 1 MHz itself and re-programs it (with CLR) before use, so this
+ *    is transparent to it -- confirmed by navtest.sh.
+ *
+ * Skipped when a real bootrom is supplied: the chain would then do this itself.
+ * Done from the machine reset AFTER qemu_devices_reset() so the timer device's
+ * own reset does not undo the timer program -- see ipod_classic_machine_reset().
+ */
+static void ipod_classic_handoff(IPodClassicMachineState *nms)
+{
+    if (nms->bootrom_path[0] != '\0') {
+        return;
+    }
+
+    /* The SVC-mode stack the bootloader would have left in r13. */
+    nms->cpu->env.regs[13] = S5L8702_HANDOFF_SP;
+
+    /* Timer E at 1 MHz, the register-for-register image of usec_timer_init(). */
+    ipod_classic_poke32(TIMER_MEM_BASE + 0xA0, (4u << 8) | (1u << 6)); /* TECON  */
+    ipod_classic_poke32(TIMER_MEM_BASE + 0xB0, (12000000u / 1000000u) - 1u);
+                                                                      /* TEPRE  */
+    ipod_classic_poke32(TIMER_MEM_BASE + 0xA8, 0xffffffffu);          /* TEDATA0 */
+    ipod_classic_poke32(TIMER_MEM_BASE + 0xA4, (1u << 1) | (1u << 0));/* TECMD  */
+}
+
+static void ipod_classic_machine_reset(MachineState *machine,
+                                       ShutdownCause reason)
+{
+    /*
+     * Reset every device the normal way first -- that includes the timer's own
+     * reset -- and only THEN reproduce the bootloader hand-off, so the timer we
+     * program does not get wiped a moment later. The sysbus cold-reset handler
+     * is registered by qdev_machine_creation_done(), i.e. after this machine's
+     * init has registered ipod_classic_cpu_reset(), so it would otherwise run
+     * last. This override is the one place guaranteed to run after all of them.
+     */
+    qemu_devices_reset(reason);
+    ipod_classic_handoff(IPOD_CLASSIC_MACHINE(machine));
+}
+
 static void ipod_classic_memory_setup(MachineState *machine,
                                       MemoryRegion *sysmem, AddressSpace *nsas)
 {
@@ -723,6 +797,7 @@ static void ipod_classic_machine_class_init(ObjectClass *klass, void *data)
 
     mc->desc = "Apple iPod classic (6th generation), S5L8702";
     mc->init = ipod_classic_machine_init;
+    mc->reset = ipod_classic_machine_reset;
     mc->max_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm926");
 }

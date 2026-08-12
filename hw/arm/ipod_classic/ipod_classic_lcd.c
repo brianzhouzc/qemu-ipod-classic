@@ -480,8 +480,22 @@ static const MemoryRegionOps ipod_classic_lcd_ops = {
     .read = ipod_classic_lcd_read,
     .write = ipod_classic_lcd_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid.min_access_size = 4,
+    /*
+     * The retailOS touches this block only in 32-bit words, but Rockbox does
+     * not: it pushes the frame as one pixel per 16-bit access to the data port,
+     * driven by DMAC0 (lcd-s5l8702.c displaylcd_dma(), dwidth = WIDTH_16 to
+     * S5L8702_DADDR_PERI_LCD_WR = LCD_BASE+0x40). With a 4-byte floor every one
+     * of those DMA writes was rejected as "invalid size" and 0 pixels reached
+     * the panel -- MEASURED: the screen stayed black while the driver ran a full
+     * update. Accept halfword accesses too; panel_data() already takes one pixel
+     * from the low 16 bits, so a 16-bit or a 32-bit write both deliver one pixel.
+     * impl is pinned to [2,4] so the core hands the handler the guest's real
+     * access size and never folds a 16-bit pixel store into a read-modify-write.
+     */
+    .valid.min_access_size = 2,
     .valid.max_access_size = 4,
+    .impl.min_access_size = 2,
+    .impl.max_access_size = 4,
 };
 
 /* ---------------------------------------------------------------- console */
