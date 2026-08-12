@@ -96,26 +96,76 @@ Eso ya costó cuatro carreras, y por eso `navtest.sh` ahora cuenta procesos
 sueltos y avisa antes de empezar. Si arrancas una copia con otro nombre para
 mirar la pantalla, **mátala tú** antes de fiarte de una carrera de pruebas.
 
-## 5. Lo que queda sin comprobar, y es lo importante
+## 5. Por qué no sale la música: el volumen de datos NO se monta
 
-**El identificador FireWire de arriba está inventado.** No aparece en el
-`SysCfg`, así que se puso uno cualquiera para que `libgpod` firmara.
+La primera versión de esta sección culpaba a la firma del `iTunesDB`. **Era
+falso, y lo probamos midiendo.** El firmware no llega ni a mirar la base de
+datos. La pantalla enseña "No Music" porque **rechaza el volumen FAT32 entero
+al leer su cabecera**, mucho antes de la firma.
 
-El firmware valida el hash contra **su propio** identificador, no contra el
-del fichero. Si no coinciden, lo esperable es que el menú de Música aparezca
-y la lista salga **vacía**. Eso no sería un fallo del disco ni de la base de
-datos: sería la firma.
+### Lo que está VERIFICADO, ejecutando
 
-Si pasa, lo siguiente es averiguar **de dónde saca el firmware su
-identificador** —desensamblando quién lee qué antes de validar— y ponerlo
-igual en `SysInfo`. En una emulación tenemos los dos lados, así que el
-problema es de averiguación, no de criptografía.
+Todo esto es del 2026-08-12, medido, no supuesto:
 
-> **INFERIDO, no verificado:** que el retailOS del 6G rechace una base de datos
-> mal firmada mostrando una lista vacía. Es el comportamiento que se documenta
-> para estos modelos, pero no lo hemos visto aquí.
+1. **Se llega al menú de Música.** Navegando con `sendkey` desde el monitor
+   (esperar 38 s tras arrancar y espaciar las pulsaciones ~9 s), el retailOS
+   entra en Música y dibuja la lista Cover Flow / Playlists / … / Songs con
+   **"No Music"** en el panel. Captura mirada, no sólo contada.
 
-Y hay una segunda incógnita, independiente de la primera: **que suene**. El
-I²S no está modelado —hoy se tiran al suelo unos 6 000 accesos por arranque—
-así que aunque la canción aparezca en la lista, reproducirla es otro
-problema. Ver [04-roadmap.md](04-roadmap.md).
+2. **La FAT32 se lee UNA vez y se rechaza.** Con `ATATRACE=1` en un arranque
+   que llega a Música: de las ~450 lecturas por DMA, **una sola** cae dentro
+   de la partición de datos (sus primeros 64 sectores de 512 B = la cabecera),
+   y **nunca** se lee el directorio raíz ni `iPod_Control` ni el `iTunesDB`.
+   Si el volumen se hubiera montado, el firmware habría leído el directorio
+   buscando `iPod_Control`. No lo hace. Se rechaza en la cabecera.
+
+3. **La firma, el hash y el `iTunesDB.p7b` son IRRELEVANTES.** No se llega a
+   validar nada de eso porque el volumen no se monta. La sección anterior se
+   preocupaba del problema equivocado.
+
+4. **El rechazo no depende de** (todos probados, misma traza de una lectura):
+   - tamaño de sector de la FAT: **512, 2048 y 4096** fallan igual;
+   - tipo de partición en el MBR: **0x0B (CHS) y 0x0C (LBA)** fallan igual;
+   - el campo de sectores ocultos del sector de arranque, puesto a su valor
+     correcto.
+
+### Quién lee la cabecera, y la cadena de montaje
+
+Instrumentando el modelo ATA para imprimir el PC y la pila del huésped en la
+lectura de la partición de datos (LBA 181568), la lectura sale de una sola
+llamada y la cadena, de dentro afuera, es:
+
+```
+0x0805a6f4   primitiva de lectura de bloque (registros en 0x38700000)
+0x08326518   bucle de lectura de bloques (troceado en sectores)
+0x0827a6b0   envoltorio de lectura del sistema de ficheros
+0x0824690c   lectura FS -> compara el resultado con 31 en 0x08246948
+0x082465xx   DESPACHO VFS: elige el driver por TIPO de sistema de ficheros
+             (cmp #1 / #4 / #5, cada uno con su tabla de funciones)
+0x0813b20c   tarea de trabajo de RTXC
+```
+
+El punto donde se decide aceptar o rechazar está **detrás de la tabla de
+funciones** que selecciona `0x082465xx`: el firmware identifica el tipo de
+volumen y despacha al driver correspondiente, y ese driver es el que valida (o
+descarta) la cabecera FAT.
+
+### Lo que falta, acotado para retomarlo
+
+Poner un breakpoint (con `tools/ipod_classic/gdbpoke.py`) en el driver de FAT
+que la vtable selecciona en `0x082465xx`, y ver **qué campo de la cabecera
+rechaza**. Es una tarea de una sola sesión. Candidatos a mirar de camino: el
+byte que `0x0824659c` lee en `+6` y compara con `8`, y la cadena `"FAT32   "`
+en `+0x52` del sector de arranque.
+
+> **Hipótesis de trabajo, sin verificar:** que un iPod classic 6G de fábrica
+> formatea su partición de datos con parámetros que nuestra `mkfs.vfat` no
+> reproduce (alineación, tamaño de FAT, o un campo del BPB que el driver de
+> Apple exige). La forma de zanjarlo es el breakpoint de arriba, no seguir
+> probando formatos a ciegas: 512/2048/4096 y 0x0B/0x0C ya se descartaron.
+
+### Segunda incógnita, independiente: que SUENE
+
+Aunque la pista aparezca en la lista, reproducirla es otro problema. El I²S no
+está modelado —hoy se tiran al suelo unos 6 000 accesos por arranque— así que
+el audio es un frente aparte. Ver [04-roadmap.md](04-roadmap.md).
