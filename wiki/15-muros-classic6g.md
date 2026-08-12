@@ -209,6 +209,61 @@ decisivo: firma real de libgpod → biblioteca vacía; ceros → "1 曲". El fir
 
 ---
 
+## 12. El audio del retailOS: la decodificación vive en un DSP
+
+**Síntoma.** Con la música ya listada, al dar play el reproductor salía a medias
+(icono sí, barra e info no) y no sonaba.
+
+**Causa.** Se modeló el camino de audio del SoC —el I²S en `0x3CA00000`, el códec
+CS42L55 por I²C `0x4A`, y el pacing del DMA a 44100 Hz—, y la captura de PCM a
+WAV funciona. Pero el WAV sale con **RMS 0: silencio**. El motivo, medido: **el
+retailOS decodifica el MP3 en el DSP CalmADM2E** (`0x39000000`/`0x3F000000`), que
+no está modelado. El PCM que el DMA envía al I²S son ceros porque el DSP nunca
+los produce.
+
+**Estado.** El camino de audio *del hardware* está modelado y probado (I²S, códec,
+pacing, captura). Pero "que suene por el retailOS" exige **modelar un DSP entero**
+— un frente enorme. La vía practicable es Rockbox (ver 13-14).
+([14-classic6g-audio.md](14-classic6g-audio.md))
+
+---
+
+## 13. Rockbox: compilar y arrancar el firmware libre en la máquina
+
+**Por qué.** Rockbox decodifica el MP3 **en el ARM**, no en un DSP. Su PCM sí
+saldría real por el mismo I²S que ya capturamos. Y es open source, con símbolos,
+así que depurarlo es incomparablemente más fácil que el retailOS a ciegas.
+
+**Muro (a): compilar.** El árbol de Rockbox trae el target `ipod6g`, pero Rockbox
+oficialmente quiere su propio `arm-elf-eabi-gcc 4.9`. Se compiló con el
+`arm-none-eabi-gcc 13.2` del sistema (detectó bien `arm v5, classic`), dando
+`rockbox.bin` (1,13 MB), `rockbox.elf` (con símbolos) y `rockbox.zip` con los
+códecs — incluido `mpa.codec`, el decodificador MP3 en ARM.
+
+**Muro (b): arrancar.** Rockbox carga en `0x08000000` (LMA de la tabla de
+vectores), igual que el osos, así que arranca por `-kernel`. Pero se colgaba, por
+dos cosas que el bootloader real hace y nosotros saltábamos:
+
+1. **La pila.** `crt0.S` (build de app, no bootloader) llama a `memory_init`
+   *antes* de montar sus pilas. Con SP=0 daba un data abort. Se siembra
+   SP=`0x22020000` (tope de IRAM0) en un hand-off que corre tras el reset de los
+   devices.
+2. **El reloj de microsegundos.** `udelay` gira sobre `USEC_TIMER == TECNT` sin
+   timeout, y su init es `#ifdef BOOTLOADER`. Se arranca el TimerE a 1 MHz igual
+   que `usec_timer_init()`.
+
+Y un tercero, de vídeo: **Rockbox empuja el frame por DMA de 16 bits** al LCD
+(`displaylcd_dma`, DMAC0), mientras el retailOS usa 32. El suelo de acceso del
+panel, puesto a 4 bytes, rechazaba cada escritura de Rockbox → 0 píxeles. Se
+bajó a 2, sin romper la ruta de 32 bits del retailOS.
+
+**Cómo cayó.** Con esos tres ajustes (todos en el modelo, anotados y sin tocar
+Rockbox), **Rockbox arranca hasta su menú principal cabbiev2, navegable**: la
+rueda mueve el resaltado, SELECT abre. Verificado con capturas miradas y sin
+regresión del retailOS. ([16-classic6g-rockbox.md](16-classic6g-rockbox.md))
+
+---
+
 ## El patrón que se repitió: el descarte que era la pista
 
 **Tres veces** en este proyecto algo dado por descartado resultó ser la clave:
@@ -229,9 +284,13 @@ el instrumento con un caso de control.
 
 ## Muros que siguen en pie
 
-- **Que suene.** El camino de audio (I²S + DMA de audio + códec) no está
-  modelado; hoy ~6.000 accesos por arranque se tiran al suelo. En curso — ver
-  [14-classic6g-audio.md](14-classic6g-audio.md) cuando exista.
+- **Que suene, el último.** El camino de audio del hardware está modelado (I²S,
+  códec, pacing, captura a WAV) y **Rockbox arranca a su menú**. Falta el paso
+  final: reproducir un MP3 en Rockbox y comprobar que el WAV capturado tiene
+  **audio real** (Rockbox decodifica en el ARM, así que debería). **En curso**
+  ahora mismo. Ver [14](14-classic6g-audio.md) y [16](16-classic6g-rockbox.md).
+- **El audio del retailOS por sí solo.** Exigiría modelar el DSP CalmADM2E
+  entero (muro 12). Frente aparte y grande; Rockbox lo sortea.
 - **"Connect to Power" / reinicio a los ~46 s.** El modelo de energía hace creer
   al retailOS que la batería está vacía (lee la carga por un camino que no
   modelamos; el ADC que damos es el que quiere Rockbox, no Apple). Acotado.
