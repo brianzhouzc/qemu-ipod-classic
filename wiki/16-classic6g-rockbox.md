@@ -290,3 +290,135 @@ SELECT es la fluctuación ya documentada del arnés, no una regresión; 5G: nave
   muestra, pero sí es lo que mantiene el flujo vivo lo bastante para capturarlo.
 - **La tasa es 48000 Hz**, no 44100: este MP3 es de 48 kHz, Rockbox pone
   `I2SCLKDIV=0xfa` (=250 → 12 MHz/250 = 48000) y el WAV queda etiquetado bien.
+
+---
+
+## 8. Que **SUENE por los altavoces** y que reproducir sea **FIABLE**
+
+Faltaban dos cosas para *disfrutarlo*: (a) que el PCM salga por los altavoces del
+host en vivo, no sólo a un WAV; (b) eliminar un **panic intermitente** del DMA al
+darle *play*. Ambas hechas y **medidas**.
+
+### 8.1. Audio en vivo por PulseAudio (`AUDIOLIVE=1`, `-audio pa`)
+
+El **mismo** PCM que va al WAV se entrega además a un `SWVoiceOut` de QEMU, que
+sale por el backend `-audio pa` (PulseAudio). Bajo **WSLg**, `pa` alcanza los
+altavoces de Windows: `PULSE_SERVER=/mnt/wslg/PulseServer` → `RDPSink` → RDP →
+Windows (`pactl info` lo confirma: *Default Sink RDPSink*). En un Linux de
+escritorio, `pa` va al PulseAudio/Pipewire local. Está en
+`hw/arm/ipod_classic/ipod_classic_i2s.c`, **gated por `AUDIOLIVE`** y **aditivo** a
+la captura `AUDIOWAV` (los mismos bytes van a los dos sitios).
+
+**Un solo comando** (ventana gráfica + sonido):
+
+```sh
+sh tools/ipod_classic/rbmusic.sh          # -M iPod-Classic -audio pa, AUDIOPACE+AUDIOLIVE
+# equivale a:
+env AUDIOPACE=1 AUDIOLIVE=1 <qemu> -M iPod-Classic -kernel rockbox.bin \
+    -drive if=ide,format=raw,file=$HOME/6g/Erbmusic.img -audio pa -display sdl
+```
+
+Teclas (enfocar la ventana; mapeo en `ipod_classic_wheel.c`): **e/q** rueda
+adelante/atrás, **Enter** SELECT, **w** MENU, **s** play/pausa, **d/a**
+siguiente/anterior. Para reproducir: arranca (~15 s) → **Enter** → **e/q** a una
+pista → **Enter**.
+
+**Prueba MEDIDA de que el backend recibe el PCM real (el mismo que el WAV):**
+
+- **Checksum, byte a byte.** En una corrida con `AUDIOWAV`+`AUDIOLIVE`, los bytes
+  entregados a `AUD_write` son **idénticos** a los del WAV:
+  `wav_bytes=live_bytes=4936192`, `wav_sum=live_sum=626263738` → **IDENTICAL**
+  (instrumentación temporal `AUDIOLIVEDBG`, ya retirada). Y ese WAV correlaciona
+  **1.000** con la canción (§7). Es decir: al altavoz llega, muestra a muestra, la
+  misma canción que ya validamos.
+- **Captura del monitor de PulseAudio** (`parecord RDPSink.monitor`) durante una
+  reproducción: **pico 31883** (casi fondo de escala, cf. WAV 30074), **estéreo
+  real** (`RMS(L−R)=4363`, 0 sería falso-mono), reconociblemente la canción.
+- **Host ocioso: 0 underruns, 0 drops** en toda la canción.
+
+**Cómo está cableado** (todo `AUDIOLIVE`-gated, inerte por defecto):
+
+- La voz se abre **en `realize`**, *antes* de arrancar la VM. `AUD_set_active_out`
+  sólo arma el timer del mixer si `vm_running`, que se pone **una vez** al arrancar
+  la VM; una voz registrada tarde (durante la reproducción) se pierde ese flanco y
+  **no clockea ni una muestra** (el backend `wav` se queda en 44 bytes; `pa` mudo).
+  Copiado de `hw/audio/lm4549.c`.
+- **Anillo de 1 MiB + *priming* de 300 ms.** El DMA se pacea en reloj **VIRTUAL** y
+  el mixer consume en reloj **REAL**; sus tasas sólo coinciden de media, así que el
+  jitter por ráfaga vaciaría el anillo (medido: **~90 underruns/s** sin colchón).
+  Se retiene el primer 0.3 s de PCM sin activar la salida (una voz inactiva no
+  tira, el anillo se llena); luego se activa y el **callback del mixer** drena el
+  anillo a su ritmo real. La ruta por muestra es mínima (sólo *append*; el
+  `AUD_write` ocurre en el callback), porque el decode MP3 en el ARM emulado va
+  justo de presupuesto y cualquier trabajo por muestra le roba margen al códec.
+
+**Techo honesto (rendimiento del host, no un bug):** el decode MP3 en el ARM
+emulado va a **~0.9× tiempo real** en este host de desarrollo (contendido con
+compilaciones). El *priming* absorbe **jitter**, no un déficit sostenido: si el
+host no sostiene ≥1× real-time, el colchón se agota en unos segundos y reaparece
+algún underrun (la canción suena un pelín lenta/con algún hueco). En un host
+rápido/ocioso suena limpio y a tono. **El WAV siempre es exacto**, y el backend
+siempre recibe el PCM correcto (checksum arriba). Nota de medida: grabar el
+monitor `RDPSink.monitor` *a la vez* que corre QEMU roba CPU y añade sus propios
+underruns a la *grabación* — es artefacto del aparato de medida, no de la salida.
+
+### 8.2. El panic **"DMA ch link error"** eliminado de raíz
+
+Reproduciendo con la ventana gráfica (o con el host cargado) Rockbox entraba a
+veces en `panicf("DMA ch%d: link error")` al darle *play*. Es una **carrera** del
+pacing del DMA de audio.
+
+**La causa (VERIFICADO leyendo el driver, `assets/rockbox/.../s5l8702/pl080.c`).**
+Rockbox mantiene un DMA de audio continuo extendiendo la cadena de LLIs desde su
+ISR de terminal-count (`dmac_ch_queue_2d`, rama `QUEUE_LINK`): cuando ve
+`DMACCxLINK==0` (el HW llegó a la última LLI) escribe el enlace de la nueva task y
+**re-lee `DMACCxCONFIG`**; si el bit **E** (enable) ya está a 0, hace *panic*
+(`pl080.c:436-437` del firmware). Nuestro modelo, al completar la LLI terminal
+(`link==0`), **auto-deshabilitaba el canal** (`ch->conf &= ~E`) en ese mismo
+instante — y ese instante lo dispara un **`QEMUTimer` del host** (el tick de
+drenaje del audio) que el `disable_irq_save()` del guest **no puede frenar**. Si
+el timer completa la LLI terminal *entre* la lectura `link==0` y la comprobación de
+E del guest, éste ve **E=0** y hace panic. Carrera de *timing relativo*: headless
+rápido casi nunca la pierde; con la ventana gráfica (WSLg roba CPU, el guest tarda
+más) a veces sí — justo lo que reportaba el usuario.
+
+**El arreglo (robusto, `hw/dma/pl080.c`).** Un canal **paced** **nunca** suelta su
+bit E al llegar a una LLI terminal: se marca `paced_pending` y se queda
+*enabled*-e-inactivo. Reanuda cuando el guest escribe un nuevo `LINK`
+(`pl080_write` caso 2 sólo lo **registra**; `pl080_run` recarga el descriptor en el
+siguiente tick, que es donde el HW real consume el registro LINK), y **sólo** se
+deshabilita cuando el guest aborta explícitamente (`CONFIG.E=0`). Así la
+comprobación de E del guest **siempre** ve E=1 y el `panicf` queda **inalcanzable
+para el canal de audio con cualquier timing** — garantía determinista, no
+probabilística. Un reenganche tardío cuesta, como mucho, un breve underrun.
+**Gating sin regresión:** `paced_pending` sólo se pone para líneas *paced*, que
+sólo existen bajo `AUDIOPACE` y sólo las marca el I2S 6G; para el retailOS 6G y el
+5G el flujo es **byte-idéntico** al de stock.
+
+**Verificación MEDIDA (detector: leer `panic_buf` en `0x08154c48` por el monitor
+tras cada corrida).** Para *forzar* la carrera se usó un botón temporal
+`PANICSTRESS=N` (comprime el intervalo del tick para que el DMA adelante al guest)
+y un `PACED_NOFIX=1` que revierte el arreglo en el **mismo binario** (ambos ya
+retirados):
+
+| Corrida | Sin arreglo (`PACED_NOFIX=1`) | Con arreglo |
+|---|---|---|
+| stress=16 (carrera forzada) | **4/4 PANIC** (incl. el literal `DMA ch2: link error`) | **0 / 8** |
+| stress=2 (playback sostenido) | **3/5 PANIC** | **0 / 10** |
+| pacing normal + `-audio pa` (condición del usuario) | — | **0 / 10** |
+
+Es decir: el estresor **reproduce** el panic (y el detector lo caza, texto exacto
+incluido) y el arreglo lo **elimina** en todas las corridas, tanto bajo la carrera
+forzada como en reproducción normal sostenida con audio en vivo. (El 5G no se
+toca; `navtest.sh` 6G y 5G siguen pasando — §8.3.)
+
+### 8.3. Reproducir
+
+```sh
+# altavoces en vivo (ventana):
+sh tools/ipod_classic/rbmusic.sh
+# captura a WAV como antes (sigue dando la canción, correlación 1.000):
+env AUDIOPACE=1 sh tools/ipod_classic/rbplay.sh
+# a la vez altavoces + WAV:
+AUDIOWAV=/tmp/out.wav sh tools/ipod_classic/rbmusic.sh
+```

@@ -74,6 +74,15 @@ struct PL080State {
      * instead of all at once. See hw/arm/ipod_classic/ipod_classic_i2s.c.
      */
     uint32_t paced_lines;
+    /*
+     * Bitmap of paced channels that have completed their terminal LLI (link==0)
+     * but are kept ENABLED instead of auto-disabling, so a concurrent guest
+     * relink cannot observe CONFIG.E==0 and panic "DMA ch link error". The bit
+     * is set in pl080_run and cleared when the guest relinks (pl080_write LLI),
+     * reloads the channel (Control with a non-zero count) or disables it
+     * (CONFIG.E=0). Never set for non-paced lines, so stock DMA is unaffected.
+     */
+    uint32_t paced_pending;
     qemu_irq irq;
     qemu_irq interr;
     qemu_irq inttc;

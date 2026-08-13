@@ -88,6 +88,24 @@ static void pl080_update(PL080State *s)
     qemu_set_irq(s->irq, errlevel || tclevel);
 }
 
+/*
+ * Load a channel's working registers from the linked-list descriptor at `lli`
+ * (src @ +0, dest @ +4, next-link @ +8, control @ +12). This is exactly the
+ * fetch the controller does at an LLI boundary; factored out so the terminal
+ * relink path (pl080_write) and the mid-run boundary (pl080_run) stay identical.
+ */
+static void pl080_ch_load_lli(PL080State *s, pl080_channel *ch, uint32_t lli)
+{
+    ch->src  = address_space_ldl_le(&s->downstream_as, lli,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    ch->dest = address_space_ldl_le(&s->downstream_as, lli + 4,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    ch->ctrl = address_space_ldl_le(&s->downstream_as, lli + 12,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    ch->lli  = address_space_ldl_le(&s->downstream_as, lli + 8,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
 static void pl080_run(PL080State *s)
 {
     int c;
@@ -129,6 +147,18 @@ again:
             if ((ch->conf & (PL080_CCONF_H | PL080_CCONF_E))
                     != PL080_CCONF_E)
                 continue;
+            /*
+             * Resume a completed-pending paced channel that the guest has since
+             * relinked: it wrote the next task's descriptor pointer to the LINK
+             * register while we were holding the enable bit high (see the
+             * terminal handling below). Load that descriptor now -- this is the
+             * point at which real hardware consumes the LINK register -- and drop
+             * the pending flag so the channel runs the new task normally.
+             */
+            if ((s->paced_pending & (1u << c)) && ch->lli != 0) {
+                pl080_ch_load_lli(s, ch, ch->lli);
+                s->paced_pending &= ~(1u << c);
+            }
             flow = (ch->conf >> 11) & 7;
             if (flow >= 4) {
                 hw_error(
@@ -199,22 +229,30 @@ again:
             if (size == 0) {
                 /* Transfer complete.  */
                 if (ch->lli) {
-                    ch->src = address_space_ldl_le(&s->downstream_as,
-                                                   ch->lli,
-                                                   MEMTXATTRS_UNSPECIFIED,
-                                                   NULL);
-                    ch->dest = address_space_ldl_le(&s->downstream_as,
-                                                    ch->lli + 4,
-                                                    MEMTXATTRS_UNSPECIFIED,
-                                                    NULL);
-                    ch->ctrl = address_space_ldl_le(&s->downstream_as,
-                                                    ch->lli + 12,
-                                                    MEMTXATTRS_UNSPECIFIED,
-                                                    NULL);
-                    ch->lli = address_space_ldl_le(&s->downstream_as,
-                                                   ch->lli + 8,
-                                                   MEMTXATTRS_UNSPECIFIED,
-                                                   NULL);
+                    pl080_ch_load_lli(s, ch, ch->lli);
+                } else if (s->paced_lines & ((1u << dest_id) | (1u << src_id))) {
+                    /*
+                     * Terminal LLI (no link) on a PACED channel. Do NOT clear
+                     * the enable bit here. Rockbox's audio driver keeps a single
+                     * continuous DMA alive by extending the LLI chain from its
+                     * terminal-count IRQ handler (dmac_ch_queue_2d, QUEUE_LINK):
+                     * when it sees DMACCxLINK==0 it writes the next task's link
+                     * and then re-reads DMACCxCONFIG, and it panics
+                     * "DMA ch%d: link error" if the enable bit is already clear.
+                     * Our paced drain runs from a host QEMUTimer that the guest's
+                     * IRQ masking cannot hold off, so auto-disabling the channel
+                     * the instant the terminal element drains races that check
+                     * and makes playback panic under some timings (graphical
+                     * window, loaded host). Instead we keep the channel enabled
+                     * and idle (completed-pending); it resumes when the guest
+                     * writes a new LINK (pl080_write case 2) and is disabled only
+                     * when the guest explicitly aborts (writes CONFIG.E=0). This
+                     * removes the race for ANY relative timing: a late relink now
+                     * costs at most a brief underrun, never a panic. Non-paced
+                     * channels (all retailOS/5G DMA, and everything when AUDIOPACE
+                     * is off) keep the exact stock auto-disable below.
+                     */
+                    s->paced_pending |= (1u << c);
                 } else {
                     ch->conf &= ~PL080_CCONF_E;
                 }
@@ -370,13 +408,34 @@ static void pl080_write(void *opaque, hwaddr offset,
             break;
         case 2: /* LLI */
             s->chan[i].lli = value;
+            /*
+             * If this channel is a completed-pending paced channel (see the
+             * terminal handling in pl080_run), the guest is extending the chain:
+             * we only RECORD the new link here. The channel is reloaded from it
+             * in pl080_run on the next drain, mirroring the hardware, which
+             * consumes the LINK register only when it reaches the end of the
+             * terminal LLI. Reloading synchronously here would change what the
+             * guest's own read-back of DMACCxLINK returns a few instructions
+             * later and corrupt its book-keeping. Because the enable bit was
+             * never dropped, the guest's follow-up CONFIG.E read passes instead
+             * of panicking "DMA ch link error".
+             */
             break;
         case 3: /* Control */
             //printf("%s: setting control of channel %d to 0x%08x (transfer size: %d)\n", __func__, i, value, value & 0xfff);
             s->chan[i].ctrl = value;
+            /* A fresh descriptor with real work clears any completed-pending
+               state (e.g. dmac_ch_run starting a new task). */
+            if (value & 0xfff) {
+                s->paced_pending &= ~(1u << i);
+            }
             break;
         case 4: /* Configuration */
             //printf("%s: setting configuration of channel %d to 0x%08x\n", __func__, i, value);
+            if (!(value & PL080_CCONF_E)) {
+                /* Explicit disable/abort resolves the completed-pending state. */
+                s->paced_pending &= ~(1u << i);
+            }
             s->chan[i].conf = value;
             pl080_run(s);
             break;
@@ -436,6 +495,7 @@ static void pl080_reset(DeviceState *dev)
     s->req_single = 0;
     s->req_burst = 0;
     s->running = 0;
+    s->paced_pending = 0;
 
     for (i = 0; i < s->nchannels; i++) {
         s->chan[i].src = 0;
