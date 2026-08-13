@@ -209,22 +209,41 @@ decisivo: firma real de libgpod → biblioteca vacía; ceros → "1 曲". El fir
 
 ---
 
-## 12. El audio del retailOS: la decodificación vive en un DSP
+## 12. El audio del retailOS: silencio, y la teoría del DSP que resultó falsa
 
 **Síntoma.** Con la música ya listada, al dar play el reproductor salía a medias
 (icono sí, barra e info no) y no sonaba.
 
-**Causa.** Se modeló el camino de audio del SoC —el I²S en `0x3CA00000`, el códec
-CS42L55 por I²C `0x4A`, y el pacing del DMA a 44100 Hz—, y la captura de PCM a
-WAV funciona. Pero el WAV sale con **RMS 0: silencio**. El motivo, medido: **el
-retailOS decodifica el MP3 en el DSP CalmADM2E** (`0x39000000`/`0x3F000000`), que
-no está modelado. El PCM que el DMA envía al I²S son ceros porque el DSP nunca
-los produce.
+**Lo que funciona.** Se modeló el camino de audio del SoC —el I²S en
+`0x3CA00000`, el códec CS42L55 por I²C `0x4A`, el pacing del DMA— y la captura de
+PCM a WAV. Pero el WAV del retailOS sale con **RMS 0: silencio**. Algo no produce
+el PCM.
 
-**Estado.** El camino de audio *del hardware* está modelado y probado (I²S, códec,
-pacing, captura). Pero "que suene por el retailOS" exige **modelar un DSP entero**
-— un frente enorme. La vía practicable es Rockbox (ver 13-14).
-([14-classic6g-audio.md](14-classic6g-audio.md))
+**La causa que creímos —y era falsa.** Dijimos: *"el retailOS decodifica en el
+DSP CalmADM2E (`0x39000000`/`0x3F000000`), que no está modelado"*, y que sonar
+exigiría **emular un DSP entero**. Lo dedujimos de **245 y 213 "referencias"** a
+esas direcciones en el firmware. Una RE posterior lo **midió y lo tumbó**
+([19-classic6g-dsp-hle.md](19-classic6g-dsp-hle.md)):
+
+- El retailOS **no toca** `0x39000000`/`0x3F000000` por MMIO en ningún estado
+  alcanzable. **Las "referencias" eran el `float 0.5f`** — `0x3F000000` es 0,5 en
+  IEEE-754 — y datos (colores ARGB). Contamos el número decimal 0,5 y lo llamamos
+  un DSP.
+- El hardware en `0x391/2/3` que sí se conduce al reproducir es un **escalador de
+  imagen** (la carátula), no audio.
+- **Evidencia fuerte de que el retailOS decodifica el audio en software** (ARM):
+  cadenas `MP3ExampleTask`, `MeCCADecode`, `alac: bit depth`, tabla `AudioCodecs`.
+
+**Estado.** Si el decode es en software, **no hay DSP que emular** y el audio
+debería fluir como Rockbox; el silencio tiene otra causa, aguas arriba. El
+experimento que decide la arquitectura —un watchpoint sobre la fuente del DMA de
+audio, para ver quién escribe el PCM— está en marcha. La vía ya probada que **sí
+suena** es Rockbox (13-14).
+
+> **Este muro es el mejor ejemplo del patrón de abajo, y lo cometimos nosotros.**
+> Escribimos este mismo documento avisando de que *contar referencias en vez de
+> mirar el valor* es la trampa que más caro salió — y acto seguido montamos una
+> teoría del DSP contando 0,5. El método que nos hizo caer fue el que nos sacó.
 
 ---
 
@@ -264,33 +283,40 @@ regresión del retailOS. ([16-classic6g-rockbox.md](16-classic6g-rockbox.md))
 
 ---
 
-## El patrón que se repitió: el descarte que era la pista
+## El patrón que se repitió: contar en vez de mirar el valor
 
-**Tres veces** en este proyecto algo dado por descartado resultó ser la clave:
+Una y otra vez en este proyecto, algo se dio por sentado **contando o
+suponiendo** en lugar de mirar el valor concreto — y estaba mal:
 
-| Descartado como… | Era en realidad… |
+| Se dio por… | Era en realidad… |
 |---|---|
-| `0x38900000`, "ningún registro con dirección de DRAM" | el compositor de vídeo, la pieza central |
-| la imagen `rsrc`, "vacía, se genera en el aparato" | un FAT16 con las tipografías |
-| el ATA, "culpable del cuelgue" | inocente; era un `memcpy` por DMA posterior |
+| `0x38900000` "ningún registro con dirección de DRAM" → descartado | el compositor de vídeo, la pieza central |
+| la imagen `rsrc` "vacía, se genera en el aparato" | un FAT16 con las tipografías |
+| el ATA "culpable del cuelgue" | inocente; era un `memcpy` por DMA posterior |
+| **245+213 "referencias al DSP" → el retailOS decodifica en un DSP** | **el `float 0.5f` y datos; no hay tal DSP** (muro 12) |
 
-Qué tienen en común: los tres se descartaron **contando o suponiendo**, no
-mirando el valor concreto. La cura, repetida hasta ser doctrina: desensambla el
-binario en vez de razonar sobre el hardware, mira *qué* dato lleva un registro y
-no solo *cuántos* accesos hay, y trata cada medida como sospechosa hasta validar
-el instrumento con un caso de control.
+Las tres primeras nos costaron horas y las remontamos. La cuarta la escribimos
+**en este mismo documento como teoría**, y otra RE la tumbó midiendo. Es el caso
+más puro: caímos en la trampa contra la que la propia doctrina avisa.
+
+La doctrina, ya sin excusa: desensambla el binario en vez de razonar sobre el
+hardware; mira **qué** dato lleva un registro, no solo **cuántos** accesos hay
+(`0x3F000000` puede ser un periférico… o el número 0,5); y trata cada medida como
+sospechosa hasta validar el instrumento con un caso de control.
 
 ---
 
 ## Muros que siguen en pie
 
-- **Que suene, el último.** El camino de audio del hardware está modelado (I²S,
-  códec, pacing, captura a WAV) y **Rockbox arranca a su menú**. Falta el paso
-  final: reproducir un MP3 en Rockbox y comprobar que el WAV capturado tiene
-  **audio real** (Rockbox decodifica en el ARM, así que debería). **En curso**
-  ahora mismo. Ver [14](14-classic6g-audio.md) y [16](16-classic6g-rockbox.md).
-- **El audio del retailOS por sí solo.** Exigiría modelar el DSP CalmADM2E
-  entero (muro 12). Frente aparte y grande; Rockbox lo sortea.
+- **Rockbox suena — resuelto.** Rockbox arranca a su menú, reproduce un MP3
+  (decodifica en el ARM) y el PCM sale **por los altavoces del host** y a un WAV
+  que correlaciona 1.000 con el original. ([16](16-classic6g-rockbox.md) §7-8)
+- **El audio del retailOS — reencuadrado, en curso.** Ya **no** se cree que haga
+  falta emular un DSP (muro 12): la evidencia dice que el retailOS decodifica en
+  **software**. El paso decisivo —averiguar con un watchpoint quién produce el
+  PCM y por qué es silencio— está en marcha. Si se confirma la decodificación por
+  software, sonar sería destapar el camino, no emular un procesador.
+  ([19](19-classic6g-dsp-hle.md))
 - **"Connect to Power" / reinicio a los ~46 s.** El modelo de energía hace creer
   al retailOS que la batería está vacía (lee la carga por un camino que no
   modelamos; el ADC que damos es el que quiere Rockbox, no Apple). Acotado.
