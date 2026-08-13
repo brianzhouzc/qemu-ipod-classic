@@ -59,6 +59,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
 #define PCF5063X_ADCS3_ADCRDY     0x80
 
 /*
+ * Power-status registers, and the healthy values a running iPod reports.
+ *
+ * OOCSTAT (0x12) is the on/off-controller status. Bits, from Rockbox's
+ * pcf5063x.h: ONKEY 0x01, EXTON1..3 0x02/0x04/0x08, BUBPRES 0x10, SYSOK 0x20,
+ * BATOK 0x40, TMPOK 0x80. Apple's power manager polls it and, when BATOK/SYSOK
+ * read clear, decides the battery is empty -> "battery low" -> software reset
+ * (see the note in ipod_classic_pmu.c). A plain register file leaves this at a
+ * stale/zero value with those bits clear, which is why it gives up.
+ *
+ * MBCS1 (0x4b) is the main-battery-charger status: USBPRES 0x01, USBOK 0x02,
+ * ADAPTPRES 0x04, ADAPTOK 0x08, TBAT in bits 4..5 (00 = OK, 20 = below range),
+ * PREWDTEXP 0x40, WDTEXP 0x80. The stale value 0x20 reads as TBAT_BELOW, a
+ * spurious temperature fault.
+ *
+ * CONVENIENCE VALUES, marked as such: this machine has no PMU analogue state to
+ * derive them from, so the honest report is "powered on, battery/system/temp
+ * OK, running on battery with no charger fault". OOCSTAT_HEALTHY sets
+ * ONKEY|SYSOK|BATOK|TMPOK; MBCS1_HEALTHY is TBAT_OK with nothing else, matching
+ * the emulated "no USB/adapter" reality (Rockbox reads MBCS1 for USB/FireWire
+ * presence and this is the state it already expects).
+ */
+#define PCF5063X_OOCSTAT_HEALTHY  0xe1   /* ONKEY|SYSOK|BATOK|TMPOK */
+#define PCF5063X_MBCS1_HEALTHY    0x00   /* TBAT_OK, no charger, no WDT expiry */
+
+/*
  * GPIOSTAT bit 1, PCF50635_GPIOSTAT_GPIO2 in Rockbox's pmu-target.h:43. It is
  * the hold switch, inverted: pmu-6g.c:244 reads it as
  * "holdswitch = !(GPIOSTAT & GPIO2)", so SET means hold is OFF. Apple's
@@ -82,6 +107,15 @@ struct IPodClassicPMUState {
     uint8_t reg[S5L8702_PMU_NUM_REGS];
     uint8_t addr;         /* the register pointer, which survives a STOP */
     bool addr_pending;    /* next byte written is the register number */
+
+    /*
+     * Support for un-clobbering the register pointer after a register WRITE.
+     * addr_saved is the pointer as it stood before the current transaction; it
+     * is restored at STOP if, and only if, the transaction actually wrote a
+     * data byte (wrote_data). See the long note in ipod_classic_pmu.c.
+     */
+    uint8_t addr_saved;
+    bool wrote_data;
 };
 
 #endif

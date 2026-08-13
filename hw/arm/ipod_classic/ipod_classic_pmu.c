@@ -80,6 +80,35 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
         /* Read to clear, which is what makes an interrupt line drop. */
         s->reg[addr] = 0;
         break;
+    case PCF50635_REG_GPIOSTAT:
+        /*
+         * The hold switch, reported OPEN unconditionally. See the long note at
+         * the reset function for why "open" is the only usable value on a
+         * machine with no switch to flip -- and why it MUST NOT depend on
+         * whatever a write has left in s->reg[0x87]. Apple's own GPIO code
+         * writes this register (measured: a byte 0x87 goes to reg 0x87), so the
+         * stored value is not reliably HOLD_OFF; forcing the read makes the
+         * keycode dispatcher's gate see "open" no matter what was written.
+         */
+        val = PCF50635_GPIOSTAT_HOLD_OFF;
+        break;
+    case PCF5063X_REG_OOCSTAT:
+        /*
+         * On/off-controller status, forced to a healthy powered value. Apple's
+         * power manager polls this; with BATOK/SYSOK clear it concludes the
+         * battery is empty and software-resets ("battery low", tag "--------").
+         * A plain register file leaves it stale/zero. See the header.
+         */
+        val = PCF5063X_OOCSTAT_HEALTHY;
+        break;
+    case PCF5063X_REG_MBCS1:
+        /*
+         * Main-battery-charger status. The stale value reads as a spurious
+         * TBAT_BELOW temperature fault; force the honest "temp OK, no charger"
+         * state instead. See the header.
+         */
+        val = PCF5063X_MBCS1_HEALTHY;
+        break;
     default:
         break;
     }
@@ -119,9 +148,30 @@ static int ipod_classic_pmu_event(I2CSlave *i2c, enum i2c_event event)
     case I2C_START_SEND:
         /* The next byte is the register number, not data. */
         s->addr_pending = true;
+        /*
+         * Remember where the pointer stood so a register write can put it back
+         * at STOP; see the note above ipod_classic_pmu_send.
+         */
+        s->addr_saved = s->addr;
+        s->wrote_data = false;
         break;
     case I2C_START_RECV:
+        s->wrote_data = false;
+        break;
     case I2C_FINISH:
+        /*
+         * A register WRITE (an address byte followed by one or more data bytes)
+         * must not leave the shared register pointer moved: another task may
+         * have a read in flight that already set the pointer and is about to do
+         * its own START_RECV. Restore it. An address-only "set the pointer"
+         * write (no data byte) leaves the pointer where it was aimed, which is
+         * exactly what the set-pointer-then-read pattern needs.
+         */
+        if (s->wrote_data) {
+            s->addr = s->addr_saved;
+        }
+        s->wrote_data = false;
+        break;
     case I2C_NACK:
         break;
     default:
@@ -130,6 +180,28 @@ static int ipod_classic_pmu_event(I2CSlave *i2c, enum i2c_event event)
     return 0;
 }
 
+/*
+ * THE REGISTER-POINTER RACE, and why the fix lives at STOP.
+ *
+ * MEASURED (temporary I2C-pointer trace): Apple's keycode dispatcher reads the
+ * hold switch (GPIOSTAT, 0x87), and its power manager reads OOCSTAT (0x12) and
+ * MBCS1 (0x4b), each as two I2C transactions -- one that sets the register
+ * pointer, a STOP, then a one-byte read -- and the pointer survives the STOP by
+ * design. Apple's GPIO housekeeping meanwhile WRITES register 0x87. When that
+ * write lands between another read's set-pointer and its data phase, it moves
+ * the shared pointer, so the read comes back with the wrong register: the hold
+ * read saw bit 1 clear and SELECT was dropped (about five boots in eight), and
+ * the OOCSTAT read saw BATOK clear and the firmware software-reset as "battery
+ * empty" (about one navtest run in six).
+ *
+ * On real hardware the firmware serialises PMU access so the write never
+ * interleaves; our timing does not reproduce that serialisation, so the model
+ * compensates: a register write restores the pointer at STOP (above), which
+ * un-clobbers whatever pointer a pending read had set. Combined with the forced
+ * HOLD_OFF / healthy-status reads, the three status reads are now stable
+ * regardless of interleaving. The pointer still auto-advances within a
+ * transaction, so multi-byte reads and writes are unchanged.
+ */
 static uint8_t ipod_classic_pmu_recv(I2CSlave *i2c)
 {
     IPodClassicPMUState *s = IPOD_CLASSIC_PMU(i2c);
@@ -149,6 +221,7 @@ static int ipod_classic_pmu_send(I2CSlave *i2c, uint8_t data)
     } else {
         pmu_reg_write(s, s->addr, data);
         s->addr++;
+        s->wrote_data = true;
     }
     return 0;
 }
@@ -160,6 +233,8 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
     memset(s->reg, 0, sizeof(s->reg));
     s->addr = 0;
     s->addr_pending = false;
+    s->addr_saved = 0;
+    s->wrote_data = false;
     pmu_start_adc(s);
 
     /*
@@ -201,17 +276,29 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
      * stay zero -- Rockbox marks both "TBC" and nothing we have reads them.
      */
     s->reg[PCF50635_REG_GPIOSTAT] = PCF50635_GPIOSTAT_HOLD_OFF;
+
+    /*
+     * Power-status registers seeded to their healthy powered values so a
+     * read-back before the first poll is coherent; pmu_reg_read forces them on
+     * every read anyway (see the OOCSTAT/MBCS1 cases and the header note). This
+     * is what stops Apple's power manager from deciding the battery is empty and
+     * software-resetting to the "--------" image a few seconds into the boot.
+     */
+    s->reg[PCF5063X_REG_OOCSTAT] = PCF5063X_OOCSTAT_HEALTHY;
+    s->reg[PCF5063X_REG_MBCS1] = PCF5063X_MBCS1_HEALTHY;
 }
 
 static const VMStateDescription vmstate_ipod_classic_pmu = {
     .name = TYPE_IPOD_CLASSIC_PMU,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPodClassicPMUState),
         VMSTATE_UINT8_ARRAY(reg, IPodClassicPMUState, S5L8702_PMU_NUM_REGS),
         VMSTATE_UINT8(addr, IPodClassicPMUState),
         VMSTATE_BOOL(addr_pending, IPodClassicPMUState),
+        VMSTATE_UINT8(addr_saved, IPodClassicPMUState),
+        VMSTATE_BOOL(wrote_data, IPodClassicPMUState),
         VMSTATE_END_OF_LIST()
     },
 };
