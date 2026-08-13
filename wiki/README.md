@@ -61,6 +61,7 @@ Para una introducción de una página, empezar por el
 |---|---|
 | [04-roadmap.md](04-roadmap.md) | Estado por hitos y el recorrido de cada bloqueo que hubo que quitar. El documento más largo y el más cercano a un diario. |
 | [05-build-notes.md](05-build-notes.md) | Cómo compilar (WSL), **cómo ejecutarlo y probarlo**, teclas del click wheel, las propiedades de máquina que no salen en `-M help`, tres trampas del entorno (CRLF, symlinks de git, `--disable-werror`) y cómo averiguar dónde se ha quedado el firmware. |
+| [18-entorno-herramientas.md](18-entorno-herramientas.md) | **Qué instalar y descargar para reproducir todo el proyecto**: la lista completa agrupada por para qué sirve — WSL2+WSLg y usbipd (Windows), las dependencias de QEMU, el toolchain ARM y `gdb-multiarch` (RE), `dosfstools`/`mtools`/`libgpod` (discos y música), `ffmpeg`/`numpy` (verificar el audio), `pyusb`/`libusb` (el aparato por emCORE), y los repos descargados (Rockbox, freemyipod, giek). Con el `apt install` de todo junto. |
 
 ## Fuentes
 
