@@ -491,7 +491,28 @@ static uint64_t ipod_classic_i2s_read(void *opaque, hwaddr offset,
     uint32_t val;
 
     switch (offset) {
-    case S5L8702_I2S_CLKCON: val = s->clkcon; break;
+    case S5L8702_I2S_CLKCON:
+        /*
+         * Bit 0 is the clock-enable the retailOS writes (see the header). Bit 1
+         * is a read-only hardware STATUS bit: "the I2S clock has stopped". The
+         * retailOS's IRAM audio driver, when it (re)configures the clock for a
+         * real play, DISABLES it first -- `str 0,[CLKCON]` -- and then spins
+         *     loop: ldr r0,[CLKCON]; tst r0,#2; beq loop
+         * waiting for that status bit before it reprograms CLKDIV/TXCON and
+         * re-enables. On real silicon the bit rises as soon as the gated clock
+         * settles; our register file only ever returned the written 0, so bit 1
+         * stayed clear and the driver span forever at IRAM 0x2200881c -- the
+         * exact reason a Shuffle-Songs play reached this driver but never got
+         * past it to decode a single PCM frame (measured: 161e6 CLKCON reads,
+         * all 0). Model the bit: the clock is "stopped" whenever the enable bit
+         * is clear. Boot's silence-init uses the enable path and never polls it;
+         * Rockbox drives its own I2S and never reads this bit -- both unaffected.
+         */
+        val = s->clkcon;
+        if (!(s->clkcon & 1)) {
+            val |= 2;
+        }
+        break;
     case S5L8702_I2S_TXCON:  val = s->txcon;  break;
     case S5L8702_I2S_TXCOM:  val = s->txcom;  break;
     case S5L8702_I2S_RXCON:  val = s->rxcon;  break;

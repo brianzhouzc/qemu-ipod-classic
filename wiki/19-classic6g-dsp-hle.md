@@ -388,3 +388,100 @@ Plantilla: `hw/arm/ipod_video/ipod_video_vc.c` (HLE del VideoCore del 5G) y
 - Herramientas de RE usadas: `ldrscan.py`/`osana.py lit` (cargas de literales,
   correctas donde `findlit.py` falla), `admscan.py`/`admscan2.py` (taint por base),
   `dumpctx.py`; desensamblado base VA `--adjust-vma=0x07FF51B8`.
+
+---
+
+## 11. El arranque del audio (continuación): el reproductor SÍ arranca; tres muros de RELOJ caídos; el decode sigue mudo
+
+Con los arreglos del PMU (SELECT fiable + sin reset de batería, [15](15-muros-classic6g.md))
+y el tracer no invasivo `pctrace`, se atacó el "Paso 0" del §6. Todo lo de abajo
+está **VERIFICADO** por traza de PC (sin parar la CPU) o lectura de memoria en
+runtime. VA = offset en `osos_decrypted.bin` + `0x07FF51B8`.
+
+### 11.1 El reproductor SÍ arranca — refuta el encuadre "el handler no se despacha ni falla"
+
+SELECT sobre **Shuffle Songs** (menú principal):
+- `HandleShuffleSongsSelected` (0x081fa9e4) **se despacha**.
+- Pasa su puerta: singleton `*0x089117fc` → `+0x3f4` = 4 (nº de canciones; `HandleMusicSelected`
+  lee el mismo campo), 4≠0, no aborta.
+- Corre el arranque completo: `ShufLAUNCH` (0x081faa34) → `setup20` (0x0826b858) →
+  `StartPlayback` (0x08150d84) → `playA` (0x08024798), que **encola las 4 pistas**
+  (itera el accesor de playlist `0x0802fe08`).
+- `ShufLAUNCH` **completa**: vuelve de setup20, invoca `GotoNowPlaying` (0x081faa90),
+  el handler **retorna** (0x081faaa4). El controlador Now Playing corre (región
+  0x081a0000–0x081b2000, 618 bloques distintos).
+
+Toda la maquinaria **síncrona** del arranque corre. El muro está aguas abajo, en el
+pipeline MeCCA **asíncrono** — no en el despacho del handler.
+
+### 11.2 Tres muros de RELOJ de audio (polls de bits de hardware que el modelo no ponía)
+
+**Muro A — I2S CLKCON bit 1 (medido: 1.6e8 lecturas).** El driver de audio del
+retailOS en IRAM (0x22008808–0x2200881c) **deshabilita** el reloj I2S
+(`str 0,[CLKCON]`) para reconfigurarlo y luego **gira** `ldr CLKCON; tst #2; beq`
+esperando el bit 1 (estado "reloj parado"). El modelo devolvía el 0 escrito → spin
+infinito. **Arreglo** (`hw/arm/ipod_classic/ipod_classic_i2s.c`, read de CLKCON):
+bit 1 = "reloj parado", puesto cuando el bit 0 (enable) está a 0.
+
+**Muro B — SM1 (0x38500000) registro de identidad.** El init del reloj de audio
+guarda 0x38500000 en su tabla de handles (setter `0x08083df0`, tabla @0x08ade488) y
+luego lee **SM1+0xc80** (getter `0x08075d64`), lo compara con el magic `0x004e7309`
+(literal `*0x080821cc`) y hace **`b .`** (cuelgue eterno en 0x080819b8) si no
+coincide. SM1 estaba sin implementar (0) → cuelgue. VERIFICADO en runtime: en el
+cuelgue SM1+0xc80 leía 0. **Arreglo** (`hw/arm/ipod_classic/ipod_classic.c`): SM1
+pasa de `create_unimplemented_device` a un device mínimo que devuelve `0x004e7309`
+en +0xc80.
+
+**Muro C — SM1 bit "reloj listo".** Tras la identidad, el init **pollea SM1+0xa98**
+esperando el bit 2 (`tst r0,#4; beq` en 0x08081af8) — el flag "reloj corriendo/lock".
+SM1=0 → spin en 0x080a7658. **Arreglo**: SM1+0xa98 devuelve el bit 2.
+
+**SM1 (0x38500000)**, etiquetado "clock divider" en el mapa, es en realidad el
+**controlador de reloj de audio**: el retailOS hace un handshake de varios registros
+(identidad +0xc80, estado +0xa98, escrituras a +0x824/+0xc48). El device modela SÓLO
+el handshake que el arranque necesita, no el controlador completo (anotado en el
+código).
+
+### 11.3 Estado actual: la SALIDA se arma, el DECODE sigue mudo
+
+Con los tres arreglos **+ `AUDIOPACE=1`** (necesario: el pacing del DMA es lo que hace
+avanzar el pipeline; sin él la tarea de audio se duerme antes del init del reloj), la
+**salida** se inicializa por completo (medido en runtime): I2S `CLKCON=0x1`,
+`TXCON=0x0b100019`, **`TXCOM=0x6` (bit de run ACTIVO)**, reloj de audio armado.
+
+PERO el **decodificador software MeCCA sigue sin producir PCM**: el mem-watch no
+invasivo sobre los buffers ping-pong (0x22008c5c/0x22009c5c) mide **0 escrituras**
+tras el SELECT; el I2S corre pero drena SILENCIO (buffer a cero); AUDIOWAV sale a
+cero; el sistema entra en WFI idle; Now Playing no se dibuja. La tarea de decode está
+**BLOQUEADA** esperando un evento (candidatos: la entrada comprimida desde disco vía
+StreamCache que no completa; o un semáforo "buffer listo" que no se postea).
+
+Resumen: **cayeron los muros de la SALIDA (reloj I2S/SM1); el muro que queda es el del
+DECODE** — el núcleo de la Rama A. El decode MeCCA no arranca a producir PCM aunque la
+salida ya esté lista para consumirlo.
+
+### 11.4 Herramienta: mem-watch no invasivo en `pctrace`
+
+`contrib/plugins/pctrace.c` extendido con `memw=0xLO-0xHI` (+`memcap=N`): registra cada
+STORE de la CPU en el rango con su PC, sin parar la CPU (callback de memoria en el hilo
+de la vCPU) — el watchpoint de la Rama A: en cuanto el decode escriba PCM en 0x22008c5c
+saldrá el PC del decodificador. **Coste**: registra callback en cada instrucción →
+ralentiza mucho; NO usarlo durante el boot completo (el huésped pierde deadlines y el
+modelo de batería resetea). Usar ventana corta o ya en reproducción.
+
+### 11.5 Lo que sigue
+
+- **El decode MeCCA bloqueado** es el muro restante. Averiguar el punto de bloqueo
+  RTXC. `pctrace` de QEMU 8.2 no lee registros, así que el LR del bloqueo necesita otra
+  vía: stack de la tarea RTXC, o un plugin con la API de lectura de registros de QEMU
+  9.x. Candidatos: lectura del MP3 (ATA/StreamCache) que no completa; semáforo no
+  posteado.
+- **SM1 (0x38500000)**: modelar el controlador de reloj de audio como es debido, no
+  sólo el handshake mínimo; es probable que el decode dependa del reloj REAL, no de los
+  bits "listo" fingidos.
+- **AUDIOPACE**: el arranque del audio del retailOS lo necesita. Evaluar activarlo por
+  defecto (seguro para Rockbox según [16](16-classic6g-rockbox.md)) o auto-activarlo al
+  arrancar el I2S del retailOS.
+- Sin regresión: `navtest` 6G pasa (05-select 19498 px, rueda dos mitades; 09-into-music
+  es la flakiness conocida del SELECT, no regresión; 0 resets) y Rockbox sigue navegando.
+  Los arreglos de CLKCON/SM1 sólo se ejercen en el camino de audio del retailOS.
