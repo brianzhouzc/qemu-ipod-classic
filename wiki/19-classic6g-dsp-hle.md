@@ -883,3 +883,81 @@ scheduling — con la salvedad del auditor de que el determinismo por sí solo n
 **Higiene:** cero cambios en fuentes del modelo; árbol byte-idéntico salvo esta
 entrada de wiki. `pctrace` intacto (ya en el árbol desde `0a0ea0365`).
 Instrumentación de sesión en `~/dbg/` del WSL. Rockbox/navtest/5G sin tocar.
+
+### 11.14 El cebado, cerrado por medida: el lado de ENTRADA está sano; el muro es SÓLO el disparo de SALIDA; y el candidato SM1+0xa98 bit12 REFUTADO
+
+Sesión de cierre del nodo de cebado. Se ejecutó el experimento que §11.12 dejó
+propuesto y que nadie había corrido (la atribución de emisores del **exchange 6**),
+se desensambló el lazo de render del motor a nivel de instrucción, y se **probó y
+descartó por medida** un candidato de valor de HW nuevo. Todo **VERIFICADO** por
+`pctrace` no invasivo (`sendex=`/`pc=`, disco `Emulti.img`, `AUDIOPACE=1`, Shuffle
+Songs). Recetas nuevas en `~/dbg/`: `runex6.sh`, `runsm1v3.sh`. Árbol byte-idéntico.
+
+**A) La atribución de emisores del exchange 6 (NUEVO — cierra la incógnita de §11.12/§11.13-E).**
+Sonda `sendex=0x22004138:3:0x6` (el *post* KS `0x22004138` lleva `r3`=índice de
+exchange, `r2`=opcode; VERIFICADO desensamblando el verbo del decoder `0x8025ac4`:
+`mov r3,#6; mov r2,#5; bl 0x8015740→0x22004138`). Resultado de un play:
+**57 posts al exchange 6, TODOS `r2=5` (op5 SEND-exch), TODOS desde la familia de
+verbos del decoder** `0x08025xxx` (por LR: `0x8025b18`×27, `0x8025a5c`×25,
+`0x80258a4`×3, `0x8025960`×1, `0x8025904`×1). **Ni un solo post** viene de una ISR,
+de una tarea de disco *upstream*, ni del camino de consumo de salida.
+
+⇒ **CORRIGE §11.13-E:** no existe "crédito de upstream (t0e←t16)" que fluya por el
+exchange 6. El exchange 6 es SÓLO el canal del **decoder → StreamCache** (peticiones
+de entrada; StreamCache responde por mbox 9). El lazo de ENTRADA
+decoder↔StreamCache es **autónomo y está SANO** (57 intercambios, coincide con
+`M09.seq≈52`). Se llena hasta su tope y se detiene esperando que el consumidor
+(el motor) tire — que nunca ocurre. **El muro NO está en la entrada.**
+
+**B) El muro es categóricamente el DISPARO DE SALIDA — re-confirmado.** En el mismo
+play: `sendex=0x22003f7c:0:0x52` = **25 matches, todos el propio `recv` del motor**
+(cero envíos a mbox 0x52); `copy32 0x08016eb4 = 0`; `engine=1, mixer=1, copyfn=1,
+disp=6, h12=0`. Idéntico a §11.13. **Nadie manda jamás el comando de render (mbox
+0x52) al motor**, y el lado de entrada demuestra que **no es por falta de datos**.
+
+**C) El lazo de render del motor, a nivel de instrucción (VERIFICADO por desensamblado).**
+La tarea 0x25 (driver de audio, IRAM) llama al motor **una vez** en el setup
+(`0x22006300: bl 0x22003840→0x0808170c`) y luego **espera**:
+`0x22006814: recv(obj=0x220106d0, timeout=0xbb8=3000ms)` vía `0x22003868→0x080b3e78`;
+en timeout retorna −1 y el driver hace **teardown**. El buzón del motor es un campo
+de la struct `0x220106d0`; **nadie postea a él** (§B). El disparo de render es un
+**mensaje de tarea a tarea** (StreamCache t20 → motor t25), cuya rama de envío en
+StreamCache **nunca se alcanza** (§11.13-B: 0 `select` de mbox 0x52 para enviar).
+
+**D) Candidato de valor de HW NUEVO — PROBADO y REFUTADO por medida.** El cuerpo de
+setup `0x0808af58` lee **SM1+0xa98** (getter `0x080a7638`, `r1=0` → `[obj+0xa98]`,
+`obj` = `handleTable[0x08ade488]` = base SM1) y **gatea sobre el bit 12 (0x1000)** un
+bloque que escribe **SM1+0x804=1** (`0x80a35a0`) y **SM1+0x858=1** (`0x809a72c`,
+estrobos de "enable" del motor de audio). Nuestro modelo SM1 sólo pone el **bit 2**
+(clock-ready) en +0xa98 → bit 12 siempre 0 → el bloque de enable se salta. Candidato
+plausible que las sesiones previas (centradas en el bit 2) no habían tocado.
+**Medida (flag `SM1_ENGINE=1` que fuerza el bit 12, revertida):**
+`copy32 = 0` (sin cambio) **y** `setupbody 0x0808af58 hits = 0` — el lector del bit 12
+**no está en el camino de play** (es init de arranque del subsistema de audio, no el
+cebado por-reproducción); además los dos writes gateados son **latches inertes** en el
+modelo (nada del render depende de SM1+0x804/+0x858). **No es el arreglo.** Revertido;
+árbol byte-idéntico (`git diff` vacío, recompila y enlaza limpio).
+
+**VEREDICTO (esta sesión): NO suena — muro ESTRUCTURAL, cerrado por medida.** El
+cebado del primer ciclo MeCCA **no depende de ningún valor/registro/evento de HW ni
+de estado dejado por el bootloader**: es un **mensaje inter-tarea** (el comando de
+render mbox 0x52 de StreamCache al motor, y simétricamente el render-pull tipo-12 al
+decoder) cuya rama emisora está gateada por la condición **circular** "salida consumió
+PCM real / hay trama decodificada" — y `copy32=0` la mantiene falsa de punta a punta.
+La atribución del exchange 6 (§A) elimina la última hipótesis de "crédito externo":
+la entrada está sana; **falta exclusivamente el disparo de salida en frío**, y ese
+disparo no lee nada corregible. Coherente con las 6 sesiones previas y afinado.
+
+**La vía real (documentada, no es de modelo):** un **HLE del cebado** que emita en
+frío **ambos** disparos —el primer mbox 0x52 al motor (`recv obj 0x220106d0`) **y** el
+primer tipo-12 al decoder (`0x08123970`, gate `[[obj+52]+96]!=0` ya =1)— para romper
+la simetría; el PCM lo produciría entonces el decoder del huésped. Es un shim del
+protocolo MeCCA, **no** un valor de HW: por eso no cabe como "arreglo de modelo". Un
+modelo de `icount` (QEMU 9.x) podría además explorar la carrera regime-A/B (§11.11)
+por si el orden concurrente real difiere, pero el determinismo por sí solo no garantiza
+que aparezca el emisor ausente.
+
+**Higiene:** experimento SM1 bit12 **revertido**; árbol byte-idéntico al baseline
+(`git diff` vacío) salvo esta entrada de wiki; recompila limpio. `pctrace` intacto.
+Recetas de sesión en `~/dbg/` (`runex6.sh`, `runsm1v3.sh`), fuera del repo.
+Rockbox/navtest/5G sin tocar (los caminos medidos son sólo lecturas del retailOS).
