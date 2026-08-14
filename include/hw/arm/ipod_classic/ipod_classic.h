@@ -25,6 +25,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
+#include "hw/arm/ipod_classic/ipod_classic_sm1.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 

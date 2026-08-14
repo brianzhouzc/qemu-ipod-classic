@@ -506,55 +506,6 @@ static const MemoryRegionOps ipod_classic_rng_ops = {
     .valid.max_access_size = 4,
 };
 
-/*
- * SM1 at 0x38500000. It was an unimplemented (zero) window, but the retailOS
- * audio-clock bring-up demands one register from it. During a real play the
- * setup routine 0x08083df0 stashes this base into its per-stream handle table
- * (table @0x08ade488) and the sanity check 0x08075d64 then reads base+0xc80 and
- * compares it against the block-identity magic 0x004e7309; on a mismatch the
- * firmware `b .` hangs forever at PC 0x080819b8. A zero read IS that mismatch,
- * so a Shuffle-Songs play that had already cleared the I2S CLKCON gate died
- * here instead of decoding. Hand back the magic at +0xc80 and zero elsewhere --
- * identical to the old unimplemented window for every other offset, so nothing
- * else (Rockbox, boot, navigation) changes. VERIFIED: at the hang, base+0xc80
- * read 0 and the compare operand *0x080821cc was 0x004e7309.
- */
-#define S5L8702_SM1_ID_OFF   0xc80
-#define S5L8702_SM1_ID_MAGIC 0x004e7309
-#define S5L8702_SM1_STAT_OFF 0xa98   /* clock-status; bit2 = "clock ready" */
-
-static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
-                                      unsigned size)
-{
-    if (offset == S5L8702_SM1_ID_OFF) {
-        return S5L8702_SM1_ID_MAGIC;
-    }
-    if (offset == S5L8702_SM1_STAT_OFF) {
-        /*
-         * After the identity check the audio-clock bring-up polls this status
-         * word for bit 2 (`tst r0,#4; beq` at 0x08081af8) -- the "clock is
-         * running/locked" flag it waits for before it starts feeding the codec.
-         * On real silicon the bit rises once the gated audio clock settles; a
-         * zero read left the driver spinning at 0x080a7658. Report the clock as
-         * ready. (SM1 is a whole clock controller; this models only the ready
-         * handshake the retailOS play path needs -- see wiki/19.)
-         */
-        return 0x4;
-    }
-    return 0;
-}
-
-static void ipod_classic_sm1_write(void *opaque, hwaddr offset,
-                                   uint64_t value, unsigned size)
-{
-}
-
-static const MemoryRegionOps ipod_classic_sm1_ops = {
-    .read = ipod_classic_sm1_read,
-    .write = ipod_classic_sm1_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-};
-
 static void ipod_classic_machine_init(MachineState *machine)
 {
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(machine);
@@ -813,13 +764,19 @@ static void ipod_classic_machine_init(MachineState *machine)
                           S5L8702_RNG_MEM_SIZE);
     memory_region_add_subregion(sysmem, S5L8702_RNG_MEM_BASE, rng_mr);
 
-    /* SM1 (0x38500000): the audio-clock block-identity register. See the note
-     * above ipod_classic_sm1_ops. Full 1 MB window so every other offset still
-     * reads 0 exactly like the unimplemented device it replaces. */
-    MemoryRegion *sm1_mr = g_new(MemoryRegion, 1);
-    memory_region_init_io(sm1_mr, NULL, &ipod_classic_sm1_ops, NULL,
-                          "s5l8702.sm1", 0x100000);
-    memory_region_add_subregion(sysmem, SM1_MEM_BASE, sm1_mr);
+    /*
+     * SM1 (0x38500000): the audio clock/stream engine. A stateful device that
+     * models the run/power handshake the retailOS audio bring-up drives (block
+     * identity, clock-ready, per-channel state machine, run latch). It was an
+     * unimplemented zero window until the play path was found to hang on it; see
+     * ipod_classic_sm1.c and wiki/19 section 11. Full 1 MB window so every
+     * undecoded offset still reads 0 like the device it replaces.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SM1_MEM_BASE);
+    /* The engine's playback position tracks what the I2S clocks out. */
+    ipod_classic_sm1_set_i2s(IPOD_CLASSIC_SM1(dev), nms->i2s);
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),
