@@ -118,6 +118,26 @@ static guint64 memw_total;          /* total stores seen in range (uncapped) */
 static guint64 memw_lines;          /* logged store lines so far */
 static GHashTable *memw_pcs;        /* distinct writing PCs -> count */
 
+/*
+ * MEM-WRITE-AT-PC (surgical). memwpc=0xADDR:LABEL registers a store callback on
+ * exactly the instruction at ADDR and logs the DESTINATION ADDRESS of each store
+ * it makes. Unlike memw= (which filters a wide address range and needs a
+ * callback on every instruction), this only fires at the one PC, so it is cheap
+ * enough to leave on during sustained playback. It answers "where does this copy
+ * write?" -- e.g. does the audio copy 0x08016eb4 target the DMA ping-pong, and
+ * does its target move when the SM1 position advances? The stored VALUE is still
+ * not readable under the 8.2 plugin API, but the address is what locates a
+ * buffer. Capped per PC so a copy loop cannot flood the log.
+ */
+typedef struct {
+    uint64_t pc;
+    const char *label;
+    guint64 count;
+    guint64 logged;
+} MemwPC;
+static GArray *memwpc;              /* array of MemwPC */
+static guint64 memwpc_cap = 40;     /* max logged lines per watched PC */
+
 static WatchPC *find_pc(uint64_t addr)
 {
     for (guint i = 0; i < watch->len; i++) {
@@ -238,12 +258,57 @@ static void vcpu_mem_w(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     fflush(out);
 }
 
+/* Store callback registered only on a memwpc-watched PC: log the dest address. */
+static void vcpu_mem_at_pc(unsigned int cpu_index, qemu_plugin_meminfo_t info,
+                           uint64_t vaddr, void *udata)
+{
+    MemwPC *m = (MemwPC *)udata;
+
+    if (!qemu_plugin_mem_is_store(info)) {
+        return;
+    }
+    m->count++;
+    if (m->logged >= memwpc_cap) {
+        return;
+    }
+    m->logged++;
+    gint64 now = g_get_monotonic_time();
+    if (t0 == 0) {
+        t0 = now;
+    }
+    unsigned sh = qemu_plugin_mem_size_shift(info);
+    fprintf(out, "PCTRACE +%8" PRId64 "us cpu%u  MEMWPC %-14s pc=0x%08" PRIx64
+            "  addr=0x%08" PRIx64 "  %ubytes  (#%" PRIu64 ")\n",
+            now - t0, cpu_index, m->label, m->pc, vaddr, 1u << sh, m->count);
+    fflush(out);
+}
+
+static MemwPC *find_memwpc(uint64_t pc)
+{
+    if (!memwpc) {
+        return NULL;
+    }
+    for (guint i = 0; i < memwpc->len; i++) {
+        MemwPC *m = &g_array_index(memwpc, MemwPC, i);
+        if (m->pc == pc) {
+            return m;
+        }
+    }
+    return NULL;
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t va = qemu_plugin_insn_vaddr(insn);
+        MemwPC *m = find_memwpc(va);
+        if (m) {
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_at_pc, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_W, m);
+        }
         WatchPC *w = find_pc(va);
         if (w) {
             qemu_plugin_register_vcpu_insn_exec_cb(
@@ -293,6 +358,14 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
                 fprintf(out, "      writer pc=0x%08" PRIxPTR "  stores=%"
                         PRIuPTR "\n", (uintptr_t)k, (uintptr_t)v);
             }
+        }
+    }
+    if (memwpc) {
+        fprintf(out, "  --- mem-write-at-pc watches ---\n");
+        for (guint i = 0; i < memwpc->len; i++) {
+            MemwPC *m = &g_array_index(memwpc, MemwPC, i);
+            fprintf(out, "      %-14s pc=0x%08" PRIx64 "  stores=%" PRIu64 "\n",
+                    m->label, m->pc, m->count);
         }
     }
     fflush(out);
@@ -350,6 +423,18 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             }
         } else if (!g_strcmp0(kv[0], "memcap") && kv[1]) {
             memw_cap = g_ascii_strtoull(kv[1], NULL, 10);
+        } else if (!g_strcmp0(kv[0], "memwpccap") && kv[1]) {
+            memwpc_cap = g_ascii_strtoull(kv[1], NULL, 10);
+        } else if (!g_strcmp0(kv[0], "memwpc") && kv[1]) {
+            /* memwpc=0xADDR:LABEL : log store dest addresses at this PC */
+            uint64_t a; char *l;
+            if (parse_pc_arg(kv[1], &a, &l)) {
+                if (!memwpc) {
+                    memwpc = g_array_new(false, false, sizeof(MemwPC));
+                }
+                MemwPC m = { a, l, 0, 0 };
+                g_array_append_val(memwpc, m);
+            }
         } else if (!g_strcmp0(kv[0], "out")) {
             FILE *f = fopen(kv[1], "w");
             if (!f) {

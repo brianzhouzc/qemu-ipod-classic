@@ -139,6 +139,9 @@ def main():
     ap.add_argument('--break', dest='breaks', action='append', default=[])
     ap.add_argument('--mem', action='append', default=[],
                     help='ADDR:LEN, dumped at every stop')
+    ap.add_argument('--memreg', action='append', default=[],
+                    help='IDX[+OFF]:LEN -- dump mem at reg[IDX]+OFF at every stop '
+                         '(robust against heap-address drift between runs)')
     ap.add_argument('--hits', type=int, default=1)
     ap.add_argument('--step', type=int, default=0)
     ap.add_argument('--timeout', type=float, default=120.0)
@@ -201,6 +204,24 @@ def main():
                 for off in range(0, len(d), 16):
                     chunk = d[off:off + 16]
                     print('  %08x: %s' % (addr + off,
+                          ' '.join('%08x' % int.from_bytes(chunk[i:i + 4], 'little')
+                                   for i in range(0, len(chunk), 4))))
+        for m in a.memreg:
+            spec, _, ln = m.partition(':')
+            idx, _, off = spec.partition('+')
+            idx = int(idx, 0)
+            off = int(off, 0) if off else 0
+            ln = int(ln or '16', 0)
+            base = (r[idx] or 0) + off
+            d = g.mem(base, ln)
+            tag = 'r%d+0x%x' % (idx, off) if off else 'r%d' % idx
+            if d is None:
+                print('  [%s]=%08x: <fault>' % (tag, base))
+            else:
+                print('  [%s]=%08x:' % (tag, base))
+                for o in range(0, len(d), 16):
+                    chunk = d[o:o + 16]
+                    print('    %08x: %s' % (base + o,
                           ' '.join('%08x' % int.from_bytes(chunk[i:i + 4], 'little')
                                    for i in range(0, len(chunk), 4))))
     for i in range(a.step):
