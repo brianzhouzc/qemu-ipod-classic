@@ -783,3 +783,103 @@ ocurren antes del atasco, y ver por qué se detiene la #53.
 `hw/arm/ipod_classic/ipod_classic_timer.c`) **revertida**; árbol byte-idéntico al baseline;
 recompila y enlaza limpio. Cero PCM inyectado, cero parche de firmware. `pctrace` intacto.
 Rockbox/navtest sin tocar (los caminos medidos son sólo lecturas del retailOS).
+
+### 11.13 El lado CONSUMIDOR re-caracterizado: el motor NUNCA recibe disparo de render; el muro es un bootstrap circular simétrico del primer ciclo
+
+Sesión con la lectura de registros no invasiva ya operativa (`sendex=`/`regpc=`,
+§ commit `0a0ea0365`). Play limpio de `~/6g/Emulti.img`, `AUDIOPACE=1`, Shuffle
+Songs. Todo **VERIFICADO** por lectura/breakpoint gdb no invasivo o por contadores
+`pctrace pc=` (cero perturbación medida: `resets=0`). Recetas nuevas en `~/dbg/`
+(fuera del repo): `runt2a.sh`+`t2a_probe.py` (grafo+pila unwound), `runcounts.sh`
+(perfil del decode), `runmbox.sh` (atribución de emisores por LR/sp), `runtree.sh`
+(árbol del decode por `range=`), `t2a_probe2/3.py`. Árbol del modelo **sin tocar**.
+
+**A) El MOTOR de audio (t25, consumidor) NUNCA recibe un disparo de render — VERIFICADO.**
+La espera de t25 es un `recv` de buzón 0x52 CON watchdog de 3 s: pila
+`0808dfa8→22002f84→22006824→[recv 0x22006814]→0x080b3e78→0x805c518`, timeout
+`r1=0xbb8=3000ms`. Sonda `sendex=0x22003f7c:0:0x52` (gatea el reg r0==0x52 en la
+cabecera-TB del primitivo *select-mailbox* `0x22003f7c`, hardcodeado con el nº de
+buzón en r0): **22 matches en el play, TODOS son el propio `recv` de t25**
+(`lr=0x805c578`, `r1=0xbb8`) disparándose **cada ~3.00 s exactos** (timeout) y
+re-esperando. **CERO envíos.** Nadie manda jamás un comando de render al motor.
+Tras 3 s el motor hace **teardown** del códec (`type[+0x58]→0xff`): ése es el
+"espejismo post-teardown" de §11.12-A y la fuente del no-determinismo entre
+sesiones (según ataques antes o después del watchdog de 3 s se ve el estado limpio
+o el desmontado).
+
+**B) La ÚNICA corrida del motor (setup) intenta renderizar y sale en vacío — VERIFICADO.**
+El motor `0x0808170c` (caso 1, gate=1, type=1 de §11.12-A) llama al mixer
+`0x0809a74c` **8 veces** (`0x8081a9c..0x8081cb0`), pero **todos los `copy` SALTAN**
+(`[r7+5]=0`, PCM no listo) → `copy32 0x08016eb4 = 0`. Su primer render corre
+**demasiado pronto** (el decoder aún no ha producido la trama 0) y **no hay segundo
+render** (sin disparo). `copy32=0` es invariante en todas las corridas.
+
+**C) El DECODER (t2a) es un actor de mensajes; su decode de datos NUNCA se dispara — VERIFICADO.**
+`pctrace` del cluster: el *dispatcher* `0x08123dcc` conmuta por `[msg+4]`;
+el manejador **tipo-12** `0x8123970` decodifica (`bl 0x8123bfc`) **sólo si**
+`[msg+8]==obj+84` (el puerto de decode) **y** `[[obj+52]+96]!=0`. Contadores en un
+play completo: **`h12 (0x8123970) = 0`** (el disparo "buffer de salida disponible /
+render-pull" NUNCA llega), `dstep (0x8123284) = 1`, `dwork (0x8123bfc) = 1`. Y el
+`range=` de esa única corrida del decode **NO toca AAC-math**: los bloques
+`0x08324xxx/0x08325xxx` que parecían "códec" son **I2C0 (`0x3C600000`)** hablando con
+el chip **CS42L55** (`0x08325634`: spin en `[I2C0+0x10]`, `[I2C0+0x20]|=0x3f00`),
+NO IMDCT/huffman. **Corrección:** el decode SW de AAC **no llega a correr** (H1 de
+§11.9 se mantiene); lo que corre una vez es la config del chip códec por I2C, que
+**completa** (mismo camino que usa Rockbox). El decode-gate `[[obj+52]+96]` se
+midió **=1** en un snapshot (entrada lista) — el decoder está listo pero sin disparo.
+
+**D) Mapa KS/mensajería consolidado (VERIFICADO por desensamblado).** Tabla de
+opcodes del dispatcher KS `@0x2200064c`: **op1**=WAIT-sema, **op2**=SIGNAL-tag,
+**op4**=RECV-exch, **op5**=SEND-exch, **op14**=RECV-mbox. *Select-mailbox*
+`0x22003f7c` (r0=nº buzón, es cabecera-TB → `sendex`-able). Veneers del lazo de
+render IRAM: `0x22003840→0x0808170c` (motor), `0x22003868→0x080b3e78` (su recv con
+timeout). Dispatcher del decoder `0x08123dcc` (tipo-12=`0x8123970` decode-gated,
+tipo-19=`0x8123cfc` switch sobre códigos `0x52800000+n`). La familia de verbos de
+buzón-9 del decoder (`0x8025ac4` send, `0x8025a04` recv, …) está hardcodeada a mbox 9.
+
+**E) EL MURO, re-caracterizado (medido): un DEADLOCK CIRCULAR SIMÉTRICO del primer ciclo.**
+Las dos mitades se bloquean mutuamente:
+- El motor renderiza PCM real **⟸** disparo de render (mbox 0x52) **⟸** la salida
+  consume PCM real (devuelve crédito) **⟸** el motor renderiza PCM real.
+- El decoder decodea la trama 0 **⟸** render-pull/buffer-de-salida (tipo-12) **⟸**
+  el motor renderiza **⟸** el decoder decodea la trama 0.
+
+Ningún lado está **cebado** para arrancar sin el otro. El conductor (StreamCache
+t20) manda datos al decoder (mbox 9) y comandos al motor (mbox 0x52) **a medida que
+fluye el crédito**; t20 está bloqueado en exchange 6 esperando crédito de su
+upstream (t0e←t16), y ese crédito sólo vuelve cuando la salida consume PCM real.
+**El decoder está BLOQUEADO, no lento** — tiempo infinito no lo arranca. `copy32=0`
+de punta a punta.
+
+**F) Por qué NO se halló arreglo de modelo (re-confirmado, honesto).** En el atasco
+**ninguna tarea pollea hardware** (grafo de espera: todas en mbox/exchange). Los
+ÚNICOS toques de HW del camino de setup — **posición SM1** (avanza, correcta) y la
+**config I2C del CS42L55** (completa, idéntica al camino que Rockbox usa y suena) —
+son **correctos**. Cero periférico sin modelar (`-d unimp` = sólo 43 writes GPIO,
+§11.11-B); IRQ16 (~50/s) y tick de 1 kHz disparan de continuo (§11.12-D). Por tanto
+**ningún valor de un periférico modelado ni evento de HW en el lazo del deadlock
+puede desbloquearlo**. Un valor de HW sólo podría importar si hiciera **divergir una
+rama AGUAS ARRIBA en el cebado**; se buscó (SM1, I2S, DMA, I2C, timers) y **no se
+localizó** ese valor en 6 sesiones — el cebado que rompe el ciclo vive dentro del
+**protocolo asíncrono de buffers/mensajes de MeCCA**, no en un registro.
+
+**VEREDICTO HONESTO (esta sesión): NO suena.** El muro es un **deadlock de bootstrap
+circular del pipeline MeCCA**, confirmado por medida como libre de todo valor/evento
+de HW ausente o erróneo *dentro del lazo*. Esta sesión **no** halló un arreglo de
+modelo localizado (coherente con las 5 previas), pero **afinó el mecanismo**: el
+primer dominó es el **CONSUMIDOR** (el motor nunca se dispara; watchdog de 3 s →
+teardown), no sólo el decoder; y es **simétricamente circular** (ninguna mitad
+cebada). Para cerrarlo haría falta: **(a)** localizar el paso de **cebado** exacto de
+MeCCA — quién debe emitir el primer render-pull (tipo-12) al decoder y/o el primer
+comando de render (mbox 0x52) al motor **sin** esperar crédito — probablemente contra
+una **referencia de HW** o el estado que deja el **bootloader** real (nuestro
+`-kernel` lo salta); **(b)** si tal cebado resultara depender de un valor que el
+firmware lee mal al arranque, corregir **ese** valor (empujón de modelo legítimo,
+aún no hallado); **(c)** en ausencia de (a)/(b), el muro es **intrínseco** a una
+emulación fiel de este bootstrap concurrente y sólo lo abriría un **HLE del
+decoder/motor** o un modelo de **timing de instrucción** (icount) que reordene el
+scheduling — con la salvedad del auditor de que el determinismo por sí solo no basta.
+
+**Higiene:** cero cambios en fuentes del modelo; árbol byte-idéntico salvo esta
+entrada de wiki. `pctrace` intacto (ya en el árbol desde `0a0ea0365`).
+Instrumentación de sesión en `~/dbg/` del WSL. Rockbox/navtest/5G sin tocar.
