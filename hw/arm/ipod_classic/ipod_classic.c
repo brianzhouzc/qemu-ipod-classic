@@ -28,6 +28,7 @@
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
@@ -803,6 +804,15 @@ static void ipod_classic_machine_init(MachineState *machine)
                                         -2000);
 
     qemu_register_reset(ipod_classic_cpu_reset, nms);
+
+    /*
+     * HLE audio "kick" shim. Off unless HLE_AUDIO_KICK=1 is set, in which case
+     * it emits the one missing type-12 render-pull that cold-starts the retailOS
+     * decode pipeline (see ipod_classic_hle_audio.c and wiki/19 section 11). With
+     * the variable unset this installs nothing, so the default build is
+     * byte-for-byte the baseline and Rockbox/navtest are untouched.
+     */
+    ipod_classic_hle_audio_init(cpu);
 }
 
 static void ipod_classic_machine_class_init(ObjectClass *klass, void *data)

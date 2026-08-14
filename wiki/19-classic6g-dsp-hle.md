@@ -961,3 +961,88 @@ que aparezca el emisor ausente.
 (`git diff` vacío) salvo esta entrada de wiki; recompila limpio. `pctrace` intacto.
 Recetas de sesión en `~/dbg/` (`runex6.sh`, `runsm1v3.sh`), fuera del repo.
 Rockbox/navtest/5G sin tocar (los caminos medidos son sólo lecturas del retailOS).
+
+### 11.15 El shim HLE del tipo-12: IMPLEMENTADO y DISPARADO, pero el tipo-12 NO es el muro (corrección medida a §11.13/§11.14)
+
+Sesión de **implementación** del shim HLE que las siete previas dejaron
+especificado. Se construyó el disparo del **tipo-12 render-pull** al decoder y se
+midió su efecto con navegación FIABLE (la pieza que faltaba). VA = off +
+`0x07FF51B8`. Todo **VERIFICADO** por `pctrace` (contadores `pc=`/`sendex=` +
+`memw`) y por la traza del propio shim. Disco `Emulti.img`, `AUDIOPACE=1`.
+
+**Lo implementado (queda en el árbol, GATEADO, build por defecto byte-idéntico).**
+`hw/arm/ipod_classic/ipod_classic_hle_audio.c` (+ `.h`), cableado en la máquina y
+disparado por el bit *run* del I2S. Con `HLE_AUDIO_KICK` sin poner **no instala
+nada** (init retorna antes de tocar estado; el hook del I2S es un no-op). Con
+`HLE_AUDIO_KICK=1`: un timer de reloj virtual vigila la puerta render-pull del
+decoder (`decoder_obj` = heap `0x0ba9a8a4`, VALIDADO por su vtable `[obj+0]==
+0x088d1948`; gate `[[obj+0x34]+0x60]`); cuando la puerta es !=0 (primed) y la CPU
+está en el **idle loop RTXC** (WFI, `0x22003b0c–0x22003b30`, para no pisar el
+contexto de ninguna tarea viva), redirige el contexto idle a llamar al
+**dispatcher del huésped `0x08123dcc`(decoder_obj, msg)** con un mensaje de 12
+bytes (`[msg+4]=12`, `[msg+8]=obj+0x54`) escrito bajo la pila idle y LR de vuelta
+al idle. Cero PCM inyectado; el mensaje es exactamente el que el handler
+`0x08123970` exige. (`HLE_AUDIO_KICK_FORCE=1` = knob de depuración que dispara aun
+con gate=0, para ejercitar la entrega; `HLE_AUDIO_KICK_TRACE=1` traza.)
+
+**A) EL DECODER SÍ SE CEBA — y hacía falta NAVEGACIÓN FIABLE (corrige §11.11–14).**
+Las sesiones previas medían con un SELECT flojo (además, el `grep StartPlayback`
+casa con la línea *watch* que `pctrace` imprime al arrancar → falso positivo → una
+sola pulsación de SELECT). Eso las dejaba en **régimen B (infra-progresado)**:
+`disp=2`, gate=0, el decoder ni se configura. Con SELECT FIABLE (`iremote press
+ret -u -w q,e --region right`, reintenta hasta que cambia la pantalla) el play
+**arranca de verdad y el decoder se configura ENTERO**: MEDIDO en varias corridas
+`disp=7`, `ex6≈61–134` (entrada cargada), y la puerta render-pull
+`[[obj+0x34]+0x60]` mide **`0x4` (!=0 = primed)**. El cebado del decoder **existe
+y es alcanzable** — la premisa "el decoder está listo" de §11.13 se confirma.
+
+**B) EL FIRMWARE EMITE EL TIPO-12 ÉL MISMO (refuta "nadie lo emite" de §11.13/§11.14).**
+En cuanto el play progresa de verdad, MEDIDO sin shim (HLE off, nav fiable):
+`h12 (0x08123970) = 1`, `gateconsume (0x081239bc, el str que consume la puerta,
+sólo alcanzable en la rama de decode) = 1`, `dwork (0x08123bfc) = 3`. Es decir: el
+retailOS **SÍ despacha el render-pull tipo-12** y **entra en la rama de decode**.
+El `h12=0` de las 7 sesiones era un **artefacto del régimen B** (bajo
+navegación floja el pipeline no llega ahí). El shim, con gate=`0x4`, también
+dispara (traza "emitted type-12 ... from idle pc=0x22003b20"); pero su tipo-12 es
+**redundante** con el que el firmware ya emite.
+
+**C) EL MURO REAL: el tipo-12 es INSUFICIENTE — no sale PCM aunque se decode
+(hallazgo decisivo).** Con el decode disparado (por el firmware o por el shim,
+`h12=1`, `gateconsume=1`, `dwork=3`), MEDIDO con `memw=0x08888000-0x0888c000` (la
+fuente PCM que lee el copy, §11.8): **8192 stores, TODOS del memset
+(`0x22000198`/`0x220001a0`), CERO del decoder.** `copy32 (0x08016eb4) = 0`
+invariante; `mixer (0x0809a74c) = 1` (sólo el render de bring-up, que salta por
+`[r7+5]=0`). **El tipo-12 NO produce PCM.** El `dwork 0x08123bfc` NO decodifica
+inline: **postea** un mensaje async (`0x8105c14` tipo `0x3a98` → `0x8105524`) al
+puerto de decode `obj+0x54`; los 3 posts se acumulan pero **la tarea de decode
+AAC aguas abajo nunca produce PCM**. El muro está **un nivel más abajo del
+tipo-12**, no en el tipo-12.
+
+**VEREDICTO HONESTO (esta sesión): el retailOS NO suena.** El `hle_out.wav`
+capturado sigue siendo el **clic de UI** (L==R 100%, ~20k muestras no nulas en
+ráfagas — no música). Lo aportado, todo MEDIDO:
+1. **Shim HLE del tipo-12 implementado, gateado, seguro** (no rompe el build por
+   defecto; `resets` observados = watchdog del propio retailOS ante la
+   reproducción estancada, no del shim) y con su **mecanismo de entrega validado**
+   (dispara el dispatcher desde el idle sin corromper tareas vivas).
+2. **El decoder SÍ se ceba** (gate `0x4`) con navegación fiable — el cebado no era
+   el muro.
+3. **El tipo-12 NO es el muro**: el firmware lo emite solo (`h12=1`), el decode
+   entra en su rama (`gateconsume=1`, `dwork=3`) y **aun así `copy32=0` y la
+   fuente del mixer sólo recibe memset**. Corrige la hipótesis central de las 7
+   sesiones ("falta el tipo-12"): faltaba **navegación fiable** para verla, y una
+   vez vista, el tipo-12 resulta **presente pero insuficiente**.
+
+**El muro exacto que queda (para la próxima sesión):** la **tarea de decode AAC
+async** —receptora de los posts de `0x08123bfc` al puerto `obj+0x54`— **no corre
+o no escribe PCM**. Es un tercer nivel de rendezvous, aguas abajo del tipo-12 que
+las 7 sesiones creían el último. Vías: (a) localizar esa tarea (quién recibe en
+`obj+0x54`, su TCB/estado en el deadlock) y ver en qué se bloquea; (b) el shim ya
+tiene el mecanismo de entrega genérico (redirección desde idle a una función del
+huésped) — reutilizarlo para cebar esa tarea, o el render del motor (mbox 0x52,
+cuyo payload sigue DESCONOCIDO, §mensaje). El PCM del huésped no aparece porque el
+productor real (decode AAC) está parado, no porque falte el tipo-12.
+
+**Higiene:** `HLE_AUDIO_KICK` off por defecto → build byte-idéntico al baseline;
+Rockbox/navtest/5G intactos (el shim es inerte sin la env). Recetas de sesión en
+`~/dbg/` (`runhle_*.sh`, `cap_hle.py`), fuera del repo.

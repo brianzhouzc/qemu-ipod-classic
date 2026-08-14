@@ -38,6 +38,7 @@
 #include "hw/core/cpu.h"
 #include "audio/audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /* ------------------------------------------------------------- tracing */
 
@@ -556,6 +557,8 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
         s->tx_running = (value & S5L8702_I2S_TXCOM_RUN) != 0;
         if (s->tx_running && !was_running) {
             i2s_pace_arm(s);
+            /* Arms the HLE audio kick (no-op unless HLE_AUDIO_KICK is set). */
+            ipod_classic_hle_audio_notify_play_start();
         } else if (!s->tx_running && was_running) {
             i2s_pace_disarm(s);
         }
