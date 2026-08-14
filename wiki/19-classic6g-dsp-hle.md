@@ -593,3 +593,117 @@ por vtable + entradas de tarea sin `bl` directo). Para cerrarlo:
   memoria relativo a registro) — lo que hizo posible leer la fuente y los
   descriptores del copy sin adivinar direcciones. `pctrace` ganó `memwpc=` (destino
   de stores en un PC concreto).
+
+### 11.11 La caza RTXC en vivo: DOS hipótesis descartadas por medida, y el muro re-encuadrado
+
+Sesión de traza en vivo con `gdb-multiarch` (SÍ está en el WSL, 15.1) + `pctrace`.
+Play arrancado por **曲をシャッフル (Shuffle Songs)**, último ítem del menú principal
+(japonés en este firmware), disco `~/6g/Emulti.img`, `AUDIOPACE=1`. Todo lo de abajo
+**VERIFICADO** salvo lo marcado.
+
+**Técnica que funciona (anotar):** `gdb.execute("continue")` desde el API Python de
+gdb corre ASÍNCRONO contra el gdbstub de QEMU y falla ("Cannot execute while
+running"); un **fichero de comandos `.gdb`** con `continue` de CLI (y bucles
+`while`) SÍ bloquea. Todo el trabajo en vivo se hizo con `-batch -x script.gdb`.
+Recetas en `~/dbg/` (WSL): `enum_bt.py` (volcado + backtrace de las 56 tareas de un
+tiro, un solo attach), `catch.gdb` (caza el motor y lo sigue hasta su bloqueo),
+`catch4.gdb` (lee el estado del HW de audio). **Un solo attach por captura** — el
+ciclado attach/detach es lo que inducía el spin EIC (ver abajo).
+
+**A) El spin EIC (0x22002e24) NO es el muro — DESCARTADO por medida no invasiva.**
+La rutina de reloj/energía `0x22002dc0` (`iPodPowerProfile.txt`) reprograma un PLL
+(`r0=CLK 0x3C500000`, `r1=EIC 0x39A00000` = `r0-0x2b00000`) y pollea EIC bit0
+(`0x22002e24`) y bit12 (`0x22002e48`) con IRQs enmascaradas; EIC sin implementar lee
+0 → spin eterno. **`pctrace pc=0x22002dc0`/`pc=0x22002e20` en un play limpio (sin
+gdb): hits=0.** La rutina NUNCA se entra durante la reproducción. El spin que
+capturó la sesión anterior era 100% artefacto del ciclado de gdb (un IRQ perdido en
+un detach deja la rutina de reloj a medias). **No modelar EIC.** El estado estable
+limpio es WFI idle en `0x22003b0c–0x22003b30`, cpsr con IRQs HABILITADAS.
+
+**B) El muro NO es un periférico que falte ni uno que devuelva mal — DESCARTADO.**
+`-d unimp,guest_errors` durante el play: los ÚNICOS accesos no modelados son 43
+**escrituras** de config a GPIO `+0x200` (setup de IRQ de rueda/botones, no lecturas
+que condicionen). **Cero** accesos a AES / SHA / ADM(`0x39/0x3F`) / SM1-window-alto
+/ io-floor. El decode no alcanza ningún bloque sin modelar. `pctrace` de la cadena:
+`audio_engine 0x0808170c`, `mixer 0x0809a74c`, `copyPCM 0x08016e44` corren **exactamente
+1 vez**; `copy32 (PCM real) 0x08016eb4` = **0**. `KS_ISRSignal 0x22001ca4` = **7621
+veces** (las ISR SÍ disparan). SM1: `SM1TRACE` en play = **0 accesos tras el SELECT**
+(SM1 no se pollea durante el streaming); `catch4.gdb` en idle: SM1 `STAT(+0xa98)=0`,
+`RUN(+0x400)=0` — ni siquiera "powered". SM1 es irrelevante en el camino de play.
+
+**C) La salida de bajo nivel FUNCIONA — idéntica a Rockbox (VERIFICADO por registros).**
+`catch4.gdb` en el idle de play leyó el HW de audio: **DMAC0 canal 1** activo —
+`SRC=0x22009c5c` (ping-pong IRAM), `DEST=0x3ca00010` (FIFO del I2S), `LLI=0x22010020`
+(cadena continua), `CTRL=0x84249800` (bit I=terminal-count IRQ), `CONF=0x8a81`
+(E=1 habilitado, `dest_id=0xA`=IIS0_TX, flow=1 mem→peri, ITC=1). I2S `TXCOM=6` (RUN),
+`CLKDIV=0x110`. Es **exactamente** el mecanismo que usa Rockbox (LLI-chain +
+terminal-count IRQ 16) y que ya suena. DMAC1 sin usar. **El muro NO está aguas abajo
+del ping-pong.** La `SM1 POS` avanzó a 0x27d800 (≈2.6M): el I2S drena silencio de
+punta a punta desde el arranque (por eso `SM1pos` en `StartPlayback` ya era 1.97M ≈
+44 s de silencio de boot).
+
+**D) El motor de audio corre en la TAREA 0x25 (VERIFICADO por breakpoint).** `catch.gdb`
+rompió en `0x0808170c`: corre en task `0x25` (worker MeCCA, entry `0x080833d0`),
+llamado desde el driver IRAM de audio (`lr=0x22006304`, IRAM `0x22006xxx` = shadow
+DRAM `0x07ffbxxx`; la "tarea de audio 0x07ffb2d0" de §11.8 es IRAM `0x22006118`).
+Tras su ÚNICA corrida, task `0x25` bloquea en **buzón/exchange 0x52** vía servicio
+**opcode 14** (wrapper `0x22004028`, un `KS_receive` de mailbox; el handler
+`0x22000950` indexa la tabla de buzones en **`0x0897783c` stride 32**, distinta de la
+tabla de semáforos opcode-1 `0x0897fb1c`). El copy `0x08016e44` corre 1 vez y SALTA
+por `[r7+5]=0` (PCM no listo) — no por la posición SM1.
+
+**E) Mapa de tareas RTXC en runtime (56 TCB, VERIFICADO).** `enum_bt.py`: array de TCB
+`0x0897ff70` stride 52 (`+12` entry, `+16` savedSP, `+28` estado, `+32` tasknum; el
+TCB no guarda puntero al nombre). Estados vistos: `0x40`=espera-semáforo (opcode 1,
+resumePC `0x2200433c`), `0x08`/`0x20`/`0x04`/`0x01`=otras esperas (opcodes 14/4/…),
+`0x00`=libre/corriendo. ~30 workers genéricos `0x080833d0`. Piezas clave:
+- **task 0x20** = tarea de StreamCache/media (bt `0x08171500→0x081f39a4→0x081d0a2c→…→
+  0x081fed34`), **idle esperando RECIBIR en exchange 6** (opcode 4). Es un consumidor
+  ocioso, no "el productor bloqueado" que creía §11.10.
+- **task 0x25** = motor/driver de audio, bloqueado en exchange 0x52 tras 1 corrida.
+- Muchos workers parados en **`0x080c8998`** (retorno de `bl 0x8033d8c` = el `KS_wait`
+  del RPC síncrono `0x080c8968`): hacen una petición y esperan la respuesta. El RPC
+  `0x080c8968` es genérico (get-event `0x8033b70` → post `0x80cc0e4` → signal
+  `0x8033af8` → wait reply): corre ~3728 veces en 18 s de play, NO es específico de
+  audio.
+
+**F) El disco NO es el problema.** La pista de `Emulti.img` es un **M4A/ALAC válido**
+(`ftyp`@0x818004, `moov`, `mdat`@0x824824, fourcc `alac`) — contenedor MPEG-4 bien
+formado, no corrupto. El códec ALAC se inicializa (§11.9); el "ID3" hallado en el
+scan es ruido coincidente.
+
+**RE-ENCUADRE DEL MURO (medido, honesto):** en el punto de bloqueo el sistema es un
+**deadlock de mensajería MeCCA**: TODAS las tareas están bloqueadas en exchanges/
+buzones inter-tarea, y NINGUNA está polleando un periférico. Por tanto **ningún
+cambio del modelo de un periférico puede desbloquearlo directamente** — lo que falta
+es un *mensaje* (un `KS_send`/`KS_signal` de tarea a tarea) o un paso del setup
+SÍNCRONO que debió despachar el primer decode y no lo hizo. Las ISR que sí disparan
+(tick de timer + DMA IRQ 16) despiertan al driver de salida de bajo nivel (rellena
+silencio) pero **no** disparan la tarea de decode. El decode nunca produce la trama 0.
+El deadlock es DURO (§11.8: 0 bloques nuevos tras 367 ms), no un timeout lento.
+
+**El siguiente nodo, preciso:** trazar el setup SÍNCRONO de reproducción desde
+`StartPlayback 0x08150d84` (media player `0x0815xxxx` → apertura del M4A → init del
+códec ALAC → **el punto donde debería encolar/señalar el primer decode**) y hallar la
+rama que NO despacha esa petición. Pista de no-determinismo: la sesión anterior
+alcanzó el handshake SM1 (33 accesos, §11.6) y ésta no (0 accesos) — el mismo play
+se atasca en puntos distintos → **hay una carrera/timing** (candidato: el instante
+del primer IRQ 16 respecto al setup). Método sugerido: breakpoint en el `KS_receive`
+del worker de decode y en `0x080c8968`/`0x8033af8` filtrando por el exchange que toca
+el media player; o comparar el árbol de `pctrace range=` de un play que progresa vs.
+uno que se atasca.
+
+**Experimento de timing PROBADO y DESCARTADO (esta sesión):** hipótesis "el primer
+IRQ 16 del DMA de audio llega demasiado pronto y el setup del decode pierde/atropella
+la señal". Se añadió temporalmente un knob `AUDIOPACE_START_MS` que retrasa el primer
+tick de drain (y con él el primer terminal-count IRQ 16) N ms; probado con 1500 ms.
+Resultado: **no confirma** — no cambia el muro (`copy32=0` sigue), y peor, retrasar la
+salida ~1.5 s tiende a **inducir resets** (el retailOS parece vigilar el avance de la
+reproducción y se resetea si se estanca). Coherente con el diagnóstico: el decode NO
+espera el IRQ 16 (la salida de bajo nivel va sola, §C) sino un MENSAJE de tarea aguas
+arriba. El knob se **revirtió** (árbol limpio). El timing del IRQ 16 no es la palanca;
+el siguiente esfuerzo va al setup síncrono del decode, no al pacing del DMA.
+
+**Higiene:** cero cambios en fuentes del modelo (sólo lecturas/breakpoints gdb y
+`pctrace`, ya en el árbol). Árbol byte-idéntico al baseline. Rockbox/navtest intactos.
+Instrumentación de sesión en `~/dbg/` del WSL (fuera del repo).
