@@ -485,3 +485,111 @@ modelo de batería resetea). Usar ventana corta o ya en reproducción.
 - Sin regresión: `navtest` 6G pasa (05-select 19498 px, rueda dos mitades; 09-into-music
   es la flakiness conocida del SELECT, no regresión; 0 resets) y Rockbox sigue navegando.
   Los arreglos de CLKCON/SM1 sólo se ejercen en el camino de audio del retailOS.
+
+### 11.6 SM1 modelado como dispositivo con estado (sustituye los bits fingidos)
+
+Los tres arreglos de reloj de §11.2 se sustituyeron por un **dispositivo QEMU con
+estado**, `hw/arm/ipod_classic/ipod_classic_sm1.c` (+ `.h`), registrado en la
+máquina en vez del `create_unimplemented_device`. Modela el handshake COHERENTE
+(el estado deriva de las escrituras del huésped, no constantes a mano):
+- **+0xc80 (ID)** devuelve el magic `0x004e7309`.
+- **sub-bloques** (`base + {idx*0x20; 0x100/0x180/0x200/0x230}`): al escribir un
+  comando en `sub+0x10`, `sub+0x14 & 7` pasa a leer **7** ("alcanzó estado"), que
+  es lo que el poll de 10 intentos en `0x080ba768` espera.
+- **+0xa98 bit2 (clock-ready)** y **+0x400 (run latch)** se derivan de un flag
+  `powered` que se pone con la primera escritura de bring-up (comando de canal,
+  `+0x824`, `+0x400`, `+0xc48`).
+- **+0xa48 (posición de reproducción)** se deriva de `i2s->tx_samples/2`.
+- Todo lo demás es latch (se guarda lo escrito, lee 0 al reset). `SM1TRACE=1`
+  imprime cada acceso con PC.
+
+**MEDIDO (traza `SM1TRACE`, disco `~/6g/Emulti.img`, `AUDIOPACE=1`):** en el play
+de Shuffle Songs el handshake corre **UNA vez, 33 accesos, y COMPLETA sin spin**:
+`rd +0xc80 -> 0x004e7309`; `wr +0x110 = 4`; `rd +0x114 -> 7`; `wr +0x110 = 16`;
+`wr +0x110 = 96`; config de códec `+0x93x..+0x97x` (una tabla desde `0x080b68b4`);
+al final `rd +0xa48 -> 0x002a9000` (posición avanzando). **Conclusión medida: el
+modelo SM1 está bien y NO es el muro** — el handshake que fingíamos ahora se
+satisface de verdad, y aun así no suena. (Confirma el aviso del auditor por la vía
+opuesta: modelar SM1 "de verdad" era correcto pero insuficiente.)
+
+### 11.7 La premisa "0 escrituras al ping-pong" era un artefacto; el muro es el DECODE
+
+Re-medido con `pctrace memw`: el buffer se escribe **millones** de veces (driver
+IRAM `0x22000294/0x22000298` a ritmo de audio, casi todo silencio) y el **mixer SW
+`0x080fb2b0`** mete exactamente los **clics de UI** (`AUDIOWAV`: ~9 360 tramas no
+nulas, pico 11444, L==R, ~15 ráfagas aisladas — clics, NO música). El **tubo de
+salida funciona de punta a punta**; lo que falta es que la MÚSICA decodificada
+entre en él. (Coincide con el segundo informe de la sesión previa.)
+
+### 11.8 El camino consumidor, mapeado entero (traza + gdb) — el copy SALTA por falta de PCM
+
+Con `pctrace range=` disparado en `StartPlayback` (0x08150d84, `hits=1`) se capturó
+la huella del arranque del decode: **~10 787 bloques distintos en ~367 ms**, luego
+**cero bloques nuevos** — el sistema se asienta en un lazo estable (vuelve al event
+loop de UI `0x08105a1c`/`0x0812xxxx`). Regiones tocadas: media player `0x0815`,
+StreamCache `0x081f`, códec ALAC `0x0808`, tabla de códec `0x0832` (75 bloques).
+
+La **cadena consumidora** (reconstruida con `pctrace pc=` y **gdbpoke** — pila +
+registros en el copy, sin corromper la entrada porque el copy corre DESPUÉS de que
+el SELECT despachó):
+
+```
+  tarea de audio 0x07ffb2d0 (entry de tarea RTXC; sin bl directo)
+    -> veneer 0x07ff89f8 -> motor de audio 0x0808170c   (bring-up SM1 + switch de códec)
+      -> mixer 0x0809a74c   (itera lista de streams: ldr r4,[r4,#4]; llama al render por stream)
+        -> render 0x08016f14 -> 0x08016f68
+          -> COPY PCM 0x08016e44   (llama al getter de posición SM1+0xa48 en 0x08091710)
+```
+
+El **copy 0x08016e44** corre **UNA vez** (`copyFn hits=1`) y toma la rama **SKIP**
+(`copySKIP 0x08016ecc hits=1`, `copy32 0x08016eb4 hits=0`). La puerta: `ldrb
+r1,[r7,#5]; cmp r1,#1; bne skip` en `0x08016e88`. **gdbpoke midió en runtime**
+(estable entre corridas): `[r7+5] = 0` (la puerta exige 1), `[r4] = 0` (ruta de 32
+bits), fuente `r0 = 0x08889098`, descriptores `r4=0x0bb12d54`, `r7=0x0bb12eb4`. El
+volcado de la **fuente 0x08889098 NO es PCM** (punteros a sí misma + relleno
+`0x5da35da3`); los descriptores están **medio-inicializados** (relleno `0x5da3`,
+que en toda la imagen aparece 2 veces → valor de heap, no PCM). El copy **hace bien
+en saltar**: no hay muestras válidas que copiar.
+
+### 11.9 H1 CONFIRMADO por medida: el decodificador NO escribe ni una muestra
+
+`pctrace memw=0x08888000-0x0888c000` (la región de la fuente 0x08889098) durante el
+play: **8 192 stores, de sólo 2 PCs — `0x22000198` y `0x220001a0`, que son el
+memset/clear de IRAM. CERO escrituras del decodificador.** Es decir, el buffer de
+stream se **limpia** pero **nunca se rellena con PCM**. Esto zanja H1 vs H2:
+
+> **El decodificador MeCCA nunca produce PCM (H1). No es un problema de ruteo/mute
+> (H2): no hay muestras que rutear.** El motor `0x0808170c` corre una vez (por eso
+> el handshake SM1 es único), mezcla el stream vacío, el copy salta, y la tarea se
+> bloquea. La tarea PRODUCTORA (decodificador), aguas arriba del stream, está
+> parada antes de la trama 0.
+
+Datos colaterales: `media_dispatch_chain 0x081f87f8` corre 248 veces y `strcmp`
+131 240 veces en la corrida (framework MeCCA muy activo por búsquedas con clave de
+cadena). El códec (región ALAC `0x0808`, tabla `0x0832`) **sí** hace setup, así que
+**no** es "códec no encontrado" tipo el muro de las fuentes (§2): el códec se
+inicializa pero se bloquea antes de decodificar.
+
+Mecanismo RTXC relevante (ya documentado en `ipod_classic.c:634-641`): las tareas
+hacen `KS_wait` SIN timeout sobre el semáforo de un canal DMAC0 y sólo las despierta
+el ISR de terminal-count (IRQ 16). Ese mecanismo **funciona** (el almacenamiento
+monta, la salida drena). El pacing (AUDIOPACE) sólo afecta la línea IIS0_TX; el DMA
+mem-a-mem del decodificador NO es paced. Así que el bloqueo del decode **no** es un
+IRQ/pacing que falte — es un semáforo/evento de software aguas arriba.
+
+### 11.10 El obstáculo exacto que queda y cómo cerrarlo
+
+El decodificador MeCCA (tarea RTXC separada, aguas arriba del stream) se bloquea en
+un `KS_wait` antes de la trama 0 y nunca rellena `[r5+12]` (la fuente del mixer). Su
+PC/LR de bloqueo sigue **DESCONOCIDO**: la cadena de mixer/render/copy está mapeada
+entera (consumidor), pero la tarea PRODUCTORA no se localizó por estático (despacho
+por vtable + entradas de tarea sin `bl` directo). Para cerrarlo:
+- **gdb ya funciona en el play** (no corrompe la entrada si el breakpoint cae tras
+  el despacho del SELECT): poner un breakpoint en el primitivo `KS_wait` de RTXC y,
+  cuando la tarea de audio se bloquee durante el setup, leer `bt`/LR → la función de
+  decode y qué semáforo espera. Falta localizar `KS_wait` (mapear la tabla de tareas
+  RTXC / el TCB de la tarea de audio).
+- Herramienta nueva reutilizable: `gdbpoke.py --memreg IDX[+OFF]:LEN` (volcado de
+  memoria relativo a registro) — lo que hizo posible leer la fuente y los
+  descriptores del copy sin adivinar direcciones. `pctrace` ganó `memwpc=` (destino
+  de stores en un PC concreto).
