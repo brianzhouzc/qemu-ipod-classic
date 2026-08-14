@@ -79,7 +79,44 @@ static gint64 t0;                   /* first-hit timestamp, for relative stamps 
 static bool always;                 /* log every hit, ignore window */
 static guint64 cap;                 /* per-PC line cap in always mode */
 static guint64 lines;               /* total lines emitted (global sanity cap) */
+
+/*
+ * RANGE TRACE (discovery mode). range=0xLO-0xHI logs the first-seen PC of every
+ * translated block whose start PC falls in [LO,HI), but ONLY while a trigger
+ * window is open, and each PC at most once per window opening (deduped by
+ * win_gen). This reveals which functions a keypress sets off without halting the
+ * CPU -- exactly what is needed to find the song-list HandleSelect, whose address
+ * is not in any pointer table. Outside the window the callback is a single time
+ * compare, so it does not perturb boot timing enough to trip the reset.
+ */
+typedef struct {
+    uint64_t addr;
+    guint last_gen;                 /* win_gen at which this PC was last logged */
+    guint64 count;
+} RangePC;
+static uint64_t range_lo, range_hi; /* [lo,hi); hi==0 disables range trace */
+static GHashTable *range_tbl;       /* addr -> RangePC* */
+static guint win_gen;               /* bumped each time a trigger opens the window */
 static const guint64 PCTRACE_LINE_MAX = 5000000;
+
+/*
+ * MEMORY-WRITE WATCH (the non-invasive watchpoint). memw=0xLO-0xHI logs every
+ * guest-CPU store whose address falls in [LO,HI), with the store's PC and size.
+ * This is the tool the brief asks for on the audio PCM ping-pong buffers
+ * (IRAM 0x22008c5c / 0x22009c5c): whatever ARM code the MeCCA software decoder
+ * runs to fill those buffers will show up here as the writing PC -- the Branch-A
+ * capture -- without halting the CPU the way a gdb watchpoint does (which
+ * desyncs the click-wheel latch). Always-on (not window-gated): the decode task
+ * runs asynchronously, off the keypress window. Capped so a memcpy loop cannot
+ * flood the log; the count keeps rising past the cap so the summary is honest.
+ * QEMU 8.2's plugin API cannot read the stored value, so the value is confirmed
+ * out-of-band (AUDIOWAV RMS, or an xp of the buffer once a writer PC is known).
+ */
+static uint64_t memw_lo, memw_hi;   /* [lo,hi); hi==0 disables mem watch */
+static guint64 memw_cap = 400;      /* max logged store lines */
+static guint64 memw_total;          /* total stores seen in range (uncapped) */
+static guint64 memw_lines;          /* logged store lines so far */
+static GHashTable *memw_pcs;        /* distinct writing PCs -> count */
 
 static WatchPC *find_pc(uint64_t addr)
 {
@@ -117,6 +154,7 @@ static void vcpu_pc_exec(unsigned int cpu_index, void *udata)
     if (w->trigger) {
         /* (re)open the logging window and announce the trigger itself */
         window_end = now + window_us;
+        win_gen++;                  /* new window: range PCs may log again */
     }
 
     if (w->quiet) {                 /* count-only PC (e.g. strcmp): no line */
@@ -142,6 +180,64 @@ static void vcpu_pc_exec(unsigned int cpu_index, void *udata)
     fflush(out);
 }
 
+/* Range-trace callback: log this TB's start PC once per open window. */
+static void vcpu_range_exec(unsigned int cpu_index, void *udata)
+{
+    gint64 now = g_get_monotonic_time();
+    if (!window_end || now > window_end) {
+        return;                     /* window closed: cheapest possible path */
+    }
+    RangePC *r = (RangePC *)udata;
+    r->count++;
+    if (r->last_gen == win_gen) {
+        return;                     /* already logged this window opening */
+    }
+    r->last_gen = win_gen;
+    if (t0 == 0) {
+        t0 = now;
+    }
+    if (lines >= PCTRACE_LINE_MAX) {
+        return;
+    }
+    lines++;
+    fprintf(out, "PCTRACE +%8" PRId64 "us cpu%u  RANGE                         "
+            "@0x%08" PRIx64 "  #%" PRIu64 "\n",
+            now - t0, cpu_index, r->addr, r->count);
+    fflush(out);
+}
+
+/* Memory-store callback: log stores that land in the watched [lo,hi) range. */
+static void vcpu_mem_w(unsigned int cpu_index, qemu_plugin_meminfo_t info,
+                       uint64_t vaddr, void *udata)
+{
+    if (vaddr < memw_lo || vaddr >= memw_hi) {
+        return;
+    }
+    if (!qemu_plugin_mem_is_store(info)) {
+        return;
+    }
+    uint64_t pc = (uint64_t)(uintptr_t)udata;
+    memw_total++;
+    if (memw_pcs) {
+        gpointer key = (gpointer)(uintptr_t)pc;
+        guint64 c = (guint64)(uintptr_t)g_hash_table_lookup(memw_pcs, key);
+        g_hash_table_insert(memw_pcs, key, (gpointer)(uintptr_t)(c + 1));
+    }
+    if (memw_lines >= memw_cap) {
+        return;
+    }
+    memw_lines++;
+    gint64 now = g_get_monotonic_time();
+    if (t0 == 0) {
+        t0 = now;
+    }
+    unsigned sh = qemu_plugin_mem_size_shift(info);
+    fprintf(out, "PCTRACE +%8" PRId64 "us cpu%u  MEMW  pc=0x%08" PRIx64
+            "  addr=0x%08" PRIx64 "  %ubytes  (#%" PRIu64 ")\n",
+            now - t0, cpu_index, pc, vaddr, 1u << sh, memw_total);
+    fflush(out);
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
@@ -153,6 +249,26 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, vcpu_pc_exec, QEMU_PLUGIN_CB_NO_REGS, w);
         }
+        /* Range trace only cares about the TB's first instruction. */
+        if (i == 0 && range_hi && va >= range_lo && va < range_hi) {
+            RangePC *r = g_hash_table_lookup(range_tbl, &va);
+            if (!r) {
+                r = g_new0(RangePC, 1);
+                r->addr = va;
+                uint64_t *key = g_new(uint64_t, 1);
+                *key = va;
+                g_hash_table_insert(range_tbl, key, r);
+            }
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, vcpu_range_exec, QEMU_PLUGIN_CB_NO_REGS, r);
+        }
+        /* Memory-write watch: every instruction may store; the callback
+         * filters by address, so register on all of them when armed. */
+        if (memw_hi) {
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_w, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_W, (void *)(uintptr_t)va);
+        }
     }
 }
 
@@ -163,6 +279,21 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         WatchPC *w = &g_array_index(watch, WatchPC, i);
         fprintf(out, "  %-28s @0x%08" PRIx64 "  hits=%" PRIu64 "%s\n",
                 w->label, w->addr, w->count, w->trigger ? "  (trigger)" : "");
+    }
+    if (memw_hi) {
+        fprintf(out, "  --- mem-write watch 0x%08" PRIx64 "-0x%08" PRIx64
+                ": %" PRIu64 " stores from %u distinct PC(s) ---\n",
+                memw_lo, memw_hi, memw_total,
+                memw_pcs ? g_hash_table_size(memw_pcs) : 0);
+        if (memw_pcs) {
+            GHashTableIter it;
+            gpointer k, v;
+            g_hash_table_iter_init(&it, memw_pcs);
+            while (g_hash_table_iter_next(&it, &k, &v)) {
+                fprintf(out, "      writer pc=0x%08" PRIxPTR "  stores=%"
+                        PRIuPTR "\n", (uintptr_t)k, (uintptr_t)v);
+            }
+        }
     }
     fflush(out);
     if (out != stderr) {
@@ -203,6 +334,22 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             always = kv[1] && !g_strcmp0(kv[1], "on");
         } else if (!g_strcmp0(kv[0], "cap")) {
             cap = g_ascii_strtoull(kv[1], NULL, 10);
+        } else if (!g_strcmp0(kv[0], "range") && kv[1]) {
+            /* range=0xLO-0xHI */
+            g_auto(GStrv) lh = g_strsplit(kv[1], "-", 2);
+            if (lh[0] && lh[1]) {
+                range_lo = g_ascii_strtoull(lh[0], NULL, 16);
+                range_hi = g_ascii_strtoull(lh[1], NULL, 16);
+            }
+        } else if (!g_strcmp0(kv[0], "memw") && kv[1]) {
+            /* memw=0xLO-0xHI : log guest-CPU stores in [lo,hi) */
+            g_auto(GStrv) lh = g_strsplit(kv[1], "-", 2);
+            if (lh[0] && lh[1]) {
+                memw_lo = g_ascii_strtoull(lh[0], NULL, 16);
+                memw_hi = g_ascii_strtoull(lh[1], NULL, 16);
+            }
+        } else if (!g_strcmp0(kv[0], "memcap") && kv[1]) {
+            memw_cap = g_ascii_strtoull(kv[1], NULL, 10);
         } else if (!g_strcmp0(kv[0], "out")) {
             FILE *f = fopen(kv[1], "w");
             if (!f) {
@@ -212,6 +359,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             out = f;
         }
     }
+
+    range_tbl = g_hash_table_new(g_int64_hash, g_int64_equal);
+    memw_pcs = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     watch = g_array_new(false, false, sizeof(WatchPC));
 
@@ -260,6 +410,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     fprintf(out, "=== PCTRACE armed: %u PC(s), window=%" PRId64 "ms, %s ===\n",
             watch->len, window_us / 1000,
             always ? "always-log" : "window-gated");
+    if (range_hi) {
+        fprintf(out, "    range trace 0x%08" PRIx64 "-0x%08" PRIx64
+                " (first-TB-PC, deduped per window)\n", range_lo, range_hi);
+    }
+    if (memw_hi) {
+        fprintf(out, "    mem-write watch 0x%08" PRIx64 "-0x%08" PRIx64
+                " (store PC+addr, always-on, cap=%" PRIu64 ")\n",
+                memw_lo, memw_hi, memw_cap);
+    }
     for (guint i = 0; i < watch->len; i++) {
         WatchPC *w = &g_array_index(watch, WatchPC, i);
         fprintf(out, "    watch %-28s @0x%08" PRIx64 "%s%s\n",
