@@ -610,6 +610,29 @@ QEMU_PLUGIN_API
 const char *qemu_plugin_insn_symbol(const struct qemu_plugin_insn *insn);
 
 /**
+ * qemu_plugin_read_register() - read a guest core register (8.2 backport)
+ * @buf: GByteArray the register bytes are appended to (target endianness, as
+ *       the gdbstub formats them; little-endian for ARM)
+ * @reg: target gdb *core*-register index (ARM: 0..12 = r0..r12, 13 = sp,
+ *       14 = lr, 15 = pc, 25 = cpsr)
+ *
+ * Reduced backport of the QEMU 9.x register-read API: exposes the read half
+ * keyed directly by gdb core-register index, enough to capture a caller LR and
+ * argument GPRs at a breakpoint. Requires <glib.h> to be included first.
+ *
+ * Must be called from a vCPU callback so current_cpu is valid. In 8.2 the guest
+ * register file is only authoritative at a translation-block boundary (cb-flags
+ * are ignored and the callback helper is emitted TCG_CALL_NO_RWG), so a caller
+ * MUST only read registers from a callback installed on the FIRST instruction
+ * of a TB (a branch/call target). See the note in plugins/api.c.
+ *
+ * Returns the number of bytes appended (4 for an ARM core reg), or 0 on
+ * failure (no current CPU, target lacks gdb_read_register, unknown index).
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_read_register(GByteArray *buf, int reg);
+
+/**
  * qemu_plugin_vcpu_for_each() - iterate over the existing vCPU
  * @id: plugin ID
  * @cb: callback function

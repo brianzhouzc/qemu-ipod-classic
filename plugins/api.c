@@ -245,6 +245,49 @@ const char *qemu_plugin_insn_symbol(const struct qemu_plugin_insn *insn)
 }
 
 /*
+ * Register read (reduced backport of QEMU 9.x qemu_plugin_read_register).
+ *
+ * Upstream 9.x exposes register handles through qemu_plugin_get_registers()
+ * and reads them with qemu_plugin_read_register(handle, buf); internally both
+ * go through the gdbstub's per-target gdb_read_register callback. QEMU 8.2 has
+ * no such public API. This adds the read half only, keyed directly by the
+ * target's gdb *core*-register index (for ARM: 0..12 = r0..r12, 13 = sp,
+ * 14 = lr, 15 = pc, 25 = cpsr), which is all a PC-conditioned tracer needs to
+ * capture a caller's LR and argument GPRs.
+ *
+ * IMPORTANT (8.2 correctness constraint): plugin callback cb-flags are
+ * discarded in 8.2 (plugins/core.c: "Note flags are discarded as unused") and
+ * the udata helper is emitted TCG_CALL_NO_RWG (accel/tcg/plugin-helpers.h), so
+ * TCG does NOT spill its register globals to CPUArchState before a mid-block
+ * callback. The guest register file in env is therefore only authoritative at
+ * a translation-block boundary. Callers of this function MUST only read
+ * registers from a callback installed on the FIRST instruction of a TB (a
+ * branch/call target such as an RTXC primitive entry): at TB entry every
+ * global was written back to env by the previous block's epilogue and no guest
+ * instruction has run yet, so env holds the exact architectural values. Read
+ * anywhere else and the values can be stale. The pctrace plugin enforces this
+ * by only arming register reads at insn index 0.
+ *
+ * Returns the number of bytes appended to @buf (4 for an ARM core reg), or 0
+ * if there is no current CPU / the target has no gdb_read_register / the
+ * register index is unknown. Must be called from a vCPU callback (so that
+ * current_cpu is valid).
+ */
+int qemu_plugin_read_register(GByteArray *buf, int reg)
+{
+    CPUState *cpu = current_cpu;
+
+    if (!cpu) {
+        return 0;
+    }
+    CPUClass *cc = CPU_GET_CLASS(cpu);
+    if (!cc->gdb_read_register) {
+        return 0;
+    }
+    return cc->gdb_read_register(cpu, buf, reg);
+}
+
+/*
  * The memory queries allow the plugin to query information about a
  * memory access.
  */

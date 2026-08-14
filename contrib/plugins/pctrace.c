@@ -37,6 +37,29 @@
  *   loud=0xADDR     undo quiet for a PC (emit per-hit lines again)
  *   nodefault=on    do not install the built-in PC table (only pc=/trig= args)
  *
+ * REGISTER READ (8.2 backport of qemu_plugin_read_register -- see plugins/api.c):
+ *   regpc=0xADDR:LABEL          at ADDR log LR + r0..r3 + sp of the guest, every
+ *                               hit (capped). Use this first to DISCOVER which
+ *                               argument register carries a value: e.g. arm it
+ *                               on the RTXC send-primitive 0x22001060 and read
+ *                               off which of r0..r3 holds the exchange index.
+ *   sendex=0xADDR:REG:WANT:LABEL  conditional variant: at ADDR read gdb core reg
+ *                               REG (0..12=r0..r12, 13=sp, 14=lr, 15=pc); only
+ *                               when it equals WANT (hex) log LR + r0..r3 + sp.
+ *                               This is the "send of exchange 6" catcher:
+ *                               sendex=0x22001060:1:0x6:ex6  (once REG is known)
+ *                               fires only on the ~52 real sends to exchange 6,
+ *                               so it never perturbs the guest into regime B.
+ *   regcap=N                    max logged register lines per regpc/sendex PC
+ *                               (default 400; counts keep rising past the cap).
+ *
+ *   CORRECTNESS: 8.2 discards callback cb-flags and emits the callback helper
+ *   TCG_CALL_NO_RWG, so the guest register file is only authoritative at a TB
+ *   boundary. This plugin therefore only reads registers when ADDR is the FIRST
+ *   instruction of its translation block (a branch/call target -- which every
+ *   RTXC primitive entry is). If ADDR is ever seen mid-block the plugin counts
+ *   the hit but refuses the (unreliable) register read and warns once.
+ *
  * License: GNU GPL, version 2 or later (see COPYING).
  */
 #include <glib.h>
@@ -137,6 +160,46 @@ typedef struct {
 } MemwPC;
 static GArray *memwpc;              /* array of MemwPC */
 static guint64 memwpc_cap = 40;     /* max logged lines per watched PC */
+
+/*
+ * REGISTER READ (8.2 backport). regpc=/sendex= install an insn-exec callback on
+ * a PC that is the FIRST instruction of a TB and read the guest GPRs there with
+ * qemu_plugin_read_register(). At a TB head env holds the exact architectural
+ * register file (§ plugins/api.c), so LR = caller return address and r0..r3 =
+ * the primitive's arguments are captured non-invasively -- no gdb, no CPU halt,
+ * no watchpoint on the hot kernel data page 0x0897xxxx. sendex= additionally
+ * gates logging on one register equalling WANT (the exchange index == 6), so it
+ * fires only on the handful of real sends and cannot push the guest to regime B.
+ */
+typedef struct {
+    uint64_t pc;
+    const char *label;
+    int cond_reg;       /* -1 => unconditional (regpc); else gdb reg to test */
+    uint32_t want;      /* required value of cond_reg when cond_reg >= 0 */
+    guint64 hits;       /* times the PC executed at a TB head */
+    guint64 matches;    /* times the condition held (== logged candidates) */
+    guint64 logged;     /* lines actually emitted (<= regpc_cap) */
+    guint64 mid_hits;   /* times seen mid-TB (regs unreliable, not read) */
+    bool mid_warned;    /* one-shot warning emitted for mid-TB sighting */
+} RegPC;
+static GArray *regpcs;              /* array of RegPC */
+static guint64 regpc_cap = 400;    /* max logged reg lines per watched PC */
+static GByteArray *reg_buf;        /* scratch for qemu_plugin_read_register */
+
+/* Read a 32-bit guest core register by gdb index. iPod ARM is little-endian. */
+static bool read_reg32(int reg, uint32_t *out)
+{
+    g_byte_array_set_size(reg_buf, 0);
+    int n = qemu_plugin_read_register(reg_buf, reg);
+    if (n < 4) {
+        return false;
+    }
+    *out = (uint32_t)reg_buf->data[0] |
+           ((uint32_t)reg_buf->data[1] << 8) |
+           ((uint32_t)reg_buf->data[2] << 16) |
+           ((uint32_t)reg_buf->data[3] << 24);
+    return true;
+}
 
 static WatchPC *find_pc(uint64_t addr)
 {
@@ -283,6 +346,73 @@ static void vcpu_mem_at_pc(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     fflush(out);
 }
 
+static RegPC *find_regpc(uint64_t pc)
+{
+    if (!regpcs) {
+        return NULL;
+    }
+    for (guint i = 0; i < regpcs->len; i++) {
+        RegPC *rp = &g_array_index(regpcs, RegPC, i);
+        if (rp->pc == pc) {
+            return rp;
+        }
+    }
+    return NULL;
+}
+
+/* Insn-exec callback on a TB-head PC: read GPRs (env is authoritative here). */
+static void vcpu_regpc_exec(unsigned int cpu_index, void *udata)
+{
+    RegPC *rp = (RegPC *)udata;
+    rp->hits++;
+
+    if (rp->cond_reg >= 0) {         /* sendex: gate on one register == want */
+        uint32_t v;
+        if (!read_reg32(rp->cond_reg, &v) || v != rp->want) {
+            return;                  /* not the exchange we are hunting */
+        }
+    }
+    rp->matches++;
+    if (rp->logged >= regpc_cap) {
+        return;
+    }
+    rp->logged++;
+
+    uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, sp = 0, lr = 0;
+    read_reg32(0, &r0);
+    read_reg32(1, &r1);
+    read_reg32(2, &r2);
+    read_reg32(3, &r3);
+    read_reg32(13, &sp);
+    read_reg32(14, &lr);
+
+    gint64 now = g_get_monotonic_time();
+    if (t0 == 0) {
+        t0 = now;
+    }
+    fprintf(out, "PCTRACE +%8" PRId64 "us cpu%u  REGPC %-12s pc=0x%08" PRIx64
+            "  lr=0x%08" PRIx32 "  r0=0x%08" PRIx32 " r1=0x%08" PRIx32
+            " r2=0x%08" PRIx32 " r3=0x%08" PRIx32 " sp=0x%08" PRIx32
+            "  (match#%" PRIu64 " hit#%" PRIu64 ")\n",
+            now - t0, cpu_index, rp->label, rp->pc, lr, r0, r1, r2, r3, sp,
+            rp->matches, rp->hits);
+    fflush(out);
+}
+
+/* Mid-TB sighting: env is NOT authoritative here (8.2), so refuse to read. */
+static void vcpu_regpc_mid(unsigned int cpu_index, void *udata)
+{
+    RegPC *rp = (RegPC *)udata;
+    rp->mid_hits++;
+    if (!rp->mid_warned) {
+        rp->mid_warned = true;
+        fprintf(out, "PCTRACE WARNING: %s pc=0x%08" PRIx64 " seen mid-TB; "
+                "register read skipped (env unreliable off a TB head in 8.2)\n",
+                rp->label, rp->pc);
+        fflush(out);
+    }
+}
+
 static MemwPC *find_memwpc(uint64_t pc)
 {
     if (!memwpc) {
@@ -313,6 +443,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         if (w) {
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, vcpu_pc_exec, QEMU_PLUGIN_CB_NO_REGS, w);
+        }
+        /* Register read: only trustworthy at a TB head (i == 0). Elsewhere the
+         * same PC is registered on a count-and-warn callback that never reads. */
+        RegPC *rp = find_regpc(va);
+        if (rp) {
+            if (i == 0) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_regpc_exec, QEMU_PLUGIN_CB_R_REGS, rp);
+            } else {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_regpc_mid, QEMU_PLUGIN_CB_NO_REGS, rp);
+            }
         }
         /* Range trace only cares about the TB's first instruction. */
         if (i == 0 && range_hi && va >= range_lo && va < range_hi) {
@@ -366,6 +508,23 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             MemwPC *m = &g_array_index(memwpc, MemwPC, i);
             fprintf(out, "      %-14s pc=0x%08" PRIx64 "  stores=%" PRIu64 "\n",
                     m->label, m->pc, m->count);
+        }
+    }
+    if (regpcs) {
+        fprintf(out, "  --- register-read watches ---\n");
+        for (guint i = 0; i < regpcs->len; i++) {
+            RegPC *rp = &g_array_index(regpcs, RegPC, i);
+            fprintf(out, "      %-12s pc=0x%08" PRIx64 "  hits=%" PRIu64
+                    "  matches=%" PRIu64 "  logged=%" PRIu64,
+                    rp->label, rp->pc, rp->hits, rp->matches, rp->logged);
+            if (rp->cond_reg >= 0) {
+                fprintf(out, "  (gate r%d==0x%" PRIx32 ")",
+                        rp->cond_reg, rp->want);
+            }
+            if (rp->mid_hits) {
+                fprintf(out, "  [mid-TB skipped=%" PRIu64 "]", rp->mid_hits);
+            }
+            fprintf(out, "\n");
         }
     }
     fflush(out);
@@ -425,6 +584,33 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             memw_cap = g_ascii_strtoull(kv[1], NULL, 10);
         } else if (!g_strcmp0(kv[0], "memwpccap") && kv[1]) {
             memwpc_cap = g_ascii_strtoull(kv[1], NULL, 10);
+        } else if (!g_strcmp0(kv[0], "regcap") && kv[1]) {
+            regpc_cap = g_ascii_strtoull(kv[1], NULL, 10);
+        } else if (!g_strcmp0(kv[0], "regpc") && kv[1]) {
+            /* regpc=0xADDR:LABEL : log LR+r0..r3+sp at ADDR (unconditional) */
+            uint64_t a; char *l;
+            if (parse_pc_arg(kv[1], &a, &l)) {
+                if (!regpcs) {
+                    regpcs = g_array_new(false, false, sizeof(RegPC));
+                }
+                RegPC rp = { a, l, -1, 0, 0, 0, 0, 0, false };
+                g_array_append_val(regpcs, rp);
+            }
+        } else if (!g_strcmp0(kv[0], "sendex") && kv[1]) {
+            /* sendex=0xADDR:REG:WANT[:LABEL] : log only when gdb reg REG==WANT */
+            g_auto(GStrv) f = g_strsplit(kv[1], ":", 4);
+            if (f[0] && f[1] && f[2]) {
+                uint64_t a = g_ascii_strtoull(f[0], NULL, 16);
+                int reg = (int)g_ascii_strtoull(f[1], NULL, 10);
+                uint32_t want = (uint32_t)g_ascii_strtoull(f[2], NULL, 16);
+                char *l = f[3] ? g_strdup(f[3])
+                               : g_strdup_printf("r%d==0x%x", reg, want);
+                if (!regpcs) {
+                    regpcs = g_array_new(false, false, sizeof(RegPC));
+                }
+                RegPC rp = { a, l, reg, want, 0, 0, 0, 0, false };
+                g_array_append_val(regpcs, rp);
+            }
         } else if (!g_strcmp0(kv[0], "memwpc") && kv[1]) {
             /* memwpc=0xADDR:LABEL : log store dest addresses at this PC */
             uint64_t a; char *l;
@@ -447,6 +633,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
     range_tbl = g_hash_table_new(g_int64_hash, g_int64_equal);
     memw_pcs = g_hash_table_new(g_direct_hash, g_direct_equal);
+    reg_buf = g_byte_array_new();
 
     watch = g_array_new(false, false, sizeof(WatchPC));
 
@@ -486,9 +673,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
     }
 
-    if (watch->len == 0) {
-        fprintf(stderr, "pctrace: no PCs to watch (use pc=... or drop "
-                        "nodefault)\n");
+    if (watch->len == 0 && !(regpcs && regpcs->len) && !(memwpc && memwpc->len)
+        && !memw_hi && !range_hi) {
+        fprintf(stderr, "pctrace: nothing to watch (use pc=/regpc=/sendex=/"
+                        "memw=/memwpc=/range= or drop nodefault)\n");
         return -1;
     }
 
@@ -503,6 +691,20 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         fprintf(out, "    mem-write watch 0x%08" PRIx64 "-0x%08" PRIx64
                 " (store PC+addr, always-on, cap=%" PRIu64 ")\n",
                 memw_lo, memw_hi, memw_cap);
+    }
+    if (regpcs) {
+        for (guint i = 0; i < regpcs->len; i++) {
+            RegPC *rp = &g_array_index(regpcs, RegPC, i);
+            if (rp->cond_reg >= 0) {
+                fprintf(out, "    reg-read (sendex) %-12s @0x%08" PRIx64
+                        "  gate r%d==0x%" PRIx32 "  cap=%" PRIu64 "\n",
+                        rp->label, rp->pc, rp->cond_reg, rp->want, regpc_cap);
+            } else {
+                fprintf(out, "    reg-read (regpc)  %-12s @0x%08" PRIx64
+                        "  LR+r0..r3+sp  cap=%" PRIu64 "\n",
+                        rp->label, rp->pc, regpc_cap);
+            }
+        }
     }
     for (guint i = 0; i < watch->len; i++) {
         WatchPC *w = &g_array_index(watch, WatchPC, i);
