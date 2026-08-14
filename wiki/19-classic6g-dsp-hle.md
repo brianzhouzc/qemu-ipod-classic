@@ -707,3 +707,79 @@ el siguiente esfuerzo va al setup síncrono del decode, no al pacing del DMA.
 **Higiene:** cero cambios en fuentes del modelo (sólo lecturas/breakpoints gdb y
 `pctrace`, ya en el árbol). Árbol byte-idéntico al baseline. Rockbox/navtest intactos.
 Instrumentación de sesión en `~/dbg/` del WSL (fuera del repo).
+
+### 11.12 El muro re-caracterizado por MEDIDA: NO es un evento de hardware — es un deadlock de rendezvous puro (y correcciones a §11.6/§11.8/§11.F)
+
+Sesión de medición dedicada al grafo de espera y al setup del decode. Play limpio de
+`~/6g/Emulti.img`, `AUDIOPACE=1`, disparado por Shuffle Songs. Todo lo de abajo
+**VERIFICADO** por lectura/breakpoint gdb (no invasivo) o instrumentación temporal del
+modelo (revertida). Recetas en `~/dbg/` (`probe6.sh`=wgraph, `probe7.sh`=HW+timers,
+`probe8.sh`=codec-setup, `probe9.sh`=tasas de ISR; `catch5.gdb`, `catch_setup.gdb`).
+
+**A) La pista es AAC-LC, NO ALAC (corrige §11.F). Y el códec SÍ se configura (refuta la
+hipótesis "AAC → rama default").** Las 6 pistas de `Emulti.img` son `mp4a` en el `stsd`
+(esds objectTypeIndication `0x40`, ASC `0x1210` = AAC-LC 44100/estéreo), medido con
+`ffprobe`+volcado del `stsd`. La cadena "alac" que vieron sesiones previas es la tabla
+fourcc del demuxer + bytes de `mdat`, no la sample entry. **CORRECCIÓN de dirección:** el
+getter `0x08015860`→IRAM `0x22006078` devuelve la struct de estado en **`0x220106dc`**
+(no `0x22008c4c`, que es sólo un latch de init interno); el tipo de códec vive en
+`0x22010734` (+0x58) y el gate en `0x22010723` (+0x47). Con breakpoints de baja
+perturbación (`probe8.sh`) se MIDIÓ en vivo durante el setup: `CODEC_SETUP`
+(IRAM `0x22006574`) corre con **type=0x01**, `GATE_SET` (`0x220065ac`) pone gate=1, y el
+motor `0x0808170c` lee **gate=1, type=1** → toma el **caso 1** del switch (`0x0808182c`),
+que SÍ cablea el pipeline. **El tipo 1 es un caso manejado; el motor se configura bien.**
+(Las lecturas snapshot que daban type=0xff/gate=0 son *post-teardown*: el estado se
+reinicializa cuando la reproducción falla — un espejismo. Medir en vivo, no en el atasco.)
+
+**B) El grafo de espera exacto (regime A, deadlock estable, resets=0, `wgraph.py`).**
+- **t2a** (decodificador AAC, cluster `0x08123xxx`) BLOQUEADO recibiendo en **buzón 0x09**
+  (`0x08977964`); `M09.seq≈52` → StreamCache le sirvió ~52 trozos. Está **hambriento**
+  (esperando input), no fallando al decodificar.
+- **t25** (motor de audio) BLOQUEADO recibiendo en **buzón 0x52** (`0x08978284`);
+  `M52.seq≈18-20`. Corrió su setup UNA vez (type 1) y espera comandos.
+- **t20** (StreamCache) BLOQUEADO recibiendo en **exchange 6** (`sema[6]=0x20`,
+  `0x0897fb34`). Es el SERVIDOR: dueño de los buzones 0x09/0x52/0x4e.
+- t20 sirvió ~52/18 veces y luego se durmió en exchange 6 esperando el disparo #53. El
+  punto de atasco es **reproducible/determinista** (M09≈52-53, M52≈18-20 en 4 corridas).
+
+**C) NO hay evento de hardware perdido ni mal temporizado — DESCARTADO por medida directa
+(`catch5.gdb` en el atasco).** VIC0 `RawIntr=0` (CERO IRQ pendiente), `IntEnable=0x21a7010f`
+(irq16 DMAC0 e irq29 ATA habilitados). DMAC0 `RawIntTC=0`, **ch0 (almacenamiento) IDLE
+(E=0)** — el disco ya está leído, no hay DMA colgado; ch1 (audio) sigue E=1 dando vueltas
+a su LLI. ATA quiescente (transfer completo). **No hay ninguna interrupción pendiente que
+el guest no esté sirviendo.**
+
+**D) Las ISR que importan SÍ disparan, continuamente, DENTRO del atasco — DESCARTA "tick
+muerto"/"IRQ perdida" (instrumentación temporal `IRQDBG`, `probe9.sh`).** El **tick RTXC
+de 1 kHz** (timer B, 16-bit, ECLK/2, DATA0=6000, INT_EN, IRQ 8) dispara **~1000/s** sin
+parar durante el deadlock. La **IRQ 16 de audio (DMAC0 ch1)** dispara **~50/s** (tempo
+real, ~43 ráfagas/s de 2048 muestras). El almacenamiento (ch0) está parado (disco leído).
+Es decir: el scheduler RTXC recibe su tick 1000 veces por segundo y el driver de salida su
+IRQ 50 veces por segundo, **y aun así nadie señala el exchange 6.**
+
+**RE-ENCUADRE FINAL (medido, honesto):** el muro **NO** encaja en ninguno de los tres casos
+de "arreglo en el modelo por evento de periférico": no hay evento externo mal temporizado
+(C: sin IRQ pendiente), no es que el tick/DMA falte (D: ambos vivos), y no hay latencia de
+hardware que reproducir (el disco/ATA/SM1 están correctos y ociosos). Es un **deadlock de
+rendezvous inter-tarea PURO**: el `KS_send`/`signal` al exchange 6 que despertaría a
+StreamCache proviene de una tarea del **camino de datos** que está ella misma bloqueada
+(t2a hambrienta ↔ t20 en ex6 ↔ t25 en buzón 0x52). El primer dominó —la PRIMERA muestra de
+PCM (`copy32 0x08016eb4` = 0 siempre)— nunca se produce, así que el ciclo
+productor↔consumidor nunca arranca, y ni el tick de 1 kHz ni la IRQ de audio lo rompen
+(sus manejadores no tocan el exchange 6 mientras el buffer drenado sea silencio).
+
+**Lo que queda DESCONOCIDO (el obstáculo exacto):** QUIÉN debería señalar el exchange 6 en
+el arranque en frío y por qué su tarea no corre. Es un problema de protocolo del framework
+MeCCA (bootstrap del pipeline), no de un registro/temporización de periférico. Como la
+carrera regime-A/regime-B es sensible a la velocidad del guest (instrumentación pesada →
+regime B), atrapar el `send`-a-exchange-6 en vivo exige una sonda de MUY baja perturbación
+(los watchpoints sobre la página de datos del kernel `0x0897xxxx`, que es caliente, empujan
+a regime B). Vía sugerida: localizar el veneer del primitivo `send-exchange` de RTXC (opcode
+del KS, tabla en `0x22003620`) y ponerle un breakpoint condicionado al índice 6 —
+suficientemente raro para no perturbar— para leer el LR del emisor de los ~52 señales que SÍ
+ocurren antes del atasco, y ver por qué se detiene la #53.
+
+**Higiene:** instrumentación `IRQDBG` (contadores en `hw/dma/pl080.c` y
+`hw/arm/ipod_classic/ipod_classic_timer.c`) **revertida**; árbol byte-idéntico al baseline;
+recompila y enlaza limpio. Cero PCM inyectado, cero parche de firmware. `pctrace` intacto.
+Rockbox/navtest sin tocar (los caminos medidos son sólo lecturas del retailOS).
