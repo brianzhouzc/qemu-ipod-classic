@@ -1321,3 +1321,155 @@ REVERTIDO tras medir (sólo esta doc se commitea). Rockbox/navtest 6G/5G intacto
 (el shim era inerte sin la env; el árbol final es baseline). Recetas de sesión en
 `~/dbg/` (`run_rk.sh`, `run_rk2.sh`, `run_rksnap.sh`, `rk_probe.py`,
 `rk_probe2.py`), fuera del repo.
+
+### 11.18 El DOBLE KICK (`HLE_DUAL_KICK`): el decode del HUÉSPED SÍ corre por primera vez, pero productor y consumidor están DESLIGADOS en frío — deadlock simétrico confirmado a nivel de instrucción, sin arreglo de kick
+
+Sesión de **implementación** del doble kick que las dos investigaciones de cierre
+(cebado del decoder + orden/timing) especificaron: cebar el DECODER (que produzca
+la trama 0) **y** el MOTOR (que la consuma), a la vez / decoder-primero, para
+romper el deadlock simétrico. Se construyó, se **corrigió el punto de entrega del
+decoder** a nivel de instrucción, y se **midió** con navegación FIABLE. VA = off +
+`0x07FF51B8`; IRAM en `0x22xxxxxx`. Todo **VERIFICADO** por desensamblado directo
+(`~/6g/osos.dis`/`iram.dis`), snapshot gdb no invasivo de un play navegado fiable, y
+contadores `pctrace` (`pc=`/`memw=`/`memwpc=`). Disco `Emulti.img`, `AUDIOPACE=1`,
+SELECT fiable. Recetas nuevas en `~/dbg/` (`run_dk.sh`, `run_dksnap.sh`,
+`run_dk_snap2.sh`, `dk_probe.py`, `dk_probe2.py`); shim en `~/dbg/hle_dual_kick_shim/`.
+
+**Corrección VERIFICADA del punto de cebado del decoder (a nivel de instrucción).**
+El dispatcher `0x08123dcc` conmuta por `[msg+4]`: **12**→watchdog `0x8123970`
+(§11.16, confirmado); **19**→`blx [[msg]+20](msg)` y luego `switch 0x8123cfc(obj,
+[retval+8])`; default→`0x80eaebc`. El `switch 0x8123cfc` conmuta por
+`[[retval+8]+4]-0x52800000` (10 casos): **caso 1** (`0x52800001`, `0x8123d64`) →
+`bl 0x81232d8` = **DECODE-de-trama**; **caso 7** (`0x52800007`, vía `0x81235d0`) →
+`bl dstep 0x08123284` → `bl 0x8025ac4` (pide entrada por ex6 + **RECV mbox 9**, DONDE
+BLOQUEA). El decoder vivo está procesando un caso-7 (cadena de retorno medida
+`0x08025b04→0x081232a4(dstep)→0x081236c8(caso7)→0x08123da8(switch)→0x08123e20(disp)`).
+El DECODE real cuelga del caso-1 `0x81232d8`: en `0x8123390` hace
+`blx [[ctx]+104]`=`0x081c0a1c` (decode-method) → `0x081c1508` (frame-pull) →
+`reader->vtable[16]`=`0x081e93d8` (pull) → bucle sobre `0x081e9e70` (la math del
+códec por-bloque). Alcanzable sólo si `ctx=[obj+0x34]!=0`, `[obj+0x84]==0`,
+`[obj+0x38]==0` — **los tres se cumplen en vivo** (snapshot: `ctx=0x0ba90c50`,
+`gate[ctx+0x60]=0x4`).
+
+**El shim (GATEADO, build por defecto byte-idéntico).** `HLE_DUAL_KICK=1`: un timer
+de reloj virtual, desde el idle RTXC (`pc∈[0x22003b0c,0x22003b34)`, sin pisar tareas
+vivas), **alterna decoder-primero**: (1) DECODER = llamar la caso-1 propia del huésped
+`0x081232d8(r0=decoder_obj, r1=0)` — decodifica la trama **y** la publica
+(`ctx->vtable[100]=0x081c12ac` + ops de mensaje); `r1=0` hace que el post-decode
+`0x81235d0` vea `r7==0` y SALTE el dstep de entrada (que haría RECV mbox 9), así **no
+bloquea** — VERIFICADO que decode-method/frame-pull/pull/publish no tienen KS-wait; el
+lock `0x805c430` de `ctx+80` está descontendido (t2a aparcado en el verbo de entrada,
+no lo tiene). (2) MOTOR = `[engobj+71]=1` + timbre `0x22006870` (§11.17). Se gatea el
+motor a que el decoder ya esté construido (nunca timbrar en frío durante el boot).
+Cero PCM inyectado. Knobs: `_DEC_ONLY`, `_MOTOR_ONLY`, `_CFG` (fuerza `+88=1/+70=1`),
+`_DEC_MAX`, `_TRACE`.
+
+**A) HALLAZGO POSITIVO: el DECODE del huésped SÍ CORRE — primera vez en 11 sesiones.**
+Con el doble kick (decoder-primero, caso-1 decode+publish), MEDIDO:
+`decmeth 0x081c0a1c = 4192`, `fpull 0x081c1508 = 4192`, `rpull 0x081e93d8 = 4193`,
+**`innerdec 0x081e9e70 = 1`**. Es decir: el kick alcanza y ejecuta la **math AAC del
+huésped** (la que §11.9-§11.16 midieron como "nunca corre": `range` sólo veía
+`ParseASC`=config). El mecanismo de entrega decoder-primero funciona y llega al decode.
+
+**B) PERO el decode corre UNA sola vez — la puerta de habilitación de producción está a 0.**
+`innerdec=1` pese a 4192 llamadas a caso-1. El `rpull 0x081e93d8` sale temprano
+(`0x81e93f8 beq`) porque su puerta **`[[reader+0x30]+0x2b8]` = 0** (snapshot baseline:
+`reader=0x0ba61f50`, `[reader+4]ring=ctx`, `decode-gate[[+48]+0x2b8]=0x00000000`). Esa
+puerta es el crédito "puedes producir una trama" que gobierna **StreamCache**; a 0, el
+decoder no puede producir la trama 1. Es una hambruna de **slot de salida**, no de datos.
+
+**C) copy32 = 0: la trama publicada NUNCA llega al motor — productor y consumidor DESLIGADOS.**
+Aun forzando la config del motor (`_CFG`: `[engobj+88]=1`, `[engobj+70]=1`), MEDIDO:
+`copy32 0x08016eb4 = 0`; el motor t25 despierta del timbre, **sondea su fuente
+`srcpoll 0x22005e48 = 19×` y la halla SIEMPRE VACÍA**; `dpump 0x22006118 = 1` (sólo el
+bring-up), `dpgateclr 0x22006308 = 0` (nunca cierra un ciclo de render). El descriptor
+de copia del motor **`0x0bb12d54 = 5da35da3 5da35da3…` (relleno de heap SIN
+inicializar; `[descr+5]=0x5d≠1`)** — la vinculación fuente↔copia que el propio render
+inicializaría NO existe en frío. Y `memw 0x08888000-0x0888c000` = **sólo memset**
+(`0x22000198`/`0x220001a0`), CERO escrituras del decoder a la fuente del mixer. La trama
+que el decode produjo/publicó quedó en el buffer interno del reader; **no hay camino
+cableado a la fuente (basura) del motor**. `CODEC_SETUP 0x22006574` corrió (`hits=1`)
+pero su config de render está ausente en el atasco (`[engobj+88]=0xff`, `+71=0`, `+70=0`
+= valores del ctor `0x220068e4`; espejismo post-teardown de §11.12-A/§11.13-A).
+
+**D) El deadlock simétrico, ahora a nivel de instrucción (VERIFICADO).** Cada mitad
+está gateada por la salida en régimen del OTRO:
+- Productor: `decode` ⟸ puerta `[[reader+0x30]+0x2b8]!=0` ⟸ StreamCache da crédito ⟸
+  buffer de salida liberado ⟸ el motor renderiza (`copy32`) ⟸ PCM en la fuente ⟸ decode.
+- Consumidor: `copy32` ⟸ `[descr+5]==1` + descriptor `0x0bb12d54` inicializado ⟸ el
+  render propio del motor ⟸ fuente con PCM ⟸ el decode publicó ⟸ productor habilitado.
+Las tres esperas del lazo son rendezvous inter-tarea (t2a RECV mbox 9 dentro del verbo
+de entrada; t25 RECV en el timbre; t20 RECV ex6), **ninguna es poll de HW** (coherente
+con §11.12-D/§11.16). Cebar UN extremo desde el idle da **un paso transitorio** (1
+decode; 1 wake del motor), nunca un ciclo autosostenido, porque los recursos
+compartidos (crédito de producción, descriptor de salida inicializado) sólo los produce
+el pipeline en marcha, no un timbre ni una llamada-a-decode.
+
+**VEREDICTO (medido, honesto): el retailOS NO suena con el doble kick.** Hasta dónde
+llegó cada lado, con evidencia:
+1. **¿El decoder decodeó?** SÍ — la math AAC del huésped (`innerdec 0x081e9e70`)
+   **ejecutó por primera vez** (todas las sesiones previas: 0). Pero **UNA sola trama**:
+   la puerta de producción `[[reader+0x30]+0x2b8]` está a 0 (StreamCache no da crédito).
+2. **¿Escribió PCM en `0x08888xxx`?** NO — la fuente del mixer recibió sólo memset; el
+   decode escribió en el buffer interno del reader y la publicación quedó desligada de la
+   fuente (basura) del motor.
+3. **¿`copy32` subió de 0?** NO — invariante. El motor sondea su fuente vacía (19×) y no
+   renderiza; su descriptor de copia `0x0bb12d54` está sin inicializar. Forzar `+88/+70`
+   no ayuda (el problema es la VINCULACIÓN de la fuente, no el tipo).
+4. **¿Autosostenido?** NO. WAV = clic de UI (`nonzero=0.22 %`, `L==R`, pico 11444;
+   §11.16-F), nada que correlacionar con el AAC.
+
+**Es el VEREDICTO ESTRUCTURAL firme:** el doble kick avanza el estado **más que las 10
+sesiones previas** (el decode del huésped corre), pero el deadlock de bootstrap
+**simétrico** no se abre: las puertas de cebado de cada mitad
+(`[[reader+0x30]+0x2b8]` en el productor; `[descr+5]` + descriptor `0x0bb12d54` sin
+init en el consumidor) las alimenta el estado-en-régimen de la OTRA mitad, y ningún kick
+(timbre/decode-call/config) desde el idle las fabrica. Lo único que quedaría es un **HLE
+COMPLETO del camino de datos** decoder↔motor: sintetizar el flujo de tramas y los
+créditos/descriptores de buffer — lo que es **inyectar PCM/falsear estado**, prohibido
+por las reglas (el PCM debe producirlo el decoder del huésped y fluir por su propio
+protocolo). No hay palanca de kick, ni valor de HW, ni orden/timing que cierre el lazo.
+
+**Direcciones nuevas VERIFICADAS esta sesión (disasm + snapshot vivo):**
+- dispatcher `0x08123dcc` (tipo-12→watchdog `0x8123970`; tipo-19→`blx [[msg]+20]` +
+  `switch 0x8123cfc`); `switch 0x8123cfc` conmuta `[[retval+8]+4]-0x52800000`: **caso 1
+  → `0x81232d8` (decode)**, caso 7 → `0x81235d0` → dstep.
+- decode-de-trama caso-1 `0x081232d8` (gate: `ctx=[obj+0x34]!=0`, `[obj+0x84]==0`,
+  `[obj+0x38]==0`); decode-method `[[ctx]+104]=0x081c0a1c`; frame-pull `0x081c1508`
+  (`reader=[ctx+0x48]`, pull=`reader->vtable[16]`); reader-pull `0x081e93d8` (puerta
+  `[[reader+0x30]+0x2b8]`, ring=`[reader+4]`); **inner-decode/math AAC `0x081e9e70`**;
+  publish `ctx->vtable[100]=0x081c12ac` (no bloqueante).
+- verbo de entrada `0x8025ac4`: SELECT-mbox9 `0x8015730→0x22003f7c`, SEND-ex6
+  `0x8015740→0x22004138`, **RECV-mbox9 `0x8015738→0x22004260`** (bloqueo). El verbo NO
+  lee la respuesta: el RECV es puro handshake.
+- snapshot vivo (atasco, baseline): `decoder_obj=0x0ba9a8a4` vt=`0x088d1948`
+  ctx=`0x0ba90c50` vt=`0x088daa4c`; reader vt=`0x088de828`; **`decode-gate[[reader+0x30]
+  +0x2b8]=0`**; **descriptor motor `0x0bb12d54=0x5da35da3` (sin init)**; `engobj+88=0xff`.
+- motor: `srcpoll 0x22005e48` (`bx [[[src]]+28]`), `dpump 0x22006118`, `dpgateclr
+  0x22006308`, `CODEC_SETUP 0x22006574` (corre `hits=1`, config torn-down en el atasco).
+
+**Correcciones al registro (VERIFICADAS):**
+1. **REFINA "cebar-decoder" (report decoder-in):** el decode NO es inalcanzable — la
+   caso-1 `0x81232d8` desde el idle **sí ejecuta la math AAC del huésped** (`innerdec=1`).
+   Lo que falta no es el disparo sino el **crédito de producción** (`[[reader+0x30]
+   +0x2b8]=0`) que gobierna StreamCache.
+2. **REFINA "orden/timing" (report orden):** el motor NO sólo necesita el timbre; su
+   **fuente/descriptor `0x0bb12d54` está SIN INICIALIZAR** (no sólo `+88=0xff`), y forzar
+   `+88=1/+70=1` no rinde (`copy32=0`). La vinculación productor→consumidor no existe en
+   frío; no es un campo que forzar sino un binding de render que sólo el render crea.
+3. **CODEC_SETUP `0x22006574` SÍ corre** (`hits=1`), refinando la duda de §11.17-D: su
+   config de render se ve `0xff`/`0` en el atasco por **teardown**, no por no-ejecución.
+
+**Decisión sobre el shim: REVERTIDO (mudo), finding conservado (regla §11.17).** El shim
+es limpio, gateado y default-inerte (build por defecto byte-idéntico; navtest 6G/5G y
+Rockbox sin cambios con la env sin poner), y su **mecanismo de entrega del doble kick
+está validado** (decoder-primero desde el idle, decode+publish no bloqueante) — pero **no
+produce audio** (el lazo simétrico no cierra). Se revierte la fuente y se conserva SÓLO
+esta documentación medida. Reproducible: shim en `~/dbg/hle_dual_kick_shim/`, gateado por
+`HLE_DUAL_KICK`.
+
+**Higiene:** `HLE_DUAL_KICK`/`HLE_RENDER_KICK` off por defecto → build byte-idéntico;
+shim REVERTIDO tras medir (sólo esta doc se commitea). Rockbox/navtest 6G/5G intactos
+(el árbol final es baseline; navtest 6G y 5G corridos de verdad al cierre). Recetas de
+sesión en `~/dbg/` (`run_dk.sh`, `run_dksnap.sh`, `dk_probe.py`, `dk_probe2.py`) y shim
+en `~/dbg/hle_dual_kick_shim/`, fuera del repo.
