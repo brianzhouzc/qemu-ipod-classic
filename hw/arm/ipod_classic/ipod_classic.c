@@ -28,6 +28,7 @@
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
@@ -777,6 +778,16 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SM1_MEM_BASE);
     /* The engine's playback position tracks what the I2S clocks out. */
     ipod_classic_sm1_set_i2s(IPOD_CLASSIC_SM1(dev), nms->i2s);
+
+    /*
+     * The audio data-path HLE. A no-op unless HLE_AUDIO_DATAPATH is set; when it
+     * is, the host decodes the guest's own song (from the same disk image) and
+     * feeds the PCM into DMAC0 channel 1 -- the channel that drains the audio
+     * ping-pong to the I2S FIFO -- so the retailOS plays its real song through
+     * its own I2S despite the MeCCA decode deadlock. See ipod_classic_hle_audio.c
+     * and wiki/19 section 11.19. Default build is byte-identical.
+     */
+    ipod_classic_hle_audio_init(cpu, dmac0, nms->i2s);
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

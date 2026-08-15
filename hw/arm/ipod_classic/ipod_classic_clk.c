@@ -13,10 +13,12 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "exec/cpu-common.h"
+#include "hw/core/cpu.h"
 #include "migration/vmstate.h"
 #include "sysemu/runstate.h"
 #include "qemu/error-report.h"
 #include "hw/arm/ipod_classic/ipod_classic_clk.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /*
  * The 256 bytes at the top of IRAM1 that the bootrom and the OS use to talk to
@@ -86,9 +88,33 @@ static void ipod_classic_clk_write(void *opaque, hwaddr offset,
                     tag[i] = '.';
                 }
             }
+            CPUState *cs = current_cpu;
+            uint32_t pc = cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0;
+
+            /*
+             * HLE audio: while the shim is actively feeding the guest's own I2S
+             * with the decoded song, the retailOS MeCCA pipeline is still in its
+             * symmetric bootstrap deadlock (wiki/19 11.12-11.18), so its play
+             * task stalls and its watchdog reboots the device (the blank "----"
+             * image tag) ~15 s in -- which would cut the song off and stop the
+             * Now Playing screen from ever settling. Suppress ONLY that
+             * watchdog reboot (blank tag) and ONLY while the HLE is playing, so
+             * the song can run to the end through the guest's own DMA/I2S. Real
+             * reboots (diskmode/softupdt/retailOS tags, and any reboot when the
+             * HLE is not active) are untouched. Gated entirely by
+             * HLE_AUDIO_DATAPATH; default build unaffected.
+             */
+            if (ipod_classic_hle_audio_active() && tag[0] == '-') {
+                warn_report("S5L8702: SUPPRESSED deadlock-watchdog reboot "
+                            "(SWRCON=0x%" PRIx64 ", pc~0x%08x) -- HLE audio is "
+                            "playing the guest's song", value, pc);
+                s->reg[offset / 4] = value;
+                break;
+            }
+
             warn_report("S5L8702: guest asked for a software reset "
-                        "(SWRCON = 0x%" PRIx64 "), next image \"%s\"",
-                        value, tag);
+                        "(SWRCON = 0x%" PRIx64 "), next image \"%s\" pc~0x%08x",
+                        value, tag, pc);
             s->reg[S5L8702_CLK_RSTSR / 4] |= S5L8702_RSTSR_SWR;
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         }

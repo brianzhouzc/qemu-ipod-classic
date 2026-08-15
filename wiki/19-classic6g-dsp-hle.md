@@ -1473,3 +1473,94 @@ shim REVERTIDO tras medir (sólo esta doc se commitea). Rockbox/navtest 6G/5G in
 (el árbol final es baseline; navtest 6G y 5G corridos de verdad al cierre). Recetas de
 sesión en `~/dbg/` (`run_dk.sh`, `run_dksnap.sh`, `dk_probe.py`, `dk_probe2.py`) y shim
 en `~/dbg/hle_dual_kick_shim/`, fuera del repo.
+
+### 11.19 El HLE del CAMINO DE DATOS (`HLE_AUDIO_DATAPATH`): el retailOS saca SU canción real por su propio I2S — decode host-side, como el VideoCore del 5G
+
+Sesión de IMPLEMENTACIÓN de la vía que §11.18 dejó especificada. Como el pipeline
+de decode MeCCA está en el deadlock de arranque simétrico cerrado por medida en
+§11.12–11.18 (no se auto-ceba bajo emulación fiel), se decodifica **en el host** la
+MISMA canción que el huésped lee de SU disco y se entrega el PCM al buffer que el
+DMA/I2S PROPIO del huésped transporta al códec — exactamente el patrón HLE del
+VideoCore del 5G (`hw/arm/ipod_video/ipod_video_vc.c`). Gateado por
+`HLE_AUDIO_DATAPATH`; build por defecto byte-idéntico (Rockbox y navtest intactos).
+
+**El shim (`hw/arm/ipod_classic/ipod_classic_hle_audio.c`, gateado).**
+1. **Parsea la FAT del disco del huésped** (MBR → FAT32) y enumera los ficheros de
+   audio. IDENTIFICA la pista por las PROPIAS lecturas ATA del huésped: el read
+   DMA que cae en el rango de datos de un fichero (hook en `ipod_classic_ata.c`
+   vía `ide_get_sector`). Así se decodifica la MISMA canción que el huésped abrió.
+2. **Decodifica esa pista en el host con ffmpeg** → PCM 16-bit estéreo 44100
+   (único paso host-side; lee la MISMA imagen cruda del `-drive`; corre en un hilo
+   aparte para no congelar la vCPU).
+3. **Alimenta el PCM al canal 1 de DMAC0** (el que drena la ping-pong a la FIFO
+   del I2S): en `i2s_drain`, antes de cada ráfaga paced (`pl080_pace_request`),
+   escribe el siguiente trozo en `ch->src`; el cursor de lectura avanza SÓLO por
+   lo que la ráfaga consumió (`moved`=Δtx_samples), no por los ticks de sondeo —
+   así la canción sigue el reloj real (fill/commit).
+
+**Correcciones VERIFICADAS a la investigación previa (importantes).**
+- **La canción del huésped NO es AAC.** Los 6 M4A/AAC que la investigación de
+  ENTRADA carveó (offsets crudos 8.5–55.7 MB) están **FUERA de la partición FAT** y
+  NO son lo que el huésped reproduce. La biblioteca real vive en la FAT32 (empieza
+  en el byte **92962816**), en `/iPod_Control/Music/Fxx/`: **4 MP3** (48 kHz,
+  `libgpodNNN.mp3`) **byte-idénticos** entre sí = **una sola canción**
+  ("Numb / Encore"). El huésped saca a 44100 (CLKDIV 272) → se decodifica a 44100.
+- **Disco de sectores lógicos de 4096 B (4Kn).** Las LBA del MBR van en unidades de
+  4096 (part1 LBA 22696 × 4096 = 92962816 = boot sector FAT); el scanner prueba
+  ×512 y ×4096 y valida la firma de boot.
+- **El huésped SÍ lee los datos del MP3 al reproducir de verdad** (regime A), pero
+  su reproducción es NO DETERMINISTA (§11.11 A/B): a veces lee el fichero (→ ID por
+  lectura), a veces se atasca antes (regime B). Para robustez, un **fallback**
+  decodifica la ÚNICA canción del disco (cuando la biblioteca es inequívoca: los 4
+  ficheros idénticos) al detectar el arranque de reproducción — por el edge de
+  CLKCON (reconfig de reloj del play, que el boot no hace) o por una lectura del
+  área de datos FAT una vez pasado el boot (I2S ha sonado >~34 s, así que es el
+  usuario abriendo un fichero, no el escaneo de arranque).
+
+**Medida (navegación FIABLE, `AUDIOPACE=1`, `Emulti.img`).**
+- ID + decode: p.ej. `identified guest track N (file stream, disk offset ...)`;
+  `decoded track N -> 36400496 PCM bytes (206.4 s @ 44100 stereo) -- feeding`.
+- **El feed es CONTIGUO y al ritmo real** (traza de drenado VERIFICADA): src alterna
+  la ping-pong `0x22008c5c`/`0x22009c5c`, `count=moved=2048` por ráfaga, cursor
+  `0→4096→8192→…` monótono.
+- **Correlación WAV (capturado de la FIFO del I2S del huésped) vs el MP3 del
+  disco: Pearson=1.000** en régimen, con el offset avanzando 1:1 con el tiempo
+  (`wav+2s→song 1.62s`, `wav+4s→song 3.62s`); pico WAV 30420 ≈ pico del MP3 30653;
+  estéreo real (RMS(L−R)≫0). Es la MISMA canción, contigua, en tono. Ruido de
+  fondo del correlador ~0.02–0.05 (silencio del baseline). ⇒ **SUENA la canción
+  real del retailOS, por su propio DMA→I2S→CS42L55.**
+
+**El obstáculo exacto que QUEDA (honesto).** El motor de render del huésped sigue
+en el deadlock: `copy32 (0x08016eb4)=0`; el motor `0x0808170c` corre UNA vez a los
+~15 s (watchdog §11.16) y no renderiza. Consecuencias:
+1. **La pantalla Now Playing NO avanza / no aparece:** la UI del huésped no
+   transiciona porque su pipeline de reproducción está atascado; el shim entrega el
+   audio AGUAS ABAJO de ese motor. El shim rompe el silencio, no el deadlock.
+2. **Watchdog de reinicio:** sin más, el retailOS reinicia (`SWRCON=0xaa5`, escrito
+   en `0x08322b24`, luego spin de nops en `0x08322b28`) ~15 s tras `StartPlayback`
+   (el baseline sin HLE también: es el deadlock del huésped). Corta la canción.
+   - **`HLE_AUDIO_SUSTAIN` (opt-in):** el modelo de reloj suprime SÓLO ese
+     reinicio-watchdog (tag en blanco "----") mientras el HLE alimenta audio → la
+     canción suena ENTERA por el DMA/I2S del huésped. Coste honesto: la CPU del
+     huésped queda congelada en el spin `0x08322b28` (su intento de reproducir
+     falló en el deadlock); el audio continúa porque el DMA es HW y el fill corre
+     en el timer del host. Sin el flag, el huésped sigue su ciclo normal (suena
+     ~15 s y su watchdog reinicia).
+
+Cerrar el punto 1 (UI + que el motor del huésped renderice él mismo) es el muro de
+§11.12–11.18 (cebar el pipeline MeCCA para `copy32>0`), no abierto aquí.
+
+**Honestidad.** El PCM es la canción REAL del disco del huésped (correlaciona con
+el mismo MP3 decodificado aparte); sale por el I2S PROPIO del huésped
+(DMAC0 ch1 → FIFO 0x3ca00010 → CS42L55), no por un bypass del sumidero. Lo ÚNICO
+host-side es DÓNDE se decodifica el audio comprimido — un HLE del camino de datos.
+El huésped conduce la apertura del fichero y el arranque de reproducción; el shim
+suple el PCM que su decoder atascado no produce, y (opcional) evita que su watchdog
+de deadlock se auto-reinicie. La UI de Now Playing NO avanza (obstáculo anotado).
+
+**Higiene / gating.** Todo bajo `HLE_AUDIO_DATAPATH` (`_TRACE`, `_TRACK`,
+`_SUSTAIN`, `_DISK`); sin la env el shim no instala nada y la máquina es
+byte-idéntica. Hooks: `ipod_classic.c` (init), `ipod_classic_i2s.c` (fill+commit,
+edge de reloj), `ipod_classic_ata.c` (offset de lectura para ID),
+`ipod_classic_clk.c` (supresión gateada del reinicio-watchdog). Regresiones:
+navtest 6G y Rockbox (rbmusic) con la env sin poner — sin cambios.

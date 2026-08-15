@@ -38,6 +38,7 @@
 #include "hw/core/cpu.h"
 #include "audio/audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /* ------------------------------------------------------------- tracing */
 
@@ -428,9 +429,20 @@ static void ipod_classic_i2s_drain(void *opaque)
     if (!s->tx_running || !s->dmac0) {
         return;
     }
+    /*
+     * DATA-PATH HLE: fill the audio DMA channel's current source segment with
+     * the next chunk of the host-decoded real song, one burst ahead of the
+     * drain, so the paced request below transports the real PCM to the FIFO.
+     * A no-op unless HLE_AUDIO_DATAPATH is set and a track has been decoded.
+     */
+    ipod_classic_hle_audio_fill_dma();
+
     before = s->tx_samples;
     pl080_pace_request(s->dmac0, S5L8702_I2S_DMA_IIS0_TX);
     moved = s->tx_samples - before;   /* 16-bit samples this chunk */
+
+    /* Advance the HLE PCM cursor by what the burst actually consumed. */
+    ipod_classic_hle_audio_commit((uint32_t)moved);
 
     rate = i2s_sample_rate(s);
     if (moved >= 2) {
@@ -548,7 +560,16 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
     IPodClassicI2SState *s = opaque;
 
     switch (offset) {
-    case S5L8702_I2S_CLKCON: s->clkcon = value; break;
+    case S5L8702_I2S_CLKCON: {
+        bool was_en = s->clkcon & 1;
+        s->clkcon = value;
+        /* Disable edge = the retailOS re-configuring the clock for a real play
+         * (boot's silence init never disables). Signal the HLE play trigger. */
+        if (was_en && !(value & 1)) {
+            ipod_classic_hle_audio_notify_clock_reconfig();
+        }
+        break;
+    }
     case S5L8702_I2S_TXCON:  s->txcon = value;  break;
     case S5L8702_I2S_TXCOM: {
         bool was_running = s->tx_running;
@@ -556,6 +577,7 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
         s->tx_running = (value & S5L8702_I2S_TXCOM_RUN) != 0;
         if (s->tx_running && !was_running) {
             i2s_pace_arm(s);
+            ipod_classic_hle_audio_notify_play_start();
         } else if (!s->tx_running && was_running) {
             i2s_pace_disarm(s);
         }
