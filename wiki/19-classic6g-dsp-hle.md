@@ -1138,6 +1138,17 @@ esa espera** — coherente con las 8 sesiones. La carrera regime-A/B es
 timing-sensible pero **el desenlace es invariante** (`copy32=0` en A y B), así que
 tampoco un cambio de timing la desbloquea.
 
+**F) La SALIDA WAV en régimen A lo confirma de forma independiente — es SÓLO el
+clic de UI, cero música (`runwav.sh`, `AUDIOWAV`).** Captura de 72.6 s con decode
+confirmado (`h12=1` a `+15.17 s` tras el watchdog): **`nonzero=0.25 %` (99.75 %
+silencio), `L==R=100 %` (fake-mono, `rms(L-R)=0.0`), 13 ráfagas IDÉNTICAS de 624
+muestras con pico 11444** (una por pulsación de SELECT en la navegación). Música
+real sería `nonzero≈100 %`, `L==R≪100 %`, `rms(L-R)≫0`. No hay contenido con que
+correlacionar el AAC. (Higiene: el fichero `~/6g/EVIDENCE_realaudio.wav` de una
+sesión previa mide EXACTAMENTE esa firma —11444/624/L==R—, así que es **el clic mal
+etiquetado como "realaudio"**, no prueba de audio. El discriminador fiable es
+`copy32>0`/`memw` del decoder, no la amplitud del WAV.)
+
 **VEREDICTO (medido, honesto): el retailOS NO suena. Deadlock de bootstrap
 circular INTRÍNSECO del pipeline MeCCA, sin arreglo de modelo.** El productor
 (t2a) y el consumidor (t25) se bloquean mutuamente en frío: el motor rinde PCM
