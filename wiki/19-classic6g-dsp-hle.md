@@ -1183,3 +1183,141 @@ determinismo por sí solo no hace aparecer al emisor ausente del buzón 0x52.
 byte-idéntico. Sólo lecturas gdb no invasivas + `pctrace` (ya en árbol).
 Rockbox/navtest/5G sin tocar. Recetas de sesión en `~/dbg/` (`runmeas.sh`,
 `runtrace.sh`, `runt2aexam.sh`, `t2a_examine.py`), fuera del repo.
+
+### 11.17 El shim del TIMBRE de render (`HLE_RENDER_KICK`): IMPLEMENTADO y su MECANISMO VALIDADO, pero el motor es un CONSUMIDOR guiado-por-trabajo — tocar su timbre NO produce render sin PCM decodificado (refuta la hipótesis "cebar el buzón 0x52")
+
+Sesión de **implementación** del cebado del LADO DEL MOTOR que §11.16 dejó
+especificado (y que las dos investigaciones de cierre — formato del buzón 0x52 +
+la cascada a PCM — detallaron). Se construyó el disparo del **timbre de render**
+al motor t25 y se midió su efecto con navegación FIABLE. VA = off + `0x07FF51B8`;
+IRAM en `0x22xxxxxx`. Todo **VERIFICADO** por `pctrace` (contadores `pc=`/`sendex=`
++ `memw`), la traza del propio shim, y snapshot gdb no invasivo. Disco
+`Emulti.img`, `AUDIOPACE=1`, SELECT fiable (`iremote press ret -u -w e --region
+right -r 15`).
+
+**Corrección de marco que confirma la investigación (leer primero).** El "buzón
+0x52" NO es un buzón KS con payload: el motor t25 se bloquea en `recv()` sobre un
+**fast-semaphore SIN payload** `0x220106d0` (el "timbre"). VERIFICADO: el wrapper
+de recv de t25 `0x22006814` carga `r0=0x220106d0, r1=0xbb8` (3 s) y llama a
+`0x22003868`. El engobj es `0x220106dc` (= ring+12; `[engobj+0]=vtable 0x22008980`
+puesto por el ctor `0x220068e4`). La "orden de render" es: armar la puerta
+`[engobj+71]=1` (el motor sale por `beq 0x8082020` si es 0, `0x808171c` `ldrb
+r0,[engobj+71]`) + tocar el timbre (V() del fast-sema). El emisor propio del
+firmware es el stub IRAM `0x2200683c` (arma `[engobj+71]=1`, limpia `[+68]/[+70]/
+[+72]`, incrementa `0x22008c1c`, señala) — pero su precondición `[engobj+70]!=0`
+está **falsa en frío** (`bxeq lr` @`0x2200684c`) y tiene **0 llamadores**: por eso
+NADIE toca el timbre en frío. (Confirma §11.16-C: t25 esperando el disparo de
+salida.)
+
+**A) Lo implementado (GATEADO, build por defecto byte-idéntico).**
+`hw/arm/ipod_classic/ipod_classic_hle_audio.c` (+`.h`), cableado en la máquina y
+disparado por el bit *run* del I2S. Con `HLE_RENDER_KICK` sin poner **no instala
+nada** (init retorna antes de tocar estado; el hook del I2S es no-op). Con
+`HLE_RENDER_KICK=1`: un timer de reloj virtual, cuando t25 está encolado en el
+timbre (`[0x220106d0+4]!=0`, waiter presente) **y** la CPU está en el idle loop
+RTXC (`pc∈[0x22003b0c,0x22003b34)` o `halted` en WFI), redirige el contexto idle
+a: (1) escribir `[0x220106dc+71]=1` (la puerta de render, como el emisor propio),
+y (2) llamar al **stub propio del huésped `0x22006870`** (`r0=0x220106d0; r1=0; b
+0x22003670→V() 0x080a1858`), con LR de vuelta al idle. Cero PCM inyectado; se
+toca el timbre EXACTO que el HW tocaría, y el desencolar+despertar los hace el
+propio KS del huésped bajo sus locks. Reutiliza el mecanismo de entrega-desde-idle
+validado en §11.15 (commit `dd068aa1e`), apuntando al MOTOR en vez del decoder.
+
+**B) EL MECANISMO FUNCIONA — VERIFICADO.** Traza del shim: "rang render doorbell
+#N to engine t25 (ring=0x220106d0 waiter=0x0bb1306c [engobj+71]=1) from idle
+pc=0x22003b20". El timbre se toca desde el idle (pc=`0x22003b20`, exactamente el
+pc del snapshot de §11.16), **9 791–11 244 veces** por corrida, despertando el
+recv de t25 (waiter `0x0bb1306c` = nodo en la pila de t25, el mismo de la
+investigación). Ninguna tarea viva se perturba (`resets`=1–2 = el watchdog de 15 s
+del propio retailOS, idéntico a baseline). El snapshot vivo confirma con el shim
+activo: `[engobj+71]=01` (armado por el shim), t25 `state=40` parkeada en el timbre
+(RET `…0805c558 080b3e80 22006824 22002f84`), decoder primado (`gate[ctx+0x60]=
+0x4`).
+
+**C) HALLAZGO DECISIVO: el timbre NO produce render — el motor es un CONSUMIDOR
+guiado-por-TRABAJO, no por el timbre.** Instrumentado el camino de t25 tras el
+wake (MEDIDO, corrida v2):
+```
+recv    @0x22006814  hits=11244     <- t25 despierta del timbre 11244 veces
+recvret @0x22006824  hits=11243
+dpump   @0x22006118  hits=1         <- el data-pump (render) corre UNA vez (bring-up)
+dpeng   @0x22006300  hits=1  dpbail=0  dpalt=0
+engine  @0x0808170c  hits=1     mixer @0x0809a74c  hits=1     copy32 @0x08016eb4  hits=0
+```
+El bucle de t25 es `0x22002f5c`: `bl 0x22005e48` (@`0x22002f80`, ret `0x22002f84`)
+**sondea la FUENTE** — `0x22005e48` es un dispatch virtual `ldr r0,[r0]; ldr
+r1,[r0]; ldr r1,[r1,#28]; bx r1` (llama al método `+28` del objeto fuente). Si la
+fuente no tiene datos, devuelve 0 y t25 **vuelve al recv** (`0x22002f88 beq`). El
+timbre despierta al consumidor, pero **no puede fabricar trabajo que no existe**:
+la fuente (PCM decodificado) está vacía, así que t25 hace wake→sondea→0→re-park,
+11 244 veces, **sin renderizar ni una trama más que el baseline**. `copy32=0`
+invariante; `memw=0x08888000-0x0888c000` = **8192 stores, TODOS memset**
+(`0x22000198`/`0x220001a0`), CERO del decoder. Idéntico a §11.16.
+
+**D) El engobj está SEMI-configurado — VERIFICADO (snapshot).** `[engobj+88]=0xff`
+(el TIPO de render sigue en el valor de init del ctor `0x220068e4`; el `switch` del
+data-pump `0x220062a0` y del motor operan sobre él — nunca se configuró a un tipo
+real). `[engobj+70]=0` (la puerta de arranque en frío del emisor propio, nunca
+satisfecha). `[engobj+68]=0`. El motor nunca completó su configuración de render;
+el timbre por sí solo no la completa.
+
+**E) EL MODELO CAUSAL CORREGIDO (refuta la hipótesis de la tarea y de 8 sesiones).**
+La cadena que la orden de trabajo asumió —"el motor renderiza → emite el tipo-12
+al decoder → el decoder produce PCM"— es **FALSA y ahora está REFUTADA por medida**:
+el render es el lado **CONSUMIDOR** (`motor 0x0808170c → mixer 0x0809a74c →
+copy 0x08016eb4 → ping-pong`), NO emite el tipo-12 al decoder (ver la
+investigación "cascada"); el tipo-12 al decoder va por vía separada. Cebar el
+timbre del motor **arranca al consumidor, pero el consumidor no tiene nada que
+consumir** porque el PRODUCTOR (decoder t2a) está bloqueado en su ENTRADA (buzón
+9, RECVmbox dentro de `dstep 0x08123284`) y nunca produce PCM (§11.16-C). Es el
+**deadlock de bootstrap circular** de §11.16, ahora confirmado DINÁMICAMENTE desde
+el lado del motor: despertar al consumidor 11 244 veces no genera ni un render
+extra.
+
+**VEREDICTO (medido, honesto): el retailOS NO suena.** El timbre de render (buzón
+0x52) es **necesario pero INSUFICIENTE**. Hasta dónde llegó el kick, con evidencia:
+1. **¿El motor renderizó?** NO más que el baseline: `engine=1` (sólo el bring-up
+   del watchdog), pese a 11 244 toques del timbre. El motor despierta pero su
+   bucle sondea la fuente, la halla vacía y re-parkea.
+2. **¿El decoder decodeó?** NO: `h12=1` sólo tras el watchdog (como baseline),
+   `copy32=0`, `memw`=sólo memset. t2a sigue bloqueado en la entrada (buzón 9).
+3. **¿`copy32` subió de 0?** NO: `copy32=0` invariante (A y B). El WAV capturado
+   es SÓLO el clic de UI (`nonzero=0.26 %`, `L==R` 100 %, pico 11444) — no música,
+   nada con que correlacionar el AAC.
+
+**Lo que FALTA (el muro real, un nivel más abajo del timbre):** que el PRODUCTOR
+(decoder t2a) consuma su entrada (buzón 9) y decodifique la trama 0, poniendo PCM
+en la fuente del copy (`0x08888xxx`). Sólo entonces el bucle de t25 (ya despertado
+por el timbre) hallará trabajo y renderizará. El timbre del motor es el segundo
+eslabón; el primero (entrada del decoder) sigue ausente. Coherente con el
+"deadlock circular intrínseco, sin arreglo de modelo" de §11.16 (las tres esperas
+son rendezvous inter-tarea, ninguna es poll de HW).
+
+**Decisión sobre el shim: REVERTIDO (mudo), finding conservado.** El shim es
+limpio, gateado y default-inerte (build por defecto byte-idéntico; navtest 6G y
+Rockbox sin cambios con la env sin poner), y su **mecanismo de entrega está
+validado** — pero **no produce audio** (el timbre despierta al consumidor sin
+trabajo). Igual que el shim tipo-12 de §11.15 (revertido en `6e9f4a9c7`), se
+revierte la fuente y se conserva SÓLO esta documentación medida. Reproducible: es
+`dd068aa1e` reapuntado al timbre (`pc=0x22006870`, previo `[0x220106dc+71]=1`),
+gateado por `HLE_RENDER_KICK`.
+
+**Direcciones nuevas VERIFICADAS esta sesión (disasm + medida):**
+- t25 bucle de render `0x22002f5c`; sondeo de trabajo `bl 0x22005e48` @`0x22002f80`
+  (ret `0x22002f84`); `0x22005e48` = dispatch virtual `bx [[[fuente]]+28]` (sondea
+  la fuente, devuelve 0 si vacía).
+- recv del timbre `0x22006814` = `recv(0x220106d0, 3000ms)` vía `0x22003868`.
+- data-pump `0x22006118`; llamada al motor `bl 0x22003840`(→`0x0808170c`)
+  @`0x22006300`; limpia la puerta `strb #0,[engobj+71]` @`0x22006308`.
+- puerta de entrada del motor: `0x8081718 bl 0x8015860` (getter engobj) →
+  `0x808171c ldrb r0,[engobj+71]` → `0x8081730 beq 0x8082020` (sale si 0).
+- stub de timbre `0x22006870` (`r0=0x220106d0; r1=0; b 0x22003670`→V()
+  `0x080a1858`, veneer que no toca LR); emisores propios `0x220060e0` /
+  `0x2200683c` (0 llamadores en frío).
+- ctor del engobj `0x220068e4`: `[engobj+0]=vtable 0x22008980`, `[engobj+88]=0xff`.
+
+**Higiene:** `HLE_RENDER_KICK` off por defecto → build byte-idéntico; shim
+REVERTIDO tras medir (sólo esta doc se commitea). Rockbox/navtest 6G/5G intactos
+(el shim era inerte sin la env; el árbol final es baseline). Recetas de sesión en
+`~/dbg/` (`run_rk.sh`, `run_rk2.sh`, `run_rksnap.sh`, `rk_probe.py`,
+`rk_probe2.py`), fuera del repo.
