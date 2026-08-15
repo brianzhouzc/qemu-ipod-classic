@@ -1046,3 +1046,129 @@ productor real (decode AAC) está parado, no porque falte el tipo-12.
 **Higiene:** `HLE_AUDIO_KICK` off por defecto → build byte-idéntico al baseline;
 Rockbox/navtest/5G intactos (el shim es inerte sin la env). Recetas de sesión en
 `~/dbg/` (`runhle_*.sh`, `cap_hle.py`), fuera del repo.
+
+### 11.16 `obj+0x54` es un TIMER (no una tarea AAC); la caza de la "tarea async" era un fantasma; el muro es el disparo de SALIDA en frío — VEREDICTO cerrado por examen VIVO del decodificador real
+
+Sesión de resolución. Objetivo del workflow: "cazar la tarea AAC aguas abajo que
+recibe los posts a `obj+0x54` y no produce PCM" (§11.15). Se **midió de nuevo con
+navegación fiable** (4 capturas decode-confirmadas) y se **desensambló entera** la
+cadena `dwork`. Resultado: la premisa del workflow es una **misidentificación**.
+Todo **VERIFICADO** por desensamblado directo (`~/6g/osos.dis`, VA = off +
+`0x07FF51B8`) o lectura gdb no invasiva de un play (disco `Emulti.img`,
+`AUDIOPACE=1`, Shuffle Songs, SELECT fiable). Recetas nuevas en `~/dbg/`:
+`runmeas.sh`, `runtrace.sh`, `runt2aexam.sh`, `t2a_examine.py`. Árbol
+byte-idéntico al baseline (sólo lecturas; cero cambios de fuentes).
+
+**A) `obj+0x54` es un TEMPORIZADOR de 15 s, no un canal de decode — VERIFICADO por desensamblado (confirma Report-1; REFUTA §11.15-C y la interpretación "actor drainer" de Report-2).**
+`dwork 0x08123bfc` hace: `r1=0x3a98; r0=obj+0x54; bl 0x08105c14; b 0x08105524`.
+Desensamblado de los dos destinos:
+- `0x08105c14 → 0x08051b94`: `str r5,[r4,#4]` ⇒ **`port[+4] = 0x3a98`** (el
+  INTERVALO, no un "tipo de mensaje").
+- `0x08105524`: pone `port[+0x20]="run "` (`0x72756e20`) → `0x080578fc`, que:
+  `NOW = 0x08033a40()`; `deadline = NOW + interval·125·8 = NOW + interval·1000`;
+  `str deadline,[port+8]`; **inserta `port` en una lista enlazada ORDENADA POR
+  DEADLINE** (cabecera en el bloque de control `0x08911488`; lazo de inserción
+  `0x0805795c` que compara deadlines con `0x0826480c`); `port[+0x1c]=1` (encolado);
+  y **señala el semáforo de la rueda** (`0x0806a8ac`, sema `0x08970050`).
+Esto es una **inserción de rueda de temporizadores de libro**. `0x3a98 = 15000`
+= intervalo en ms = **15 s**. `dwork` **ARMA un watchdog de 15 s**; no postea
+ningún mensaje de decode. La "tarea que recibe en `obj+0x54`" es **t04**, el
+**servicio de la rueda** (entry `0x080833d0`, resumePC `0x22004394` op1b-WAITsema,
+parkeada en sema `0x08970050`). **La tarea AAC async que este workflow fue creado
+para cazar NO EXISTE** — `obj+0x54`/`0x3a98` es un falso rastro. (§11.15-C y
+Report-2 malinterpretaron el arme del watchdog como un post async; Report-1
+acertó.)
+
+**B) La contradicción h12=0 (Report-1) vs h12=1 (§11.15) = la carrera regime-A/B MÁS el watchdog de 15 s — RESUELTA por medida.**
+Con navegación fiable, MEDIDO (`runmeas.sh`, `pctrace pc=`/`sendex=`):
+- **Corrida A (régimen A):** `disp=7, h12=1, gateconsume=1, dwork=3, ex6=57`,
+  `copy32=0`. La **traza temporal** revela lo decisivo: setup a `+74.7 s` (disp
+  #1-2, dwork #1-2 arman watchdogs) y un primer render-pull tipo-12 con **gate=0**
+  (`h12else`), luego un **STALL de 15.13 s EXACTOS**, y a `+89.87 s` **el watchdog
+  vence** → ráfaga (disp #3-6, `h12 #1` con gate ya puesto, `gateconsume`, dwork
+  #3) → el motor corre su bring-up (`engine=1, mixer=1`) a `+90.2 s` → **`copy32=0`**.
+- **Corrida B (régimen B):** `disp=6, h12=0, dwork=2, ex6=87`, `copy32=0`, y el tag
+  del timer pasa a `"stop"` (`0x73746f70`, teardown).
+⇒ **`h12=1` SÍ se alcanza (§11.15 acertó), pero SÓLO tras el stall+watchdog de
+15 s**; las capturas de Report-1 (`<15 s`, como el propio Report-1 anotó) medían
+ANTES del vencimiento → `h12=0`. Y **el resultado es INVARIANTE en ambos
+regímenes: `copy32=0`, cero PCM.** La carrera no cambia el desenlace. El watchdog
+de 15 s (y su teardown) SON el mecanismo de **recuperación-de-estancamiento del
+propio retailOS**: su existencia y disparo **prueban que el pipeline no arranca en
+frío** — el empujón inmediato de la primera trama que el HW real provee está
+ausente, y ni siquiera el watchdog cierra el lazo.
+
+**C) PRIMER examen VIVO del decodificador AAC REAL (t2a) y del consumidor/conductor — deadlock de rendezvous PURO, confirmado en la propia tarea (`t2a_examine.py`).**
+Snapshot pre-watchdog (régimen A, gate primado): `decoder_obj=0x0ba9a8a4`
+(vtable `0x088d1948`), `ctx=[obj+0x34]=0x0ba90c50`, **gate `[ctx+0x60]=0x4`
+(primado)**. Estado de las tres tareas del lazo (todas worker entry `0x080833d0`):
+- **t2a (DECODER AAC):** `st=08`, resumePC `0x22004028` = **op14-RECVmbox en
+  buzón 9 (ENTRADA)**. Cadena de retorno `0x08025b04 → 0x081232a4 (dstep) →
+  0x08123da8 (tipo-19) → 0x08123e20`: está **dentro de `dstep 0x08123284`**,
+  habiendo pedido entrada por exchange 6, **bloqueado esperando el chunk en
+  buzón 9**. NUNCA llega al decode por-trama.
+- **t25 (MOTOR de audio):** `st=08`, op14-RECVmbox en **buzón 0x52 (comando de
+  render)**, cadena `0x0805c578 → 0x080b3e80 (recv con timeout 3 s) → 0x22006824`.
+  **Nadie le manda jamás el comando de render.**
+- **t20 (StreamCache):** `st=40`, op4-RECVexch en **exchange 6** (sirviendo las
+  peticiones de entrada del decoder), cadena `0x08171500 → 0x081f39a4 → 0x081d0a2c`.
+Las TRES en rendezvous inter-tarea; **NINGUNA polleando hardware**; gate primado;
+`copy32=0`. Snapshot **post-watchdog**: t2a y t25 pasan a `st=00` (**desmontadas**)
+y los buzones 9/0x52 a cero — el teardown del watchdog. Es **exactamente** el
+deadlock de §11.12/§11.13, ahora confirmado EN la propia tarea decodificadora.
+
+**D) El decode SÍ hace trabajo de códec, pero NUNCA escribe PCM a su buffer de salida — VERIFICADO (`runtrace.sh` range + §11.9).**
+`range=0x08080000-0x080b0000` disparado en setup + watchdog: **672 bloques
+distintos de códec** corren (región `0x080axxxx`: bring-up del motor + `ParseASC
+0x080a3cd0`, config). Pero la fuente del copy `0x08889098` (región
+`0x08888000-0x0888c000`) sigue recibiendo **sólo el memset** (§11.9/§11.15) y
+`copy32=0`. El motor rinde su bring-up y **su copy SALTA** (`[descr+5]=0`,
+"PCM no listo"). El decode-a-PCM por-trama (que escribiría `0x08889098` y pondría
+la bandera de trama-lista) **nunca se dispara**, porque está gateado tras el
+viaje-redondo de render que está en deadlock.
+
+**E) Determinación de ARREGLO DE MODELO: NINGUNO — cerrado por medida.**
+El elemento que falta es **el comando de render en frío (buzón 0x52) al motor
+t25**. Es un **mensaje inter-tarea**, no un evento de HW: las tres esperas del lazo
+son rendezvous (buzón 9 / buzón 0x52 / exchange 6), ninguna es un poll de
+periférico (confirmado VIVO en §C; coherente con `-d unimp`=sólo 43 writes GPIO
+§11.11-B, IRQ16+tick vivos §11.12-D, salida idéntica a Rockbox §11.13-C). Por
+tanto **ningún periférico, timer, valor de HW ni estado inicial puede satisfacer
+esa espera** — coherente con las 8 sesiones. La carrera regime-A/B es
+timing-sensible pero **el desenlace es invariante** (`copy32=0` en A y B), así que
+tampoco un cambio de timing la desbloquea.
+
+**VEREDICTO (medido, honesto): el retailOS NO suena. Deadlock de bootstrap
+circular INTRÍNSECO del pipeline MeCCA, sin arreglo de modelo.** El productor
+(t2a) y el consumidor (t25) se bloquean mutuamente en frío: el motor rinde PCM
+⟸ comando de render (buzón 0x52) ⟸ la salida consumió PCM real ⟸ el motor rinde;
+y el decoder produce la trama 0 ⟸ viaje-redondo de render ⟸ el motor rinde. Ninguna
+mitad está cebada. La entrada está sana (ex6=57–87, t20 sirviendo), el decoder
+primado (gate=0x4), y aun así `copy32=0` de punta a punta. El watchdog de 15 s del
+propio firmware es la prueba de que el arranque en frío no cierra.
+
+**Correcciones al registro que aporta esta sesión (todas VERIFICADAS):**
+1. `obj+0x54` = **watchdog de 15 s** (desensamblado de la rueda), no un canal de
+   decode → **la "tarea AAC async" del §11.15 es un fantasma**; el frente de este
+   workflow descansaba en una misidentificación.
+2. `h12=1` **es alcanzable** (§11.15 acertó) pero **sólo vía el watchdog de 15 s**;
+   `h12=0` de Report-1 era medir antes del vencimiento. `copy32=0` invariante.
+3. **Primer examen vivo de t2a** (el decoder real): bloqueado en la entrada
+   (buzón 9), nunca decodifica; el muro está en el **disparo de SALIDA** (buzón
+   0x52 al motor), no en `obj+0x54`.
+
+**La vía real (no es de modelo, documentada):** un **HLE del cebado en frío** que
+emita el **primer comando de render (buzón 0x52) al motor t25** para arrancar al
+consumidor —que tirará de la trama (render-pull tipo-12) y hará que el decoder del
+HUÉSPED produzca el PCM—. Es MÁS que el shim tipo-12 de §11.15 (que ahora se
+demuestra insuficiente: h12 sólo consume el gate y **arma el watchdog**, no
+decodifica): hay que cebar el LADO DEL MOTOR, y la vinculación del buffer de salida
+(descriptor `0x0bb12d54`, bandera `[descr+5]`) debe salir del render propio del
+huésped. Alternativa: `icount` (QEMU 9.x) para reordenar el scheduling y explorar
+si el orden concurrente real difiere — con la salvedad del auditor de que el
+determinismo por sí solo no hace aparecer al emisor ausente del buzón 0x52.
+
+**Higiene:** cero cambios en fuentes del modelo; `git diff` vacío; build
+byte-idéntico. Sólo lecturas gdb no invasivas + `pctrace` (ya en árbol).
+Rockbox/navtest/5G sin tocar. Recetas de sesión en `~/dbg/` (`runmeas.sh`,
+`runtrace.sh`, `runt2aexam.sh`, `t2a_examine.py`), fuera del repo.
