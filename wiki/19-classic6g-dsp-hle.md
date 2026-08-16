@@ -1564,3 +1564,57 @@ byte-idéntica. Hooks: `ipod_classic.c` (init), `ipod_classic_i2s.c` (fill+commi
 edge de reloj), `ipod_classic_ata.c` (offset de lectura para ID),
 `ipod_classic_clk.c` (supresión gateada del reinicio-watchdog). Regresiones:
 navtest 6G y Rockbox (rbmusic) con la env sin poner — sin cambios.
+
+### 11.20 Asalto nº12 (HLE_NP): plataforma propia; decode kickeado desde idle NO entrega trama; el muro es el CONTEXTO+ENTRADA del decoder, no dos campos
+
+Sesión con módulo propio integrado `hw/arm/ipod_classic/ipod_classic_hle_np.c`
+(gateado por `HLE_NP`, build por defecto byte-idéntico), rama `dsp-deadlock-break`.
+Objetivo autorizado por el usuario: cebar los bindings de control (no PCM) para
+que el motor del huésped renderice (`copy32>0`) y Now Playing avance. Todo
+**VERIFICADO** por `pctrace`/`memw`/gdb no invasivo + disasm (`~/6g/osos.dis`,
+VA = off + 0x07FF51B8). Disco `Emulti.img`, `AUDIOPACE=1`, SELECT fiable.
+
+**A) La función copy 0x08016e44 decodificada (fuente y gate exactos).**
+`src = [r5+12] + (([r4+4]-r6-[r5])<<2)`; `gate = [r7+5]==1`. Captura VIVA de sus
+args en el render de bring-up: `r5=0x088890c0` → `[r5+12]=0x08889098` (buffer
+fuente); `r7=0x0bb12eb4` → `[r7+5]=0` (gate cerrado); `r4=0x0bb12d54`. El copy
+salta por gate=0 / fuente vacía. Fuente `0x08889098` = buffer ESTÁTICO en la
+sección de datos del osos (< 0x08976f7c), no heap.
+
+**B) El publish 0x081c12ac es POR MENSAJE, no por campo (clave, corrige el marco
+de kicks previo).** Llama a `reader.vtable[3]` (get-frame) y, si devuelve !=0,
+postea la trama downstream (`bl 0x832d9dc`); si 0, no postea. **NO escribe
+`[r5+12]`/`[r7+5]` del motor.** Por eso tocar el timbre (§11.17) o el tipo-12
+(§11.15) nunca cablea el binding: éste llega por el MENSAJE que el motor debe
+recibir y procesar, no por el timbre.
+
+**C) El crédito de producción = `[[reader+0x30]+0x2b8]` (fn 0x81c0fd4, dos instr:
+`ldr r1,[r0+0x30]; ldr r0,[r1+0x2b8]`).** Snapshot vivo: reader=0x095562c8,
+credit=0x02000000 (no-cero). El reader-pull 0x081e93d8 sólo hace `cmp r0,#0; beq`
+sobre él.
+
+**D) MEDIDO: el kick-desde-idle NO entrega trama.** Con `HLE_NP` disparando la
+caso-1 `0x081232d8(decoder_obj,0)` desde el idle RTXC en régimen A (decoder
+primado, `gate[ctx+0x60]=0x4`): breakpoint en el retorno de la get-frame del
+publish (`0x081c12e8`) → **`r0=0` (sin trama)**. `memw` de la fuente estática
+`0x08888000-0x0888c000` durante el play con el kick activo: **cero escritores no-
+memset** (sólo `0x22000198/a0`). `copy32=0` invariante; WAV = sólo el clic de UI
+(nonzero 0.3%, L==R 100%, pico 11444). El "innerdec 0x081e9e70" que §11.18 tomó
+por "math AAC" es en realidad un **gestor de cola de trabajo** (0x8c bytes) —
+correr él no implica producir PCM.
+
+**E) VEREDICTO (medido, honesto): el kick-desde-idle es insuficiente por diseño.**
+El decode real requiere el **contexto de la tarea t2a** (pila/estado) y su
+**flujo de entrada** (RECV mbox 9 ← StreamCache), ambos en el deadlock; ejecutar
+el código de decode desde el idle corre las instrucciones pero **no produce una
+trama entregable** por el protocolo de mensajes. Cebar el gate del copy sin PCM
+en la fuente no rinde. La única vía nativa restante es un **HLE COMPLETO del
+decode** (sintetizar entrada+contexto+encolado por el protocolo MeCCA), de
+tamaño equivalente a reimplementar la integración del códec — coherente con la
+decisión de §11.19 de decodificar host-side aguas abajo.
+
+**Aportes reutilizables (rama `dsp-deadlock-break`, commit del módulo):** copy
+decodificado (A), publish=mensaje (B), credit fn (C), y una plataforma gateada
+`HLE_NP` que dispara el decode del huésped a voluntad para futuros experimentos.
+Recetas en `~/dbg/`: `run_np.sh`, `run_npsnap.sh`, `run_npmemw.sh`, `run_pub.sh`,
+`np_snap.py`, `catch_copy.gdb`, `catch_publish.gdb`.
