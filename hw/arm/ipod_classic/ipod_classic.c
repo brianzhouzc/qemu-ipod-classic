@@ -29,6 +29,7 @@
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
@@ -788,6 +789,10 @@ static void ipod_classic_machine_init(MachineState *machine)
      * and wiki/19 section 11.19. Default build is byte-identical.
      */
     ipod_classic_hle_audio_init(cpu, dmac0, nms->i2s);
+
+    /* HLE "Now Playing" bootstrap (wiki/19 s.11.20): break the MeCCA decode
+     * deadlock so the guest's own engine renders. No-op unless HLE_NP is set. */
+    ipod_classic_hle_np_init(cpu);
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

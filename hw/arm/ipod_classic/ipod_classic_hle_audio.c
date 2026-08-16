@@ -592,8 +592,20 @@ bool ipod_classic_hle_audio_enabled(void)
 bool ipod_classic_hle_audio_active(void)
 {
     /* Reset suppression is opt-in (HLE_AUDIO_SUSTAIN): only then do we hold off
-     * the guest's deadlock-watchdog reboot so the whole song can play. */
-    return hle.enabled && hle.sustain && qatomic_read(&hle.pcm_ready);
+     * the guest's deadlock-watchdog reboot so the whole song can play.
+     *
+     * Consider the HLE "active" from the moment a track is CHOSEN (hle.chosen >=
+     * 0), not only once the host decode has finished (pcm_ready). The decode
+     * runs async on a worker thread and can take longer than the guest's ~15 s
+     * deadlock watchdog: measured order in the log is "guest asked for a
+     * software reset" BEFORE "decoded track N -> feeding". Keying suppression on
+     * pcm_ready alone loses that race -- the device reboots to the language
+     * screen before the song is ready. hle.chosen is set the instant the guest
+     * starts streaming the file (note_disk_read), so this suppresses the blank-
+     * tag watchdog reboot from the start of playback and keeps the guest alive
+     * through the decode and on into the paced feed. */
+    return hle.enabled && hle.sustain &&
+           (hle.chosen >= 0 || qatomic_read(&hle.pcm_ready));
 }
 
 void ipod_classic_hle_audio_notify_play_start(void)

@@ -39,6 +39,7 @@
 #include "audio/audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
 
 /* ------------------------------------------------------------- tracing */
 
@@ -578,6 +579,7 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
         if (s->tx_running && !was_running) {
             i2s_pace_arm(s);
             ipod_classic_hle_audio_notify_play_start();
+            ipod_classic_hle_np_notify_play_start();
         } else if (!s->tx_running && was_running) {
             i2s_pace_disarm(s);
         }
