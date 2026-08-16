@@ -103,4 +103,16 @@ bool   ipod_classic_hle_audio_have_pcm(void);
 size_t ipod_classic_hle_audio_copy_pcm(size_t cursor, void *dst, size_t len);
 size_t ipod_classic_hle_audio_pcm_len(void);
 
+/* --- Player controls (driven by the wheel buttons; all no-op unless enabled) - */
+bool     ipod_classic_hle_audio_paused(void);
+void     ipod_classic_hle_audio_set_pause(bool on);
+void     ipod_classic_hle_audio_toggle_pause(void);
+void     ipod_classic_hle_audio_seek(int seconds_delta);          /* relative */
+void     ipod_classic_hle_audio_change_track(int delta);          /* +1 / -1  */
+uint64_t ipod_classic_hle_audio_position_frames(void);            /* elapsed  */
+uint64_t ipod_classic_hle_audio_total_frames(void);              /* duration */
+int      ipod_classic_hle_audio_track_index(void);
+int      ipod_classic_hle_audio_track_count(void);
+const char *ipod_classic_hle_audio_track_name(void);
+
 #endif /* IPOD_CLASSIC_HLE_AUDIO_H */

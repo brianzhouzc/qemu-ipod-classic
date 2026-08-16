@@ -40,6 +40,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
+#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 
 /* ------------------------------------------------------------- tracing */
 
@@ -431,6 +432,19 @@ static void ipod_classic_i2s_drain(void *opaque)
         return;
     }
     /*
+     * PAUSE (player control): when the data-path HLE is paused, skip BOTH the
+     * fill AND the paced request+commit. Skipping only the fill is a bug -- the
+     * DMA would re-clock the stale source buffer, tx_samples/commit/cursor would
+     * keep advancing and the codec would buzz the last chunk on loop. Freezing
+     * the drain instead stops tx_samples, emits no TXDB0 writes (the live ring
+     * drains to silence), and keeps the PCM cursor put -- a clean pause.
+     */
+    if (ipod_classic_hle_audio_paused()) {
+        s->next_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 4000000; /* 4ms */
+        timer_mod(s->drain_timer, s->next_tick_ns);
+        return;
+    }
+    /*
      * DATA-PATH HLE: fill the audio DMA channel's current source segment with
      * the next chunk of the host-decoded real song, one burst ahead of the
      * drain, so the paced request below transports the real PCM to the FIFO.
@@ -580,6 +594,7 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
             i2s_pace_arm(s);
             ipod_classic_hle_audio_notify_play_start();
             ipod_classic_hle_np_notify_play_start();
+            ipod_classic_np_overlay_notify_play_start();
         } else if (!s->tx_running && was_running) {
             i2s_pace_disarm(s);
         }

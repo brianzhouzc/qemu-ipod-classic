@@ -60,6 +60,7 @@
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
 #include "hw/arm/ipod_classic/ipod_classic_sm1.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
 
 /*
@@ -85,7 +86,16 @@ static bool sm1_pos_reg(IPodClassicSM1State *s, hwaddr offset, uint32_t *out)
         if (offset != a48 && offset != a44) {
             continue;
         }
-        uint64_t pos = s->i2s ? s->i2s->tx_samples / 2 : 0;   /* stereo frames */
+        /* Position in stereo frames. When the data-path HLE owns playback, use
+         * ITS cursor so pause (frozen), seek (jumped) and track-change (reset)
+         * reflect in the position register; otherwise fall back to the I2S
+         * transmit-sample count. */
+        uint64_t pos;
+        if (ipod_classic_hle_audio_have_pcm()) {
+            pos = ipod_classic_hle_audio_position_frames();
+        } else {
+            pos = s->i2s ? s->i2s->tx_samples / 2 : 0;
+        }
         /* +0xa48 is the position the copy uses; +0xa44 is its companion,
          * answered 0 until measurement says otherwise. */
         *out = (offset == a48) ? (uint32_t)pos : 0;

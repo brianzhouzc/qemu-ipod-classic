@@ -135,9 +135,15 @@ typedef struct {
     bool        play_seen;          /* real-playback clock re-config seen        */
     bool        sustain;            /* HLE_AUDIO_SUSTAIN: suppress deadlock reset*/
 
+    /* Player controls (driven by the wheel buttons via the public API). */
+    bool        paused;             /* feed+drain frozen; UI position stops     */
+    int         req_track;          /* worker: track index requested for change */
+    int         decode_gen;         /* bumped on each decode request           */
+    int         decoded_gen;        /* last generation the worker installed     */
+
     QemuThread  worker;
     QemuMutex   lock;
-    QemuCond    cond;               /* worker waits for `chosen` to be set     */
+    QemuCond    cond;               /* worker waits for a decode request        */
     bool        started;            /* play-start edge seen                    */
 } HLEAudioState;
 
@@ -413,9 +419,8 @@ static void hle_scan_disk(void)
  * ffmpeg to 16-bit stereo 44100 PCM. Runs on the worker thread so the ~1 s
  * decode never stalls the vCPU or the drain timer.
  */
-static void hle_decode_chosen(void)
+static uint8_t *hle_decode_track(int k, size_t *out_used)
 {
-    int k = hle.chosen;
     HLETrack *t;
     char tmp[] = "/tmp/hle_track_XXXXXX.m4a";
     char cmd[1200];
@@ -426,8 +431,9 @@ static void hle_decode_chosen(void)
     uint8_t *pcm = NULL;
     size_t cap = 0, used = 0;
 
+    *out_used = 0;
     if (k < 0 || k >= hle.ntracks) {
-        return;
+        return NULL;
     }
     t = &hle.tracks[k];
     off = t->file_off;
@@ -437,12 +443,12 @@ static void hle_decode_chosen(void)
     tfd = mkstemps(tmp, 4);
     if (tfd < 0) {
         fprintf(stderr, "HLE_AUDIO: mkstemps failed\n");
-        return;
+        return NULL;
     }
     dfd = open(hle.disk_path, O_RDONLY);
     if (dfd < 0) {
         close(tfd);
-        return;
+        return NULL;
     }
     fbuf = g_malloc(1u << 20);
     for (uint64_t done = 0; done < len; ) {
@@ -468,7 +474,7 @@ static void hle_decode_chosen(void)
     if (!pp) {
         fprintf(stderr, "HLE_AUDIO: popen(ffmpeg) failed\n");
         unlink(tmp);
-        return;
+        return NULL;
     }
     for (;;) {
         if (used + (1u << 16) > cap) {
@@ -487,19 +493,32 @@ static void hle_decode_chosen(void)
     if (used == 0) {
         fprintf(stderr, "HLE_AUDIO: ffmpeg produced no PCM for track %d\n", k);
         g_free(pcm);
-        return;
+        return NULL;
     }
 
-    qemu_mutex_lock(&hle.lock);
-    hle.pcm = pcm;
-    hle.pcm_len = used;
-    hle.pcm_cursor = 0;
-    qemu_mutex_unlock(&hle.lock);
-    qatomic_set(&hle.pcm_ready, 1);
-
+    *out_used = used;
     fprintf(stderr, "HLE_AUDIO: decoded track %d -> %zu PCM bytes "
-            "(%.1f s @ 44100 stereo) -- feeding the guest's I2S\n",
-            k, used, used / 4.0 / 44100.0);
+            "(%.1f s @ 44100 stereo)\n", k, used, used / 4.0 / 44100.0);
+    return pcm;
+}
+
+/*
+ * Request the worker to (re)decode track k. Clears the current PCM so feeding
+ * stops (clean silence) during the ~1s decode; a generation counter coalesces
+ * rapid next/next presses so only the latest wins. Called for the initial pick
+ * and for NEXT/PREV track changes.
+ */
+static void hle_request_decode(int k)
+{
+    qemu_mutex_lock(&hle.lock);
+    hle.chosen = k;
+    hle.req_track = k;
+    hle.decode_gen++;
+    hle.pcm_cursor = 0;
+    hle.paused = false;
+    qatomic_set(&hle.pcm_ready, 0);
+    qemu_cond_signal(&hle.cond);
+    qemu_mutex_unlock(&hle.lock);
 }
 
 static void *hle_worker(void *arg)
@@ -508,21 +527,47 @@ static void *hle_worker(void *arg)
     qatomic_set(&hle.scan_done, true);
 
     if (hle.force_track >= 0 && hle.force_track < hle.ntracks) {
-        qemu_mutex_lock(&hle.lock);
-        hle.chosen = hle.force_track;
-        qemu_mutex_unlock(&hle.lock);
+        hle_request_decode(hle.force_track);
         if (hle.trace) {
             fprintf(stderr, "HLE_AUDIO: forced track %d\n", hle.force_track);
         }
     }
 
-    qemu_mutex_lock(&hle.lock);
-    while (hle.chosen < 0) {
-        qemu_cond_wait(&hle.cond, &hle.lock);
-    }
-    qemu_mutex_unlock(&hle.lock);
+    /* Decode-request loop: wait for a request, decode the latest-requested
+     * track into a fresh buffer (no lock held during the slow ffmpeg), then
+     * install it -- unless a newer request arrived meanwhile (generation). */
+    for (;;) {
+        int k, gen;
+        uint8_t *pcm;
+        size_t used = 0;
 
-    hle_decode_chosen();
+        qemu_mutex_lock(&hle.lock);
+        while (hle.decode_gen == hle.decoded_gen) {
+            qemu_cond_wait(&hle.cond, &hle.lock);
+        }
+        k = hle.req_track;
+        gen = hle.decode_gen;
+        qemu_mutex_unlock(&hle.lock);
+
+        pcm = hle_decode_track(k, &used);
+
+        qemu_mutex_lock(&hle.lock);
+        if (gen == hle.decode_gen && pcm) {
+            g_free(hle.pcm);
+            hle.pcm = pcm;
+            hle.pcm_len = used;
+            hle.pcm_cursor = 0;
+            hle.decoded_gen = gen;
+            qatomic_set(&hle.pcm_ready, 1);
+            qemu_mutex_unlock(&hle.lock);
+            fprintf(stderr, "HLE_AUDIO: now feeding track %d (gen %d)\n", k, gen);
+        } else {
+            /* superseded by a newer request, or decode failed */
+            hle.decoded_gen = gen;
+            qemu_mutex_unlock(&hle.lock);
+            g_free(pcm);
+        }
+    }
     return NULL;
 }
 
@@ -530,16 +575,18 @@ static void *hle_worker(void *arg)
 
 static void hle_pick_track(int k, uint64_t byte_off, const char *why)
 {
+    bool first;
+
     qemu_mutex_lock(&hle.lock);
-    if (hle.chosen < 0) {
-        hle.chosen = k;
-        qemu_cond_signal(&hle.cond);
+    first = (hle.chosen < 0);
+    qemu_mutex_unlock(&hle.lock);
+    if (first) {
         if (hle.trace) {
             fprintf(stderr, "HLE_AUDIO: identified guest track %d (%s, disk "
                     "offset %llu)\n", k, why, (unsigned long long)byte_off);
         }
+        hle_request_decode(k);
     }
-    qemu_mutex_unlock(&hle.lock);
 }
 
 void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len)
@@ -639,16 +686,11 @@ void ipod_classic_hle_audio_notify_clock_reconfig(void)
         fprintf(stderr, "HLE_AUDIO: playback clock re-config (play bring-up)\n");
     }
     if (hle.chosen < 0 && hle.unique_song && hle.ntracks > 0) {
-        qemu_mutex_lock(&hle.lock);
-        if (hle.chosen < 0) {
-            hle.chosen = 0;
-            qemu_cond_signal(&hle.cond);
-            if (hle.trace) {
-                fprintf(stderr, "HLE_AUDIO: fallback -> decoding the disc's "
-                        "single song (file0 '%s')\n", hle.tracks[0].name);
-            }
+        if (hle.trace) {
+            fprintf(stderr, "HLE_AUDIO: fallback -> decoding the disc's "
+                    "single song (file0 '%s')\n", hle.tracks[0].name);
         }
-        qemu_mutex_unlock(&hle.lock);
+        hle_request_decode(0);
     }
 }
 
@@ -687,6 +729,89 @@ size_t ipod_classic_hle_audio_pcm_len(void)
     return hle.enabled ? hle.pcm_len : 0;
 }
 
+/* ------------------------------------------------------- player controls ---- */
+/*
+ * Driven by the wheel buttons (via ipod_classic_wheel.c). Everything is a rule
+ * for moving/freezing the single authoritative cursor hle.pcm_cursor. All are
+ * no-ops unless the shim is enabled, so the default build is unaffected.
+ */
+bool ipod_classic_hle_audio_paused(void)
+{
+    return hle.enabled && hle.paused;
+}
+void ipod_classic_hle_audio_set_pause(bool on)
+{
+    if (hle.enabled) {
+        hle.paused = on;
+    }
+}
+void ipod_classic_hle_audio_toggle_pause(void)
+{
+    if (hle.enabled) {
+        hle.paused = !hle.paused;
+    }
+}
+uint64_t ipod_classic_hle_audio_position_frames(void)
+{
+    uint64_t f = 0;
+    if (hle.enabled && qatomic_read(&hle.pcm_ready)) {
+        qemu_mutex_lock(&hle.lock);
+        f = hle.pcm_cursor / 4;      /* 4 bytes = 1 stereo 16-bit frame */
+        qemu_mutex_unlock(&hle.lock);
+    }
+    return f;
+}
+uint64_t ipod_classic_hle_audio_total_frames(void)
+{
+    return (hle.enabled && qatomic_read(&hle.pcm_ready)) ? hle.pcm_len / 4 : 0;
+}
+void ipod_classic_hle_audio_seek(int seconds_delta)
+{
+    if (!hle.enabled || !qatomic_read(&hle.pcm_ready)) {
+        return;
+    }
+    qemu_mutex_lock(&hle.lock);
+    int64_t cur = (int64_t)hle.pcm_cursor;
+    int64_t d = (int64_t)seconds_delta * 44100 * 4;
+    int64_t nw = cur + d;
+    if (nw < 0) {
+        nw = 0;
+    }
+    if (nw > (int64_t)hle.pcm_len) {
+        nw = (int64_t)hle.pcm_len;
+    }
+    hle.pcm_cursor = (size_t)(nw & ~3);          /* keep frame-aligned */
+    qemu_mutex_unlock(&hle.lock);
+}
+void ipod_classic_hle_audio_change_track(int delta)
+{
+    int k;
+
+    if (!hle.enabled || hle.ntracks <= 0 || hle.chosen < 0) {
+        return;
+    }
+    k = (hle.chosen + delta) % hle.ntracks;
+    if (k < 0) {
+        k += hle.ntracks;
+    }
+    hle_request_decode(k);       /* clears pcm_ready+cursor; worker re-decodes */
+}
+int ipod_classic_hle_audio_track_index(void)
+{
+    return hle.enabled ? hle.chosen : -1;
+}
+int ipod_classic_hle_audio_track_count(void)
+{
+    return hle.enabled ? hle.ntracks : 0;
+}
+const char *ipod_classic_hle_audio_track_name(void)
+{
+    if (hle.enabled && hle.chosen >= 0 && hle.chosen < hle.ntracks) {
+        return hle.tracks[hle.chosen].name;
+    }
+    return "";
+}
+
 void ipod_classic_hle_audio_fill_dma(void)
 {
     PL080State *s = hle.dmac0;
@@ -698,6 +823,9 @@ void ipod_classic_hle_audio_fill_dma(void)
 
     if (hle_np_owns_feed) {
         return;   /* NP drives the guest engine directly; don't double-feed */
+    }
+    if (hle.paused) {
+        return;   /* paused: stage nothing (the drain also skips pace+commit) */
     }
     if (!hle.enabled || !qatomic_read(&hle.pcm_ready) || !s) {
         return;

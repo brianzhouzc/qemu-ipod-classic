@@ -13,7 +13,9 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "exec/cpu-common.h"
+#include "exec/exec-all.h"
 #include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
 #include "migration/vmstate.h"
 #include "sysemu/runstate.h"
 #include "qemu/error-report.h"
@@ -105,10 +107,31 @@ static void ipod_classic_clk_write(void *opaque, hwaddr offset,
              * HLE_AUDIO_DATAPATH; default build unaffected.
              */
             if (ipod_classic_hle_audio_active() && tag[0] == '-') {
-                warn_report("S5L8702: SUPPRESSED deadlock-watchdog reboot "
-                            "(SWRCON=0x%" PRIx64 ", pc~0x%08x) -- HLE audio is "
-                            "playing the guest's song", value, pc);
+                /*
+                 * Suppress the deadlock-watchdog reboot AND redirect the CPU out
+                 * of the dead reset spin. wiki/19 s11.20 found the old suppress
+                 * (just skip the reset) left the CPU spinning forever at the nop
+                 * loop 0x08322b28, freezing the UI/compositor so the (natively
+                 * running) Now Playing controller could never present its frame.
+                 * The reset routine 0x08322b10 is a LEAF called via `bl` from the
+                 * reboot executor (LR = 0x0811325c), so returning (PC = LR) resumes
+                 * normal execution: the executor returns to the service thread and
+                 * the guest UI keeps running while the data-path HLE plays audio.
+                 * Gated exactly as before (HLE_AUDIO_SUSTAIN + blank "----" tag);
+                 * real reboots (diskmode/retailOS tags) are untouched.
+                 */
                 s->reg[offset / 4] = value;
+                if (cs) {
+                    CPUARMState *env = &ARM_CPU(cs)->env;
+                    warn_report("S5L8702: SUPPRESSED deadlock-watchdog reboot "
+                                "(SWRCON=0x%" PRIx64 ", pc~0x%08x) -- redirecting "
+                                "CPU to lr=0x%08x so the UI keeps running",
+                                value, pc, env->regs[14]);
+                    env->regs[15] = env->regs[14];   /* return from reset routine */
+                    cpu_loop_exit(cs);               /* does not return */
+                }
+                warn_report("S5L8702: SUPPRESSED deadlock-watchdog reboot "
+                            "(SWRCON=0x%" PRIx64 ", pc~0x%08x)", value, pc);
                 break;
             }
 

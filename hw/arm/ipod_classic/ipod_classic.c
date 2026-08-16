@@ -30,6 +30,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
+#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
@@ -793,6 +794,11 @@ static void ipod_classic_machine_init(MachineState *machine)
     /* HLE "Now Playing" bootstrap (wiki/19 s.11.20): break the MeCCA decode
      * deadlock so the guest's own engine renders. No-op unless HLE_NP is set. */
     ipod_classic_hle_np_init(cpu);
+
+    /* HLE "Now Playing" host overlay (wiki/19 s.11.23): a visible, controllable
+     * player drawn over the framebuffer, driven by the data-path audio. No-op
+     * unless HLE_NP_OVERLAY is set. */
+    ipod_classic_np_overlay_init();
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),
