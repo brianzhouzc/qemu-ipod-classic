@@ -88,4 +88,19 @@ void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len);
  */
 bool ipod_classic_hle_audio_active(void);
 
+/* --- Bridge to the Now-Playing bootstrap (ipod_classic_hle_np.c) ----------- */
+
+/* When true, the NP module owns audio: it feeds the guest's own render engine's
+ * copy source (so the engine renders and Now Playing advances) and this
+ * data-path DMA feed stands down to avoid double-feeding. */
+void ipod_classic_hle_audio_set_np_feed(bool on);
+
+/* The same host-decoded song the data-path shim holds, shared with the NP
+ * module (one decode, one buffer). have_pcm() is true once decoded; copy_pcm()
+ * copies up to len bytes from the given byte cursor and returns the count;
+ * pcm_len() is the total decoded size in bytes. */
+bool   ipod_classic_hle_audio_have_pcm(void);
+size_t ipod_classic_hle_audio_copy_pcm(size_t cursor, void *dst, size_t len);
+size_t ipod_classic_hle_audio_pcm_len(void);
+
 #endif /* IPOD_CLASSIC_HLE_AUDIO_H */

@@ -50,6 +50,7 @@
 #include "exec/cpu-common.h"
 #include "target/arm/cpu.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
+#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /* --------------- VERIFIED guest addresses (osos VA = off + 0x07FF51B8) ------ */
 
@@ -62,18 +63,33 @@
 #define NP_DEC_CTX_READER   0x48u   /* [ctx+0x48] = reader                      */
 #define NP_DECODE_STEP      0x081232d8u  /* decode-a-frame case (obj, 0)         */
 
-/* Engine copy binding (measured live at the bring-up render). */
+/* Engine copy binding (measured live at the bring-up render, wiki/19 11.20).
+ * copy 0x08016e44: src = [r5+12] + (([r4+4]-r6-[r5])<<2); gate [r7+5]==1 (when
+ * [r4]==0). Captured: r5=0x088890c0 [r5+12]=0x08889098 [r5]=0; r4=0x0bb12d54
+ * [r4]=0; r7=0x0bb12eb4 [r7+5]=0. So the engine reads PCM from a ring based at
+ * 0x08889098; we keep that ring filled with the real (host-decoded) song so the
+ * engine's OWN copy renders it (copy32>0) and Now Playing advances. */
 #define NP_COPY_SRC_DESCR   0x088890c0u  /* r5; source base at [descr+12]        */
 #define NP_COPY_SRC_OFF     12u
-#define NP_COPY_SRC_BUF     0x08889098u  /* = [0x088890cc]; where copy reads PCM  */
+#define NP_COPY_SRC_BUF     0x08889098u  /* = [0x088890cc]; ring base the copy reads */
 #define NP_COPY_GATE_BYTE   0x0bb12eb9u  /* [r7+5]; must be 1 to copy            */
+#define NP_COPY_R4          0x0bb12d54u  /* r4 descriptor ([r4]=type,[r4+4]=rdpos)  */
+#define NP_SRC_WINDOW       0x8000u      /* bytes of PCM we keep live at the ring   */
 
 /* Render doorbell (fast-sema t25 recv()s on) and engine object. */
 #define NP_RING_OBJ         0x220106d0u
 #define NP_RING_WAITERS_OFF 0x04u
 #define NP_ENGOBJ           0x220106dcu
 #define NP_ENG_GATE_OFF     71u
+#define NP_ENG_TYPE_OFF     88u   /* [engobj+88] render type (0xff = unconfigured) */
 #define NP_SIGNAL_STUB      0x22006870u  /* r0=ring;r1=0;b V()  (pure doorbell)  */
+
+/* Guest engine render 0x0808170c: fetches engobj itself (getter 0x8015860),
+ * bails if [engobj+71]==0, else renders the current stream via mixer 0x0809a74c
+ * -> render 0x08016f68 -> copy 0x08016e44. No KS-wait, so callable from idle.
+ * Calling it SYNCHRONOUSLY right after we set the stream source + copy gate wins
+ * the timing race that the 5 ms idle poke lost (no task interleaves the copy). */
+#define NP_ENGINE_RENDER    0x0808170cu
 
 /* RTXC idle loop. */
 #define NP_IDLE_LO          0x22003b0cu
@@ -95,12 +111,20 @@ typedef struct {
     bool       armed;
     bool       pending;
     bool       want_bind;     /* alternation: false=decode next, true=bind+motor */
-    uint32_t   src_buf;       /* copy source buffer (HLE_NP_SRC or default)      */
+    uint32_t   src_buf;       /* copy source ring base (HLE_NP_SRC or default)    */
     uint32_t   gate_byte;     /* copy gate byte addr (HLE_NP_GATE or default)    */
+    uint32_t   r4;            /* copy r4 descriptor addr                          */
+    size_t     pcm_cursor;    /* bytes of the host-decoded song fed into the ring */
+    uint32_t   last_rdpos;    /* previous copy read cursor (words) for advance    */
+    bool       feed_ready;    /* datapath decode available                        */
+    bool       nofill;        /* HLE_NP_NOFILL: trace descriptors, don't write PCM */
+    bool       type1;         /* HLE_NP_TYPE1: force engobj render type=1          */
+    uint8_t    win[NP_SRC_WINDOW];
     int        attempts;
     int        kicks;
     int        dec_kicks;
     int        bind_kicks;
+    int        feeds;
     int        deferred;
 } NPState;
 
@@ -159,7 +183,13 @@ static void np_do_kick(CPUState *cs, run_on_cpu_data data)
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
     uint32_t pc = env->regs[15];
-    bool idle = cs->halted || (pc >= NP_IDLE_LO && pc < NP_IDLE_HI);
+    /* Safe kick points where no live task's context is on the CPU: the RTXC idle
+     * loop (WFI), a halted CPU, or the SUSTAIN reset-spin (0x08322b1c..30, the
+     * nop spin after the suppressed deadlock-watchdog reset -- no task runs
+     * there either). */
+    bool in_idle = (pc >= NP_IDLE_LO && pc < NP_IDLE_HI);
+    bool in_spin = (pc >= 0x08322b1cu && pc < 0x08322b34u);
+    bool idle = cs->halted || in_idle || in_spin;
     uint32_t ret, ctx, waiter;
 
     np.pending = false;
@@ -167,10 +197,16 @@ static void np_do_kick(CPUState *cs, run_on_cpu_data data)
         return;
     }
     if (!idle) {
+        if (np.trace && np.deferred < 8) {
+            fprintf(stderr, "HLE_NP: deferred (cpu busy) pc=0x%08x halted=%d\n",
+                    pc, cs->halted);
+        }
         np.deferred++;
         return;
     }
-    ret = (pc >= NP_IDLE_LO && pc < NP_IDLE_HI) ? pc : NP_IDLE_ENTRY;
+    /* Return to the idle loop after the synchronous call (never back into the
+     * spin, which would just re-spin). */
+    ret = in_idle ? pc : NP_IDLE_ENTRY;
 
     ctx = np_decoder_ctx();
     waiter = np_ring_waiter();
@@ -199,47 +235,74 @@ static void np_do_kick(CPUState *cs, run_on_cpu_data data)
     }
 
     /*
-     * Full mode: alternate decode / (bind + motor doorbell).
-     * Decode-first so a frame exists before we bind and ring.
+     * Full mode: FEED the guest engine's own copy source with the real
+     * (host-decoded) song, open the copy gate, and ring the render doorbell so
+     * the guest's OWN engine renders (copy 0x08016eb4 > 0) and Now Playing
+     * advances. PCM is the real song (shared with the data-path decode); only
+     * the control bindings (ring fill + gate) are set here.
      */
-    if (!np.want_bind && ctx != 0) {
-        env->regs[0]  = NP_DECODER_OBJ;
-        env->regs[1]  = 0;
-        env->regs[14] = ret;
-        env->thumb    = false;
-        env->regs[15] = NP_DECODE_STEP;
-        cs->halted    = 0;
-        np.dec_kicks++;
-        np.kicks++;
-        np.want_bind = true;
-        if (np.trace && np.dec_kicks <= 8) {
-            fprintf(stderr, "HLE_NP: DECODE #%d ctx=0x%08x\n", np.dec_kicks, ctx);
-        }
-        return;
+    if (!np.feed_ready) {
+        return;   /* nothing to render yet (song not decoded) */
     }
 
-    if (waiter != 0) {
-        /* BIND: open the copy gate so the engine's own copy renders the PCM the
-         * guest decoder just produced into the engine's source buffer. (The
-         * source-buffer wiring is refined once P is measured; for now open the
-         * gate and ring -- this stage is developed iteratively.) */
-        np_wr8(np.gate_byte, 1);
-        np_wr8(NP_ENGOBJ + NP_ENG_GATE_OFF, 1);
-        /* MOTOR: ring the doorbell via the guest's own stub. */
-        env->regs[0]  = NP_RING_OBJ;
-        env->regs[1]  = 0;
-        env->regs[14] = ret;
-        env->thumb    = false;
-        env->regs[15] = NP_SIGNAL_STUB;
-        cs->halted    = 0;
-        np.bind_kicks++;
-        np.kicks++;
-        np.want_bind = false;
-        if (np.trace && np.bind_kicks <= 8) {
-            fprintf(stderr, "HLE_NP: BIND+MOTOR #%d gate[%08x]=1 waiter=0x%08x\n",
-                    np.bind_kicks, np.gate_byte, waiter);
+    /* 1. Fill EXACTLY the bytes the copy reads (measured: copy src = [r5+12] +
+     *    [r4+4]<<2 = 0x08889098 + 0, count = [r4+16] bytes). The buffer is a tiny
+     *    staging area whose descriptor r5 sits right after it (0x088890c0 =
+     *    buf+0x28), so we must fill only `count` bytes -- a bigger window clobbers
+     *    the descriptor. r4/r7 are the stable heap descriptors on the engine's
+     *    DEFAULT render path (0x0bb12d54/0x0bb12eb4); we poke those. */
+    if (!np.nofill) {
+        uint32_t buf = np_rd32(NP_COPY_SRC_DESCR + NP_COPY_SRC_OFF);
+        uint32_t off = np_rd32(np.r4 + 4);          /* [r4+4], read offset (words) */
+        uint32_t cnt = np_rd32(np.r4 + 16) & 0xffff;/* [r4+16], byte count         */
+        if (buf >= 0x08000000u && buf < 0x0c000000u && cnt > 0 && cnt <= 0x28) {
+            uint32_t dst = buf + (off << 2);
+            size_t got = ipod_classic_hle_audio_copy_pcm(np.pcm_cursor, np.win,
+                                                         cnt);
+            if (got > 0) {
+                cpu_physical_memory_write(dst, np.win, got);
+                np.pcm_cursor += got;
+                if (np.pcm_cursor >= ipod_classic_hle_audio_pcm_len()) {
+                    np.pcm_cursor = 0;
+                }
+                np.feeds++;
+            }
         }
     }
+
+    /* 2. Open the copy gate on the DEFAULT-path heap descriptors: [r7+5]=1 and
+     *    [r4]==0 (so the copy takes the [r7+5] gate path), plus arm the engine
+     *    render gate [engobj+71]=1. */
+    np_wr8(np.gate_byte, 1);
+    np_wr8(np.r4, 0);
+    np_wr8(NP_ENGOBJ + NP_ENG_GATE_OFF, 1);
+    if (np.type1) {
+        np_wr8(NP_ENGOBJ + NP_ENG_TYPE_OFF, 1);
+        np_wr8(NP_ENGOBJ + 70, 1);
+    }
+
+    /* 3. Call the guest's own engine render synchronously. It fetches engobj
+     *    itself, renders the current stream (mixer -> render -> copy) over the
+     *    PCM we just staged, and returns to the idle loop (LR=ret). */
+    env->regs[0]  = 0;
+    env->regs[1]  = 0;
+    env->regs[14] = ret;
+    env->thumb    = false;
+    env->regs[15] = NP_ENGINE_RENDER;
+    cs->halted    = 0;
+    np.bind_kicks++;
+    np.kicks++;
+    /* (cursor advanced in the fill step, by the bytes actually staged) */
+    if (np.trace && np.bind_kicks <= 8) {
+        uint32_t d = NP_COPY_SRC_DESCR;
+        uint32_t buf = np_rd32(d + 12);
+        fprintf(stderr, "HLE_NP: #%d cur=%zu stream[%08x] +0=%08x +4=%08x "
+                "+8=%08x +c(buf)=%08x +10=%08x +14=%08x | buf->%08x %08x %08x %08x\n",
+                np.bind_kicks, np.pcm_cursor, d, np_rd32(d), np_rd32(d+4),
+                np_rd32(d+8), buf, np_rd32(d+16), np_rd32(d+20),
+                np_rd32(buf), np_rd32(buf+4), np_rd32(buf+8), np_rd32(buf+12));
+    }
+    (void)ctx; (void)waiter;
 }
 
 /* ---------------------------------------------------- the retry (iothread) -- */
@@ -250,7 +313,8 @@ static void np_attempt(void *opaque)
         np.armed = false;
         return;
     }
-    if (!np.pending && (np_decoder_ctx() || np_ring_waiter())) {
+    np.feed_ready = ipod_classic_hle_audio_have_pcm();
+    if (!np.pending && (np.feed_ready || np_decoder_ctx() || np_ring_waiter())) {
         np.pending = true;
         async_run_on_cpu(CPU(np.cpu), np_do_kick, RUN_ON_CPU_NULL);
     }
@@ -301,11 +365,21 @@ void ipod_classic_hle_np_init(ARMCPU *cpu)
     np.enabled = true;
     np.trace = np_env_on("HLE_NP_TRACE");
     np.dec_only = np_env_on("HLE_NP_DEC_ONLY");
+    np.nofill = np_env_on("HLE_NP_NOFILL");
+    np.type1 = np_env_on("HLE_NP_TYPE1");
     np.src_buf = np_env_hex("HLE_NP_SRC", NP_COPY_SRC_BUF);
     np.gate_byte = np_env_hex("HLE_NP_GATE", NP_COPY_GATE_BYTE);
+    np.r4 = np_env_hex("HLE_NP_R4", NP_COPY_R4);
     np.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, np_attempt, &np);
 
+    /* We drive the guest engine directly; the data-path DMA feed must stand
+     * down so the song is not double-fed (it shares its decoded PCM with us). */
+    if (!np.dec_only) {
+        ipod_classic_hle_audio_set_np_feed(true);
+    }
+
     fprintf(stderr, "HLE_NP: armed (%s; decoder 0x%08x step 0x%08x; src 0x%08x "
-            "gate 0x%08x)\n", np.dec_only ? "decoder-only" : "decode+bind+motor",
-            NP_DECODER_OBJ, NP_DECODE_STEP, np.src_buf, np.gate_byte);
+            "gate 0x%08x r4 0x%08x)\n",
+            np.dec_only ? "decoder-only" : "feed-engine-source",
+            NP_DECODER_OBJ, NP_DECODE_STEP, np.src_buf, np.gate_byte, np.r4);
 }

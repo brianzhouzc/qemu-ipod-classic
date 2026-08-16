@@ -652,6 +652,41 @@ void ipod_classic_hle_audio_notify_clock_reconfig(void)
     }
 }
 
+/*
+ * When the "Now Playing" bootstrap (HLE_NP) owns the audio, it feeds the guest's
+ * OWN render engine's copy source instead of the DMA, so the guest engine
+ * renders (copy32>0) and Now Playing advances. In that mode this data-path feed
+ * must stand down or the song would be double-fed. Set by the NP module.
+ */
+static bool hle_np_owns_feed;
+void ipod_classic_hle_audio_set_np_feed(bool on) { hle_np_owns_feed = on; }
+
+/* Decoded-PCM accessors for the NP module (same host-decoded song, one copy). */
+bool ipod_classic_hle_audio_have_pcm(void)
+{
+    return hle.enabled && qatomic_read(&hle.pcm_ready);
+}
+size_t ipod_classic_hle_audio_copy_pcm(size_t cursor, void *dst, size_t len)
+{
+    size_t avail, n = 0;
+
+    if (!hle.enabled || !qatomic_read(&hle.pcm_ready)) {
+        return 0;
+    }
+    qemu_mutex_lock(&hle.lock);
+    avail = (cursor < hle.pcm_len) ? hle.pcm_len - cursor : 0;
+    n = MIN(len, avail);
+    if (n) {
+        memcpy(dst, hle.pcm + cursor, n);
+    }
+    qemu_mutex_unlock(&hle.lock);
+    return n;
+}
+size_t ipod_classic_hle_audio_pcm_len(void)
+{
+    return hle.enabled ? hle.pcm_len : 0;
+}
+
 void ipod_classic_hle_audio_fill_dma(void)
 {
     PL080State *s = hle.dmac0;
@@ -661,6 +696,9 @@ void ipod_classic_hle_audio_fill_dma(void)
 
     hle.filled = false;
 
+    if (hle_np_owns_feed) {
+        return;   /* NP drives the guest engine directly; don't double-feed */
+    }
     if (!hle.enabled || !qatomic_read(&hle.pcm_ready) || !s) {
         return;
     }
