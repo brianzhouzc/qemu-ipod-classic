@@ -1618,3 +1618,47 @@ decodificado (A), publish=mensaje (B), credit fn (C), y una plataforma gateada
 `HLE_NP` que dispara el decode del huésped a voluntad para futuros experimentos.
 Recetas en `~/dbg/`: `run_np.sh`, `run_npsnap.sh`, `run_npmemw.sh`, `run_pub.sh`,
 `np_snap.py`, `catch_copy.gdb`, `catch_publish.gdb`.
+
+### 11.22 Asalto #12 (cont.): por qué la inyección nativa NO converge -- el guest no idlea durante el deadlock y t25 se desmonta antes de la ventana
+
+Continuación exhaustiva del asalto #12 con la plataforma `HLE_NP`. Medido a nivel
+de instrucción (pctrace `regpc`/`memw`, gdb no invasivo, disasm iram/osos). Cada
+capa de inyección probada topa con la siguiente; el resumen del porqué:
+
+**A) El copy 0x08016e44 (medido en el bring-up natural):** lee `count=[r4+16]`
+bytes desde `[r5+12]+([r4+4]<<2)`. Valores: `[r5+12]=0x08889098`, `[r4+4]=0`,
+`[r4+16]=0x28` (40 B), gate `[r7+5]`. El buffer 0x08889098 es un área de staging
+de 40 B; el descriptor r5=0x088890c0 va justo detrás (base+0x28), así que una
+ventana grande lo corrompe (corregido: llenar exactamente `count`).
+
+**B) Descriptores dinámicos:** en el path NATURAL (t25) el copy usa el descriptor
+de HEAP estable `r4=0x0bb12d54 r7=0x0bb12eb4` (pokeable); llamando al engine
+0x0808170c DIRECTAMENTE usa descriptores de PILA transitorios (`0x0896xxxx`, bajan
+0x3e0/render) que no se pueden pokear desde idle. El path natural corre UNA vez
+(gateado por el contador de jobs `[r5+12]=[0x22008c1c]`, render-por-job 0x22005dec).
+
+**C) El gate `[r7+5]` lo deriva el engine del estado-de-relleno del stream**
+(0x088890c0: `[+0]=0 [+4]=0x08889088 [+8]=0xa [+c]buf=0x08889098 [+10]=0x004c1bf8
+[+14]=0x580`), no del contenido del buffer. Ponerlo exige la semántica de esos
+campos (otra capa).
+
+**D) NO HAY VENTANA DE INYECCIÓN SEGURA (el hallazgo que cierra la vía de kick):**
+- Durante el deadlock el guest **NO idlea**: los pc diferidos son bucles MeCCA
+  vivos (`0x0813dd3c`, `0x081611f8`, `0x081e47fc`, `0x080c8bb0`, `0x0815bb54`).
+  Inyectar desde idle **siempre difiere** (medido: deferred monótono, bind=0).
+- Cuando el CPU llega a un punto seguro (el spin del reset suprimido por
+  `HLE_AUDIO_SUSTAIN`, 0x08322b28), **t25 ya se desmontó** (recv-timeout de 3 s →
+  `st=00`, `waiter=0`): el timbre no tiene destino.
+- Sin SUSTAIN, el guest se resetea a los ~15 s. Con SUSTAIN, spinea muerto. En
+  ninguno de los dos hay un instante con (t25 vivo + CPU en punto seguro +
+  PCM decodificado listo) a la vez.
+
+**VEREDICTO (medido): la inyección de estado/kicks desde el emulador NO puede
+abrir el pipeline nativo.** No por falta de un valor concreto, sino porque (a) no
+hay punto de inyección seguro sincronizado con t25 vivo, y (b) el render es una
+cascada de capas dinámicas (copy←descriptor←engine-build←stream-state←job-count←
+t25-loop←mensaje) que habría que conducir TODAS a la vez, en el contexto de tarea
+correcto, sin un instante en que hacerlo. Es la confirmación más fina del
+"deadlock de bootstrap estructural" de §11.12-11.18: abrirlo equivale a
+reimplementar el scheduler de render de MeCCA, no a cebar campos. La plataforma
+`HLE_NP` (gateada, default-inerte) queda para futuros intentos.

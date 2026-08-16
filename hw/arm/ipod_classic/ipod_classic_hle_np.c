@@ -119,6 +119,7 @@ typedef struct {
     bool       feed_ready;    /* datapath decode available                        */
     bool       nofill;        /* HLE_NP_NOFILL: trace descriptors, don't write PCM */
     bool       type1;         /* HLE_NP_TYPE1: force engobj render type=1          */
+    bool       call_engine;   /* HLE_NP_ENGINE: call engine directly vs ring bell  */
     uint8_t    win[NP_SRC_WINDOW];
     int        attempts;
     int        kicks;
@@ -281,14 +282,28 @@ static void np_do_kick(CPUState *cs, run_on_cpu_data data)
         np_wr8(NP_ENGOBJ + 70, 1);
     }
 
-    /* 3. Call the guest's own engine render synchronously. It fetches engobj
-     *    itself, renders the current stream (mixer -> render -> copy) over the
-     *    PCM we just staged, and returns to the idle loop (LR=ret). */
-    env->regs[0]  = 0;
-    env->regs[1]  = 0;
-    env->regs[14] = ret;
-    env->thumb    = false;
-    env->regs[15] = NP_ENGINE_RENDER;
+    /* 3. Trigger the render. Two modes:
+     *    - default: RING THE DOORBELL (guest stub 0x22006870) so the NATURAL t25
+     *      render path runs -- it uses the stable HEAP descriptor (0x0bb12d54/eb4)
+     *      we poked in step 2, so the copy sees our gate+PCM.
+     *    - HLE_NP_ENGINE: call the engine render directly (uses transient STACK
+     *      descriptors; kept for experiments). */
+    if (np.call_engine) {
+        env->regs[0]  = 0;
+        env->regs[1]  = 0;
+        env->regs[14] = ret;
+        env->thumb    = false;
+        env->regs[15] = NP_ENGINE_RENDER;
+    } else {
+        if (waiter == 0) {
+            return;   /* t25 not parked on the doorbell yet */
+        }
+        env->regs[0]  = NP_RING_OBJ;
+        env->regs[1]  = 0;
+        env->regs[14] = ret;
+        env->thumb    = false;
+        env->regs[15] = NP_SIGNAL_STUB;
+    }
     cs->halted    = 0;
     np.bind_kicks++;
     np.kicks++;
@@ -367,6 +382,7 @@ void ipod_classic_hle_np_init(ARMCPU *cpu)
     np.dec_only = np_env_on("HLE_NP_DEC_ONLY");
     np.nofill = np_env_on("HLE_NP_NOFILL");
     np.type1 = np_env_on("HLE_NP_TYPE1");
+    np.call_engine = np_env_on("HLE_NP_ENGINE");
     np.src_buf = np_env_hex("HLE_NP_SRC", NP_COPY_SRC_BUF);
     np.gate_byte = np_env_hex("HLE_NP_GATE", NP_COPY_GATE_BYTE);
     np.r4 = np_env_hex("HLE_NP_R4", NP_COPY_R4);
