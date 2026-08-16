@@ -114,5 +114,8 @@ uint64_t ipod_classic_hle_audio_total_frames(void);              /* duration */
 int      ipod_classic_hle_audio_track_index(void);
 int      ipod_classic_hle_audio_track_count(void);
 const char *ipod_classic_hle_audio_track_name(void);
+const char *ipod_classic_hle_audio_track_title(void);
+const char *ipod_classic_hle_audio_track_artist(void);
+const char *ipod_classic_hle_audio_track_album(void);
 
 #endif /* IPOD_CLASSIC_HLE_AUDIO_H */

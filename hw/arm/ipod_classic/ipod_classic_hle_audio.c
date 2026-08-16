@@ -141,6 +141,11 @@ typedef struct {
     int         decode_gen;         /* bumped on each decode request           */
     int         decoded_gen;        /* last generation the worker installed     */
 
+    /* Current track tags (from ffprobe), for the Now Playing overlay. */
+    char        cur_title[96];
+    char        cur_artist[96];
+    char        cur_album[96];
+
     QemuThread  worker;
     QemuMutex   lock;
     QemuCond    cond;               /* worker waits for a decode request        */
@@ -419,6 +424,34 @@ static void hle_scan_disk(void)
  * ffmpeg to 16-bit stereo 44100 PCM. Runs on the worker thread so the ~1 s
  * decode never stalls the vCPU or the drain timer.
  */
+/* Read one format/stream tag from a media file via ffprobe into out[0..n).
+ * Leaves out[0]=0 on any failure. */
+static void hle_probe_tag(const char *file, const char *key, char *out, size_t n)
+{
+    char cmd[1400];
+    FILE *pp;
+    size_t got = 0;
+
+    out[0] = '\0';
+    snprintf(cmd, sizeof(cmd),
+             "ffprobe -v quiet -show_entries format_tags=%s:stream_tags=%s "
+             "-of default=nw=1:nk=1 '%s' 2>/dev/null", key, key, file);
+    pp = popen(cmd, "r");
+    if (!pp) {
+        return;
+    }
+    got = fread(out, 1, n - 1, pp);
+    pclose(pp);
+    out[got] = '\0';
+    /* Trim trailing newline(s)/CR and any extra lines (keep the first). */
+    for (size_t i = 0; i < got; i++) {
+        if (out[i] == '\n' || out[i] == '\r') {
+            out[i] = '\0';
+            break;
+        }
+    }
+}
+
 static uint8_t *hle_decode_track(int k, size_t *out_used)
 {
     HLETrack *t;
@@ -488,6 +521,16 @@ static uint8_t *hle_decode_track(int k, size_t *out_used)
         }
     }
     pclose(pp);
+
+    /* Real title/artist/album for the Now Playing overlay (ffprobe; no new
+     * dependency). Fall back to the FAT 8.3 name when a tag is absent. */
+    hle_probe_tag(tmp, "title",  hle.cur_title,  sizeof(hle.cur_title));
+    hle_probe_tag(tmp, "artist", hle.cur_artist, sizeof(hle.cur_artist));
+    hle_probe_tag(tmp, "album",  hle.cur_album,  sizeof(hle.cur_album));
+    if (!hle.cur_title[0]) {
+        g_strlcpy(hle.cur_title, t->name, sizeof(hle.cur_title));
+    }
+
     unlink(tmp);
 
     if (used == 0) {
@@ -810,6 +853,18 @@ const char *ipod_classic_hle_audio_track_name(void)
         return hle.tracks[hle.chosen].name;
     }
     return "";
+}
+const char *ipod_classic_hle_audio_track_title(void)
+{
+    return (hle.enabled && hle.cur_title[0]) ? hle.cur_title : "";
+}
+const char *ipod_classic_hle_audio_track_artist(void)
+{
+    return (hle.enabled && hle.cur_artist[0]) ? hle.cur_artist : "";
+}
+const char *ipod_classic_hle_audio_track_album(void)
+{
+    return (hle.enabled && hle.cur_album[0]) ? hle.cur_album : "";
 }
 
 void ipod_classic_hle_audio_fill_dma(void)

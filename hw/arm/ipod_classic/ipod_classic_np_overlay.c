@@ -93,12 +93,29 @@ static int draw_string(uint16_t *fb, int W, int H, int x, int y,
     return x;
 }
 
-/* Centre a string horizontally at width W. */
+/* Centre a string horizontally at width W, truncating with an ellipsis if it
+ * would run off-screen at scale s. */
 static void draw_string_centered(uint16_t *fb, int W, int H, int y,
                                  const char *str, uint16_t fg, int s)
 {
+    char buf[64];
+    int maxchars = (W - 4) / (8 * s);
     int len = (int)strlen(str);
-    int x = (W - len * 8 * s) / 2;
+    int x;
+
+    if (len > maxchars && maxchars > 2) {
+        int keep = maxchars - 2;
+        if (keep > (int)sizeof(buf) - 3) {
+            keep = (int)sizeof(buf) - 3;
+        }
+        memcpy(buf, str, keep);
+        buf[keep] = '.';
+        buf[keep + 1] = '.';
+        buf[keep + 2] = '\0';
+        str = buf;
+        len = keep + 2;
+    }
+    x = (W - len * 8 * s) / 2;
     if (x < 2) {
         x = 2;
     }
@@ -154,17 +171,32 @@ void ipod_classic_np_overlay_draw(uint16_t *fb, int w, int h)
     draw_string(fb, w, h, w - 8 * 8 - 6, 3,
                 ipod_classic_hle_audio_paused() ? " PAUSED" : "PLAYING", dim, 1);
 
-    /* Track title (2x) + index. */
-    name = ipod_classic_hle_audio_track_name();
+    /* Track title (2x) -- real tag if present, else the file name. */
+    name = ipod_classic_hle_audio_track_title();
+    if (!name || !*name) {
+        name = ipod_classic_hle_audio_track_name();
+    }
     if (!name || !*name) {
         name = "Track";
     }
-    draw_string_centered(fb, w, h, 70, name, fg, 2);
+    draw_string_centered(fb, w, h, 60, name, fg, 2);
+
+    /* Artist / album (real tags if present). */
+    {
+        const char *artist = ipod_classic_hle_audio_track_artist();
+        const char *album  = ipod_classic_hle_audio_track_album();
+        if (artist && *artist) {
+            draw_string_centered(fb, w, h, 92, artist, fg, 1);
+        }
+        if (album && *album) {
+            draw_string_centered(fb, w, h, 106, album, dim, 1);
+        }
+    }
 
     snprintf(idx, sizeof(idx), "Track %d of %d",
              ipod_classic_hle_audio_track_index() + 1,
              ipod_classic_hle_audio_track_count());
-    draw_string_centered(fb, w, h, 104, idx, dim, 1);
+    draw_string_centered(fb, w, h, 124, idx, dim, 1);
 
     /* Progress bar + times. */
     pos   = ipod_classic_hle_audio_position_frames();
