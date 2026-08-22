@@ -698,6 +698,19 @@ bool ipod_classic_hle_audio_active(void)
            (hle.chosen >= 0 || qatomic_read(&hle.pcm_ready));
 }
 
+/*
+ * True when reset suppression is armed (HLE_AUDIO_SUSTAIN), regardless of
+ * whether a song has been chosen yet. The blank-tag ("--------") reboot is NEVER
+ * a legitimate boot -- it is the deadlock watchdog OR the battery-low path -- so
+ * with SUSTAIN on we hold it off during plain menu BROWSING too, otherwise the
+ * guest reboots out from under the user (~46 s) before they reach the music
+ * menu. Real reboots (diskmode/retailOS tags) are gated separately by the tag.
+ */
+bool ipod_classic_hle_audio_sustain_on(void)
+{
+    return hle.enabled && hle.sustain;
+}
+
 void ipod_classic_hle_audio_notify_play_start(void)
 {
     if (!hle.enabled) {

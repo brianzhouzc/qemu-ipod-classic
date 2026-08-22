@@ -88,6 +88,11 @@ void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len);
  */
 bool ipod_classic_hle_audio_active(void);
 
+/* True when HLE_AUDIO_SUSTAIN is armed (independent of whether a song is chosen).
+ * Used to hold off the blank-tag deadlock/battery reboot during menu browsing so
+ * the guest stays alive long enough to reach the music menu. */
+bool ipod_classic_hle_audio_sustain_on(void);
+
 /* --- Bridge to the Now-Playing bootstrap (ipod_classic_hle_np.c) ----------- */
 
 /* When true, the NP module owns audio: it feeds the guest's own render engine's

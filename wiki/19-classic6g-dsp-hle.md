@@ -1662,3 +1662,57 @@ correcto, sin un instante en que hacerlo. Es la confirmación más fina del
 "deadlock de bootstrap estructural" de §11.12-11.18: abrirlo equivale a
 reimplementar el scheduler de render de MeCCA, no a cebar campos. La plataforma
 `HLE_NP` (gateada, default-inerte) queda para futuros intentos.
+
+### 11.23 DÓNDE ESTAMOS: reproductor Now Playing HLE (overlay) usable, con play/pausa/seek/skip
+
+Tras cerrar por medida que el pipeline de render NATIVO de MeCCA es un deadlock
+estructural sin apertura por inyección (§11.12-11.22), y validar con una
+investigación multi-agente qué SÍ es alcanzable, se implementó un **reproductor
+Now Playing funcional por HLE** (no la UI nativa de Apple). Committeado en la rama
+`dsp-deadlock-break`.
+
+**Qué es real y qué es HLE (honesto).**
+- **Audio: REAL.** La canción del disco del huésped, decodificada host-side, por
+  el DMA/I2S propio (CS42L55) → altavoces (Pearson 1.000, §11.19).
+- **Pantalla del reproductor: HLE (dibujada por QEMU).** Un overlay sobre el
+  framebuffer RGB565 (`ipod_classic_np_overlay.c`), NO la pantalla Now Playing
+  del retailOS (que nunca se dibuja: render nativo en deadlock, `copy32`=0).
+- **Controles: reales sobre el datapath.** Los botones de la rueda manejan la
+  reproducción HLE, no el media player nativo.
+
+**Los dos arreglos clave que lo hicieron posible.**
+1. **El guest ya no se congela pasados los 15 s.** `ipod_classic_clk.c`: al
+   suprimir el reinicio-watchdog de tag en blanco "--------", ahora **redirige la
+   CPU a retornar de la rutina de reset** (PC=LR, la rutina 0x08322b10 es una
+   hoja llamada con bl) en vez de dejarla en el spin muerto 0x08322b28. Además,
+   con `HLE_AUDIO_SUSTAIN` se suprime el reset en blanco **también durante la
+   navegación de menús** (gate `ipod_classic_hle_audio_sustain_on()`), no solo al
+   reproducir, para que el guest no reinicie a ~46 s antes de llegar a Música.
+   (Descubrimiento del workflow: la pantalla NO depende de `copy32` ni del
+   escalador; el único bloqueo de una pantalla estable era este auto-reinicio, y
+   el SUSTAIN previo lo suprimía DEMASIADO TARDE dejando la CPU congelada.)
+2. **Capa de control sobre el cursor único `hle.pcm_cursor`** (`hle_audio.c`):
+   pausa (congela feed+drain en `i2s.c` → silencio real, sin zumbido),
+   seek ±s (salta el cursor), siguiente/anterior (worker reestructurado a bucle
+   de peticiones de decode con contador de generación), y getters de posición/
+   duración/pista. `sm1.c` +0xa48 lee el cursor del datapath. Metadatos reales
+   (título/artista/álbum) vía `ffprobe`.
+
+**Controles (teclado):** `s`=play/pausa, `d`/`a`=siguiente/anterior, `]`/`[`=
+seek ±5 s, `w`=ocultar (volver al menú). El overlay auto-aparece al decodificar
+una pista y **NO secuestra SELECT** (bug corregido: hacía "atrancar" el menú).
+
+**Verificado (capturas + WAV):** overlay muestra "Numb / Encore" — "Linkin Park",
+"Track 1 of 4", barra + reloj avanzando (0:06→0:47→1:02); pausa congela el reloj
+("PAUSED") y el WAV deja de crecer (silencio); seek salta; siguiente re-decodifica
+(track 1→2→3 de 4). Todo gateado (`HLE_NP_OVERLAY` + `HLE_AUDIO_DATAPATH`/
+`SUSTAIN`); build por defecto byte-idéntico (sin regresión Rockbox/navtest).
+
+**Cómo lanzarlo:** `HLE_AUDIO_DATAPATH=1 HLE_AUDIO_DISK=<img> HLE_AUDIO_SUSTAIN=1
+AUDIOPACE=1 AUDIOLIVE=1 HLE_NP_OVERLAY=1 qemu-system-arm -M iPod-Classic -kernel
+osos_decrypted.bin -drive if=ide,format=raw,file=<img> -snapshot -audio pa`.
+
+**Lo que queda (nativo, sin garantía):** hacer aparecer la pantalla Now Playing
+REAL de Apple exige reconstruir el protocolo de streams/jobs/mensajes de MeCCA
+capa por capa (§11.22); el redirect ya mantiene vivo al guest, pero su contador
+de tiempo nativo sigue muerto. Fuera de alcance de esta entrega.

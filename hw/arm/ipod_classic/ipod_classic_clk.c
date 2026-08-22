@@ -106,7 +106,7 @@ static void ipod_classic_clk_write(void *opaque, hwaddr offset,
              * HLE is not active) are untouched. Gated entirely by
              * HLE_AUDIO_DATAPATH; default build unaffected.
              */
-            if (ipod_classic_hle_audio_active() && tag[0] == '-') {
+            if (ipod_classic_hle_audio_sustain_on() && tag[0] == '-') {
                 /*
                  * Suppress the deadlock-watchdog reboot AND redirect the CPU out
                  * of the dead reset spin. wiki/19 s11.20 found the old suppress

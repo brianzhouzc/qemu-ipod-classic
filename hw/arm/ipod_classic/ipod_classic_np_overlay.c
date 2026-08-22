@@ -238,22 +238,21 @@ void ipod_classic_np_overlay_key(int keycode)
     if (!ov.enabled || !down) {
         return;
     }
+    /*
+     * The overlay's controls act ONLY while it is showing (i.e. a song is
+     * playing). Crucially it must NOT hijack SELECT (Enter) -- that is the
+     * primary menu-navigation button; grabbing it froze the menu. So we take no
+     * keys while the overlay is hidden: the guest gets everything and the menu
+     * is fully navigable. The overlay auto-shows once a track decodes.
+     */
+    if (!ipod_classic_np_overlay_active()) {
+        return;
+    }
     switch (sc) {
-    case SC_ENTER:                       /* SELECT: show the player */
-        ov.visible = true;
-        ov.user_hid = false;
-        break;
-    case SC_W:                           /* MENU: hide (reveal guest menu) */
+    case SC_W:                           /* MENU: hide (back to the guest menu) */
         ov.visible = false;
         ov.user_hid = true;
         break;
-    default:
-        break;
-    }
-    if (!ov.visible) {
-        return;                          /* controls act only while shown */
-    }
-    switch (sc) {
     case SC_S:                           /* PLAY/PAUSE */
         ipod_classic_hle_audio_toggle_pause();
         break;
