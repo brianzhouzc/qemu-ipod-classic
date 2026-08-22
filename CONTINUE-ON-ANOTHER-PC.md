@@ -44,6 +44,7 @@ así que van en una **GitHub Release** del repo, no en el árbol git
 | `osos_decrypted.bin` | `assets/classic6g/` | kernel del retailOS (`-kernel`) |
 | `rsrc_fat16.img`, `aupd_decrypted.bin`, `bootflash_nor_1MB.bin` | `assets/classic6g/` | recursos / boot del 6G |
 | `Emulti.img` | `~/6g/` (o donde prefieras) | disco con música (una canción; para probar el reproductor) |
+| `osos.dis`, `iram.dis` | `~/6g/` | desensamblado (VA = off + 0x07FF51B8) que usan las sondas de `tools/session-dbg/` |
 
 Ajusta las rutas `HLE_AUDIO_DISK` / `-drive` a donde pongas `Emulti.img`.
 
