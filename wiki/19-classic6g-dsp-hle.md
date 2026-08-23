@@ -1716,3 +1716,70 @@ osos_decrypted.bin -drive if=ide,format=raw,file=<img> -snapshot -audio pa`.
 REAL de Apple exige reconstruir el protocolo de streams/jobs/mensajes de MeCCA
 capa por capa (§11.22); el redirect ya mantiene vivo al guest, pero su contador
 de tiempo nativo sigue muerto. Fuera de alcance de esta entrega.
+
+### 11.24 Asalto #13: la hipótesis de TIMING refutada por medida (sweep icount), y el encolado de render localizado como camino MUERTO en frío
+
+Sesión de retome en máquina nueva (clon limpio + WSL Ubuntu-24.04, QEMU 8.2 +
+`libpctrace.so` recompilados, assets desde la Release `assets-v1`). El baseline
+**reproduce el deadlock idéntico** al documentado (`copy32=0`, `h12=1`, `ex6=57`
+matches, `mbox52` cero envíos, `engine=1`) — la emulación es fiel entre máquinas.
+Dos experimentos NUEVOS, ambos **VERIFICADOS** por `pctrace` no invasivo. Runners:
+`tools/session-dbg/run_icount.sh`, `sweep_icount.sh`, `run_bind.sh`.
+
+**A) El sweep de `-icount` — la hipótesis de timing, propuesta 3× (§11.12/§11.14/
+§11.16) y nunca corrida, queda REFUTADA por medida.** Se corrió el mismo probe de
+play navegado bajo `-icount shift={off,1,2,3,4}` (≈1000, 500, 250, 125, 62.5 MIPS;
+el core real ARM926 ronda ~200 MIPS ⇒ shift 2-3). El core es único (`max_cpus=1`,
+`arm926`) y ningún dispositivo de la máquina usa reloj de host (i2s/timers/pl080 =
+`QEMU_CLOCK_VIRTUAL`/`ptimer`), así que bajo icount la máquina es **determinista**.
+Resultado:
+
+| shift | MIPS | copy32 | h12 | ex6 | mbox52 envíos | engine |
+|---|---|---|---|---|---|---|
+| off | ~1000 | **0** | 1 | 57 | 0 | 1 |
+| 1 | 500 | **0** | 1 | 57 | 0 | 1 |
+| 2 | 250 | **0** | 1 | 57 | 0 | 1 |
+| 3 | 125 | **0** | 1 | 56 | 0 | 1 |
+| 4 | 62.5 | **0** | 1 | 56 | 0 | 1 |
+
+`copy32=0` es **invariante** en todo el rango. El muro **NO es una carrera de
+scheduling** sensible a la velocidad del guest: es estructural (confirma §11.13-E,
+y da la razón al auditor de §11.13/§11.14 — "el determinismo por sí solo no basta").
+El régimen A/B de §11.11 era artefacto del PESO de la instrumentación, no del ritmo
+de CPU. `icount` queda **cerrado como arreglo**; sólo sirve ya como replay
+determinista para sondas pesadas.
+
+**B) El encolado de render, localizado a nivel de instrucción como camino MUERTO en
+frío (refina §11.18).** Decodificado en `iram.dis`: el contador de jobs de render
+`[0x22008c1c]` y el objeto del motor `[0x220106d0]` los comparte una **familia de
+timbres** del motor, todos con la forma `[0x22008c1c]++; signal(motor)` vía el
+veneer KS `0x22003670→0x080a1858`:
+- `0x220060e0` (`jobenq`, gateado por `[engobj+0x44]`): **hits=0** — nunca corre.
+- `0x2200683c…0x22006878` (el "timbre de render" `0x22006870` de §11.17): gateado
+  por **`[engobj+0x46]!=0`** (`cmp [r0+0x46],#0; bxeq lr`); §11.18-C midió
+  `+0x46=0` en frío ⇒ **retorna sin encolar**.
+- `0x22005e58` (`bindchk`: `if [descr+5]==1 return; else job_setup`): **hits=0** —
+  la comprobación que vincularía fuente↔copia **nunca se invoca** (se despacha por
+  vtable `bx r1`, no por `bl`, y su slot no se alcanza en frío).
+
+Sonda `run_bind.sh` (pc-watch + `memw=0x22008c1c`): el contador de jobs recibe **3
+escrituras totales** — 2 de un `memset` (`0x080001a0`) y **1 sola** del bring-up
+único del motor (`0x220067b8`) — y **CERO del incrementador de `jobenq`
+(`0x220060f8`)**. Es decir: **jamás se encola un job de render**; el motor corre su
+setup una vez (§11.13-B) y se queda esperando el timbre que su propio gate
+`[engobj+0x46]=0` impide emitir. Es la afirmación más limpia del muro: no es que
+falte un valor, es que **el slot de vtable del encolado de render nunca se despacha
+en el arranque en frío**, porque su habilitación (`+0x46`, y simétricamente el
+binding del descriptor `0x0bb12d54`) sólo la pone el propio ciclo de render que
+nunca arranca. Coherente con la simetría de §11.18-D; forzar un solo gate no basta
+(§11.18 ya forzó `+0x46=1`/`+88=1` → `copy32=0`).
+
+**VEREDICTO (medido, esta sesión):** el asalto #13 **cierra la vía de timing** (icount
+refutado) y **afina el muro** al slot de vtable de encolado de render que no se
+despacha en frío. NO abre el pipeline nativo. La única vía restante sigue siendo la
+de §11.14/§11.18: un **HLE del cebado de MeCCA** que despache el primer job de render
+en el contexto de tarea correcto (poner `+0x46`, encolar vía `0x220060e0`, vincular
+el descriptor `0x0bb12d54` con `[descr+5]=1`) — trabajo abierto, sin garantía de
+convergencia. El iPod físico **no aporta** aquí (diskless, sólo emCORE; no ejecuta el
+retailOS reproduciendo — wiki/10 §0/§5). Árbol del modelo byte-idéntico (sólo esta
+entrada de wiki + runners en `tools/session-dbg/`); baseline/Rockbox sin tocar.
