@@ -379,10 +379,15 @@ static void vcpu_regpc_exec(unsigned int cpu_index, void *udata)
     rp->logged++;
 
     uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, sp = 0, lr = 0;
+    uint32_t r4 = 0, r5 = 0, r6 = 0, r7 = 0;
     read_reg32(0, &r0);
     read_reg32(1, &r1);
     read_reg32(2, &r2);
     read_reg32(3, &r3);
+    read_reg32(4, &r4);
+    read_reg32(5, &r5);
+    read_reg32(6, &r6);
+    read_reg32(7, &r7);
     read_reg32(13, &sp);
     read_reg32(14, &lr);
 
@@ -393,9 +398,11 @@ static void vcpu_regpc_exec(unsigned int cpu_index, void *udata)
     fprintf(out, "PCTRACE +%8" PRId64 "us cpu%u  REGPC %-12s pc=0x%08" PRIx64
             "  lr=0x%08" PRIx32 "  r0=0x%08" PRIx32 " r1=0x%08" PRIx32
             " r2=0x%08" PRIx32 " r3=0x%08" PRIx32 " sp=0x%08" PRIx32
+            " r4=0x%08" PRIx32 " r5=0x%08" PRIx32 " r6=0x%08" PRIx32
+            " r7=0x%08" PRIx32
             "  (match#%" PRIu64 " hit#%" PRIu64 ")\n",
             now - t0, cpu_index, rp->label, rp->pc, lr, r0, r1, r2, r3, sp,
-            rp->matches, rp->hits);
+            r4, r5, r6, r7, rp->matches, rp->hits);
     fflush(out);
 }
 

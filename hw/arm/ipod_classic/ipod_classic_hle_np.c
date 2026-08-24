@@ -120,6 +120,8 @@ typedef struct {
     bool       nofill;        /* HLE_NP_NOFILL: trace descriptors, don't write PCM */
     bool       type1;         /* HLE_NP_TYPE1: force engobj render type=1          */
     bool       call_engine;   /* HLE_NP_ENGINE: call engine directly vs ring bell  */
+    bool       passive;       /* HLE_NP_PASSIVE: memory-only prefill, no PC hijack */
+    int        prefills;      /* passive prefill ticks applied                     */
     uint8_t    win[NP_SRC_WINDOW];
     int        attempts;
     int        kicks;
@@ -320,6 +322,74 @@ static void np_do_kick(CPUState *cs, run_on_cpu_data data)
     (void)ctx; (void)waiter;
 }
 
+/* ------------------------------------------- passive prefill (vCPU thread) -- */
+/*
+ * The idle-gated CPU hijack (np_do_kick) can never land during the deadlock:
+ * the guest busy-loops in MeCCA spinlocks and never reaches the RTXC idle loop,
+ * so every kick defers forever (measured: deferred climbs into the thousands,
+ * kicks=0; wiki/19 §11.22-D). But the copy routine 0x08016e44 only needs three
+ * MEMORY conditions to run its loop on the motor's single natural render:
+ * [r4]==0, [r7+5]==1, and the source ring filled. Those are plain stores; they
+ * do NOT need the CPU at idle. This callback keeps them primed on every tick so
+ * that whenever the guest's OWN natural render runs, its copy sees real PCM and
+ * copy32 fires -- no PC hijack, no injection window needed. It runs on the vCPU
+ * thread (via async_run_on_cpu) so guest memory is coherent at a TB boundary.
+ */
+static void np_do_prefill(CPUState *cs, run_on_cpu_data data)
+{
+    np.pending = false;
+
+    /*
+     * 1. Ensure the source descriptor points at a valid staging buffer. In cold
+     *    start [descr+12] reads 0 (the buffer is populated only by the render
+     *    that is itself deadlocked, wiki/19 §11.18-C), so the copy would read
+     *    from address 0. Force the descriptor to our known staging buffer
+     *    (np.src_buf) whenever it is unset, and fill that buffer with the
+     *    host-decoded song (or silence until the decode is ready, so the copy
+     *    can still run and copy32 can fire on the motor's single natural render).
+     */
+    uint32_t buf = np_rd32(NP_COPY_SRC_DESCR + NP_COPY_SRC_OFF);
+    if (buf < 0x08000000u || buf >= 0x0c000000u) {
+        buf = np.src_buf;
+        np_wr32(NP_COPY_SRC_DESCR + NP_COPY_SRC_OFF, buf);  /* [descr+12]=src */
+    }
+    if (!np.nofill && buf >= 0x08000000u && buf < 0x0c000000u) {
+        uint32_t off = np_rd32(np.r4 + 4);
+        uint32_t cnt = np_rd32(np.r4 + 16) & 0xffff;
+        if (cnt == 0 || cnt > 0x28) {
+            cnt = 0x28;                    /* default staging size (40 B) */
+        }
+        uint32_t dst = buf + (off << 2);
+        size_t got = 0;
+        if (np.feed_ready) {
+            got = ipod_classic_hle_audio_copy_pcm(np.pcm_cursor, np.win, cnt);
+        }
+        if (got == 0) {
+            memset(np.win, 0, cnt);        /* silence until decode is ready */
+            got = cnt;
+        }
+        cpu_physical_memory_write(dst, np.win, got);
+        np.feeds++;
+    }
+
+    /* 2. Keep the copy gate open on the stable heap descriptors and arm the
+     *    engine render gates. Re-applied every tick so a guest clear cannot win
+     *    for long. */
+    np_wr8(np.gate_byte, 1);          /* [r7+5] = 1  */
+    np_wr8(np.r4, 0);                 /* [r4]   = 0  */
+    np_wr8(NP_ENGOBJ + NP_ENG_GATE_OFF, 1);
+    np_wr8(NP_ENGOBJ + 70, 1);        /* engobj+0x46 render doorbell enable */
+    if (np.type1) {
+        np_wr8(NP_ENGOBJ + NP_ENG_TYPE_OFF, 1);
+    }
+    np.prefills++;
+    if (np.trace && np.prefills <= 6) {
+        fprintf(stderr, "HLE_NP: PREFILL #%d gate[%08x]=1 r4[%08x]=0 "
+                "srcbuf=%08x feed=%d head=%08x\n", np.prefills, np.gate_byte,
+                np.r4, buf, np.feed_ready, np_rd32(buf));
+    }
+}
+
 /* ---------------------------------------------------- the retry (iothread) -- */
 
 static void np_attempt(void *opaque)
@@ -329,7 +399,18 @@ static void np_attempt(void *opaque)
         return;
     }
     np.feed_ready = ipod_classic_hle_audio_have_pcm();
-    if (!np.pending && (np.feed_ready || np_decoder_ctx() || np_ring_waiter())) {
+    if (np.passive) {
+        /* Memory-only prefill: no idle requirement, no PC hijack, and NOT gated
+         * on feed_ready -- the host decode only reports ready ~60s after the
+         * motor's single natural render (measured), so we must have the gate +
+         * source primed from play-start. The prefill writes silence until real
+         * PCM is available, so the copy can run regardless. */
+        if (!np.pending) {
+            np.pending = true;
+            async_run_on_cpu(CPU(np.cpu), np_do_prefill, RUN_ON_CPU_NULL);
+        }
+    } else if (!np.pending &&
+               (np.feed_ready || np_decoder_ctx() || np_ring_waiter())) {
         np.pending = true;
         async_run_on_cpu(CPU(np.cpu), np_do_kick, RUN_ON_CPU_NULL);
     }
@@ -383,6 +464,7 @@ void ipod_classic_hle_np_init(ARMCPU *cpu)
     np.nofill = np_env_on("HLE_NP_NOFILL");
     np.type1 = np_env_on("HLE_NP_TYPE1");
     np.call_engine = np_env_on("HLE_NP_ENGINE");
+    np.passive = np_env_on("HLE_NP_PASSIVE");
     np.src_buf = np_env_hex("HLE_NP_SRC", NP_COPY_SRC_BUF);
     np.gate_byte = np_env_hex("HLE_NP_GATE", NP_COPY_GATE_BYTE);
     np.r4 = np_env_hex("HLE_NP_R4", NP_COPY_R4);
