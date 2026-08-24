@@ -1783,3 +1783,124 @@ el descriptor `0x0bb12d54` con `[descr+5]=1`) — trabajo abierto, sin garantía
 convergencia. El iPod físico **no aporta** aquí (diskless, sólo emCORE; no ejecuta el
 retailOS reproduciendo — wiki/10 §0/§5). Árbol del modelo byte-idéntico (sólo esta
 entrada de wiki + runners en `tools/session-dbg/`); baseline/Rockbox sin tocar.
+
+### 11.25 Asalto #13 (cont.): el lazo del motor MeCCA decodificado entero; SM1 sin IRQ (hueco de fidelidad REAL); y por qué forzar cada capa no basta
+
+Sesión larga de retome en máquina nueva. Contiene **una corrección importante de una
+afirmación propia** (§A), el **mecanismo completo del lazo de render** que trece
+asaltos no habían decodificado (§C), y un **hueco de fidelidad genuino del modelo**
+(§D). El muro nativo **NO cae**, pero el mapa cambia de forma sustancial.
+
+**A) CORRECCIÓN: el `copy32=2` de §11.24 NO fue un render.** Con un hook de PC
+externo (breakpoint gdb en `0x08016e88`, CPU detenido) se forzó `[r7+5]=1` y el copy
+**ejecutó** — `copy32=2`, `copygo=1`, primera vez en 13 asaltos que el contador se
+mueve. Pero midiendo el puntero destino en el store (`regpc` en `0x08016eb4`):
+**`r2 = 0x2238b800`**, y la IRAM del S5L8702 va de `0x22000000` a `0x22040000`. El
+copy escribía **3,4 MB FUERA de la RAM**, porque el campo `[r4+12]` del descriptor
+vale `0x0036b800` (basura). **El gate estaba cerrado por una razón legítima:** el
+contexto de render no existe en frío. Forzarlo produce una escritura fuera de rango,
+no audio. Lección: un contador que se mueve no es una trama.
+
+**A2) La tormenta de excepciones NO la causan los hooks.** `CPU_exception_handler`
+(semihosting del retailOS): **1** en baseline limpio, **111 722** en toda corrida con
+`HLE_AUDIO_SUSTAIN`, incluidas las que no llevan hook ni `HLE_NP`. Es un coste
+preexistente de SUSTAIN (suprime un reset que el firmware quiere) y conviene tenerlo
+presente al interpretar cualquier medida hecha con esa configuración.
+
+**B) La ventana de inyección, RESUELTA (mecanismo).** `HLE_NP_PASSIVE` (nuevo,
+gateado): ceba la fuente del copy y los gates por **escrituras de memoria puras**,
+sin secuestrar el PC ni exigir CPU en idle. **`deferred=0`**, frente a 1000+ intentos
+diferidos y **cero** kicks aterrizados del método de §11.22-D. El muro "no hay ventana
+de inyección" queda superado como mecanismo — lo que no basta es lo que se inyecta.
+También se midió que el host-decode (`have_pcm`) sólo está listo ~48 s **después** del
+único render natural, así que el prefill se arma desde el play-start.
+
+**C) EL LAZO DEL MOTOR, DECODIFICADO ENTERO** (desensamblado, en parte por análisis
+multi-agente; corrige el modelo mental de §11.13/§11.14):
+
+- **"mbox 0x52" NO es un buzón.** Es una **variable de condición** (`0x220106d0`) con
+  timeout de 3000 ms (`0x22006814` → `0x080b3e78` → `0x0805c518`). Su "post"
+  (`0x080a1858` con `r1=0` → `0x08051bac`) es un **notify-one sin datos**, y es
+  **no-op si nadie está encolado**. Por eso forzar el `recv` a devolver éxito
+  (medido: 6 veces) no produjo absolutamente nada.
+- **El motor es el hilo `"MeCCADecode"`** (IRAM `0x22002f5c`, creado en `0x22005f48`,
+  16 KB de pila, prio 10). Hermanos del mismo constructor: `"FrameDone"`
+  (`0x22004630`) y `"EndOfStream"` (`0x22004754`).
+- **Al despertar NO actúa sobre la señal:** re-testea el **contador de jobs
+  `0x22008c1c`** (`0x22002fe0`: `ldr/cmp/ble`, con signo) y si es `<= 0` vuelve
+  directo a su espera de 3 s. Las notificaciones son irrelevantes sin jobs.
+- **Con `jobcount > 0`** llama al pump (`0x22005dec` → slot vtable +0x20 →
+  `0x22006118`) y **decrementa** el contador.
+- **El lazo es autosostenido por diseño:** si el pump devuelve 0, el motor
+  **re-encola** un job (`0x22005e38` → `0x220067e4`, `jobcount++`) — el contador se
+  mantiene y el render corre libre. **Un solo pump exitoso bastaría.**
+- **Lo que lo rompe:** el pump **aborta con −1 nada más entrar** si
+  **`[engobj+0x44] != 0`** (`0x22006170`, escribe estado 5 en `0x22008c54`); segunda
+  salida temprana si `[engobj+0x4c] == 2`. Un solo −1 y el motor **no re-encola**: el
+  contador cae a 0 y el lazo **aparca para siempre**. Ése es el deadlock.
+- **Medido y aún sin explicar:** el render llamado en `0x22006300` **nunca retorna**
+  (`0x22006304` hits=0, **también en baseline limpio**) — coherente con el
+  `dpgateclr = 0` que §11.18-C midió sin interpretar.
+
+**D) HUECO DE FIDELIDAD REAL: SM1 no tenía interrupción, y la IRQ 18 no estaba
+cableada.**
+
+- El retailOS **instala un handler** (`0x08017378`) en el **índice 18** de la tabla
+  del VIC (cadena `0x0813e688` → `0x080159c0` → IRAM `0x22004cc4`, que guarda el
+  handler en `tabla+8+id*4` y toca `VIC0+0x14`).
+- Ese handler lee un registro **SM1** (getter `0x080a7638`, el mismo del bring-up de
+  audio), testea el **bit 2**, y **señala el evento `0x22008c58`** (`0x080173cc` →
+  `0x080a1a24`) — exactamente el evento que el **predicado del pump** (`0x0808af58`)
+  espera **500 ms** antes de rendirse. (Nota: el retorno del predicado sale de esa
+  espera, **no** del test del bit 12 de SM1+0xa98, que sólo gatea unas escrituras de
+  enable — eso explica por qué el experimento de §11.14-D no vio nada.)
+- **El guest tiene la línea 18 HABILITADA:** `VIC0 IntEnable = 0x21a7010f` (§11.12-C)
+  tiene el **bit 18 activo**, junto a 16/17 (DMAC), 8 (timer), 23 (wheel), 29 (ATA).
+- **Nuestro modelo no podía levantarla jamás:** `ipod_classic_sm1.c` no tenía
+  `qemu_irq` ni `sysbus_init_irq`, y la máquina nunca hacía `sysbus_connect_irq`. El
+  mapa de IRQ salió de Rockbox (`s5l87xx.h`), cuya tabla tiene un **HUECO justo en la
+  18** porque Rockbox decodifica en el ARM y **no usa SM1**.
+- **Implementado:** `qemu_irq` en SM1 + `sysbus_connect_irq` a `S5L8702_SM1_IRQ = 18`.
+  Disparo gateado: `SM1_IRQ=1` (pulsa cuando el motor está `powered`), `SM1_IRQ=2`
+  (incondicional, diagnóstico).
+- **Medido:** con `=1` **no dispara nunca** — el flag `powered` de SM1 **no se activa
+  en toda la ruta de play** (11 diagnósticos de idle en ~110 s), lo cual es en sí un
+  hallazgo pendiente de explicar. Con `=2` el pulso temprano **mata al guest** a los
+  ~125 ms (salta a un vector antes de que el handler esté instalado). **La línea queda
+  cableada; el disparo fiel queda por caracterizar.**
+
+**E) El cebado del contador de jobs: hace girar el lazo, pero no renderiza.**
+`HLE_NP_JOB=1` mantiene `[0x22008c1c] >= 1` y `[engobj+0x44] = 0`. Medido
+(`run_pump.sh job2/job3`, idéntico con y sin SUSTAIN):
+`motorpred=35 motorpump=22 dpump=22 jobrepost=11 pumpabort=11` **pero `engine=0`,
+`copy32=0`, `resets=11`**. Es decir: el motor **sí** cicla (baseline: `dpump=1`,
+aparcado) y **sí re-encola por su cuenta** (`jobrepost=11`, el autosostenimiento de
+§C existe y se observa), pero la mitad de las pasadas abortan y la otra mitad
+**devuelven 0 sin llegar al render**; el guest acaba reiniciándose 11 veces. Frente al
+baseline (`engine=1`) esto es una **regresión**: inyectar jobs desde fuera, de forma
+asíncrona al mutex del motor, hace girar el lazo en vacío. **No abre el pipeline.**
+
+**VEREDICTO honesto del asalto #13.** El pipeline nativo **sigue cerrado** y la
+pantalla Now Playing de Apple **no se dibuja**. Lo que sí queda establecido:
+
+1. La hipótesis de **timing está refutada** (§11.24-A, sweep icount).
+2. El **mecanismo del lazo de render está decodificado** (§C) — condvar sin datos,
+   contador de jobs, re-encolado autosostenido, flag de aborto `[engobj+0x44]`.
+3. Existe un **hueco de fidelidad real, cableado a medias** (§D): SM1 sin línea de
+   interrupción y la IRQ 18 sin cablear, con el guest esperándola.
+4. Cada capa forzada revela que **la de abajo tampoco está construida** (descriptor
+   con destino basura, contexto de render inexistente, `powered` que nunca sube). El
+   patrón sugiere que **falta un paso de construcción del contexto de render**, aguas
+   arriba de todo lo forzado, y que ése —no un gate— es el objetivo del asalto #14.
+
+**Próximo paso concreto propuesto:** averiguar **por qué `powered` de SM1 nunca se
+activa en la ruta de play** (¿el bring-up de audio no llega a correr entero?) y **por
+qué el render `0x0808170c` no retorna**. Ambas son preguntas cerradas, baratas de
+medir, y cualquiera de las dos puede ser la construcción de contexto que falta.
+
+**Higiene:** todo gateado (`SM1_IRQ`, `HLE_NP_PASSIVE`, `HLE_NP_JOB`) o externo
+(hooks gdb en `tools/session-dbg/`); **build por defecto byte-idéntico**; Rockbox y
+navtest sin tocar. `pctrace` ampliado para volcar `r4..r7` en `regpc`/`sendex`.
+Runners nuevos: `run_icount.sh`, `sweep_icount.sh`, `run_bind.sh`, `run_np_prime.sh`,
+`run_descr.sh`, `run_cascade.sh`, `run_pump.sh`, `copygate_hook.gdb`,
+`cascade_hook.gdb`.
