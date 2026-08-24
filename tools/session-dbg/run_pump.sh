@@ -39,6 +39,14 @@ PA="$PA,pc=0x22006304:rendret,pc=0x22006324:pumploop,pc=0x22006310:pumpretry"
 PA="$PA,pc=0x0808af58:pumppred,pc=0x08017378:credithdlr,pc=0x080173cc:creditsig"
 PA="$PA,pc=0x0809a74c:mixer,pc=0x08016e44:copyent,pc=0x08016eb4:copy32"
 PA="$PA,pc=0x22002fe0:motorpred,pc=0x22002ff4:motorpump,pc=0x220067e4:jobrepost,pc=0x22006188:pumpabort"
+PA="$PA,pc=0x08123970:h12,pc=0x08123bfc:dwork,pc=0x081239bc:gateconsume,pc=0x081232d8:decframe"
+PA="$PA,pc=0x081e9e70:aacmath,pc=0x08016e88:gatechk,pc=0x08016e94:copygo"
+# The REACHABLE store: from the live call site the 32-bit path is structurally
+# unreachable ([r4]!=0 always diverts at 0x08016e84), so real PCM goes through
+# the halfword path 0x08016edc gated by [descr+21]==1, storing at 0x08016f08.
+PA="$PA,pc=0x08016edc:hwpath,pc=0x08016ee8:hwgo,pc=0x08016f08:copy16,pc=0x08016f10:hwret"
+# The two sibling threads of MeCCADecode that nobody has ever studied.
+PA="$PA,pc=0x22004630:framedone,pc=0x22004754:endofstream,pc=0x08123cfc:decswitch"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
@@ -53,7 +61,7 @@ for i in 1 2 3 4 5 6 7 8; do
   $IR seq e:120 wait:1 ret:250 wait:2 z >/dev/null 2>&1
   if grep -aqE 'cpu[0-9]  (engine|dpump) ' "$LOG" 2>/dev/null; then echo "PROGRESS try $i"; break; fi
 done
-echo "=== 12s free-run ==="; sleep 12
+echo "=== 45s free-run (let the render loop breathe) ==="; sleep 45
 echo "=== [$TAG] timeline ==="
 grep -aE 'cpu[0-9]  (StartPlayback|dpump|engine|rendret|pumploop|pumpretry|pumppred|credithdlr|creditsig|mixer|copyent|copy32) ' "$LOG" | head -30
 exec 3<>/dev/tcp/127.0.0.1/4455 && echo quit >&3 && sleep 2 && exec 3<&-

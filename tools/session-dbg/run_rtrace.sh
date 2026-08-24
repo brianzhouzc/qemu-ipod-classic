@@ -38,6 +38,7 @@ export AUDIOPACE=1
 for kv in "$@"; do export "$kv"; done
 
 PA="nodefault=on,always=on,cap=8,window=300000,out=$LOG"
+PA="$PA,range=0x08123200-0x08123e60,cap=400,trig=0x08123dcc"
 PA="$PA,pc=0x08150d84:StartPlayback,pc=0x22006118:dpump,pc=0x0808170c:engine"
 PA="$PA,pc=0x08081734:rfull,pc=0x08082020:rearly,pc=0x080820e4:callsm1en"
 PA="$PA,pc=0x08017364:sm1en,pc=0x08017378:credithdlr,pc=0x080173cc:creditsig"
