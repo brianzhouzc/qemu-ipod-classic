@@ -120,6 +120,15 @@
 #define S5L8702_LCD_IRQ      14
 #define S5L8702_DMAC0_IRQ    16
 #define S5L8702_DMAC1_IRQ    17
+/*
+ * 18 is absent from Rockbox's s5l87xx.h IRQ list (our source for this map)
+ * because Rockbox decodes audio on the ARM and never drives the SM1 engine.
+ * Apple's retailOS installs a VIC handler at index 18 (0x08017378) which reads
+ * an SM1 register and signals the event its native render pump waits on, so on
+ * this SoC line 18 is the audio engine's. INFERIDO from the handler's own
+ * register access; see wiki/19 section 11.25.
+ */
+#define S5L8702_SM1_IRQ      18
 #define S5L8702_USB_FUNC_IRQ 19
 #define S5L8702_NAND_IRQ     20
 #define S5L8702_I2C0_IRQ     21

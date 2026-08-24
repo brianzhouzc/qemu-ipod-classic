@@ -59,6 +59,8 @@
 #include "qemu/module.h"
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
+#include "hw/irq.h"
+#include "qemu/timer.h"
 #include "hw/arm/ipod_classic/ipod_classic_sm1.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
@@ -108,6 +110,73 @@ void ipod_classic_sm1_set_i2s(IPodClassicSM1State *s,
                               struct IPodClassicI2SState *i2s)
 {
     s->i2s = i2s;
+}
+
+/* --------------------------------------------------------- interrupt ------ */
+/*
+ * The engine's "playback advanced" interrupt, VIC0 line 18.
+ *
+ * On real silicon the audio engine tells the CPU when it has consumed audio;
+ * Apple's driver hangs its whole render pump off that report (see the header,
+ * and wiki/19 section 11.25). We had no line at all here, so the report could
+ * never arrive. Raise it when the stream position has moved since the last
+ * tick -- i.e. when audio really was clocked out -- which is the condition the
+ * handler itself checks for (it reads the engine status and tests bit 2, the
+ * same bit our `powered` state answers).
+ *
+ * Level-style pulse: raise, then drop on the next tick, so a handler that does
+ * not clear anything still sees discrete events rather than a stuck line.
+ * Gated by SM1_IRQ=1; with it unset nothing here runs and the machine behaves
+ * exactly as the measured baseline.
+ */
+#define SM1_IRQ_TICK_MS 5
+
+static uint64_t sm1_stream_pos(IPodClassicSM1State *s)
+{
+    if (ipod_classic_hle_audio_have_pcm()) {
+        return ipod_classic_hle_audio_position_frames();
+    }
+    return s->i2s ? s->i2s->tx_samples / 2 : 0;
+}
+
+static void sm1_irq_tick(void *opaque)
+{
+    IPodClassicSM1State *s = opaque;
+    uint64_t pos = sm1_stream_pos(s);
+
+    /*
+     * Trigger = "the engine is running". NOT "the position moved": on silicon
+     * the engine is clocked and reports on its own, whereas our position only
+     * advances once PCM actually flows -- and PCM cannot flow until the render
+     * pump runs, which is what this interrupt unblocks. Gating on movement was
+     * circular and never fired (measured: raised=0).
+     */
+    s->ticks++;
+    qemu_irq_lower(s->irq);
+    /*
+     * SM1_IRQ=2 pulses unconditionally; SM1_IRQ=1 only once the bring-up has
+     * powered the block. Unconditional is the diagnostic mode: `powered` was
+     * measured to stay false for a whole play run, so gating on it never
+     * asserted the line at all, and the VIC masks the line anyway until the
+     * guest unmasks it (VIC0 IntEnable bit 18, measured set during play) --
+     * so an early pulse is harmless and a late one lands exactly when the
+     * driver is ready for it.
+     */
+    if (s->irq_always || s->powered) {
+        s->last_pos = pos;
+        s->irqs++;
+        qemu_irq_raise(s->irq);
+        if (s->irqs <= 4 || s->irqs % 2000 == 0) {
+            fprintf(stderr, "SM1_IRQ: line 18 raised #%" PRIu64
+                    " (powered=%d pos=%" PRIu64 ")\n",
+                    s->irqs, (int)s->powered, pos);
+        }
+    } else if (s->ticks % 2000 == 0) {
+        fprintf(stderr, "SM1_IRQ: idle tick %" PRIu64 " (powered=0, pos=%"
+                PRIu64 ")\n", s->ticks, pos);
+    }
+    timer_mod(s->irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)SM1_IRQ_TICK_MS * 1000000);
 }
 
 /*
@@ -302,6 +371,23 @@ static void ipod_classic_sm1_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &ipod_classic_sm1_ops, s,
                           TYPE_IPOD_CLASSIC_SM1, S5L8702_SM1_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+
+    /*
+     * The engine's interrupt line. Always created so the machine can wire it to
+     * VIC0 line 18; only ever RAISED when SM1_IRQ=1, so the default build is
+     * byte-identical to the baseline every prior session measured.
+     */
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+
+    const char *e = getenv("SM1_IRQ");
+    s->irq_enabled = e && *e && *e != '0';
+    s->irq_always = e && *e == '2';
+    if (s->irq_enabled) {
+        s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sm1_irq_tick, s);
+        timer_mod(s->irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)SM1_IRQ_TICK_MS * 1000000);
+        fprintf(stderr, "SM1_IRQ: engine interrupt armed on VIC0 line 18\n");
+    }
 }
 
 static const VMStateDescription vmstate_ipod_classic_sm1 = {

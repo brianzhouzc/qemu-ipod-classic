@@ -130,6 +130,38 @@ struct IPodClassicSM1State {
      * NULL (then the position stays 0, i.e. the old behaviour).
      */
     struct IPodClassicI2SState *i2s;
+
+    /*
+     * The engine's interrupt line, VIC0 line 18.
+     *
+     * Apple's retailOS installs a handler at 0x08017378 into the VIC handler
+     * table at index 18 (registration path 0x0813e688 -> 0x080159c0 ->
+     * IRAM 0x22004cc4, which stores the handler at table+8+id*4 and pokes
+     * VIC0+0x14). That handler reads an SM1 register through the same getter
+     * (0x080a7638) the audio bring-up uses, tests bit 2, and on success signals
+     * the event at IRAM 0x22008c58 -- which is exactly the event the native
+     * render pump (IRAM 0x22006118) waits on for 500 ms at 0x0808af58 before
+     * giving up and tearing the codec down.
+     *
+     * We never wired line 18: our VIC map came from Rockbox
+     * (firmware/export/s5l87xx.h), and Rockbox has a GAP at 18 because it
+     * decodes on the ARM and never drives this engine. So the block that would
+     * report "buffer consumed" had no way to interrupt at all. See
+     * wiki/19 section 11.25.
+     */
+    qemu_irq irq;
+
+    /*
+     * Raise the line as playback advances (SM1_IRQ=1). Off by default: the
+     * trigger condition is still being characterised, so the default build
+     * stays byte-identical to the measured baseline.
+     */
+    bool     irq_enabled;
+    bool     irq_always;    /* SM1_IRQ=2: pulse regardless of `powered` */
+    QEMUTimer *irq_timer;
+    uint64_t last_pos;      /* stream position at the previous tick */
+    uint64_t irqs;          /* lines raised, for the trace */
+    uint64_t ticks;         /* timer ticks, for the idle diagnostic */
 };
 
 /* Give SM1 the I2S whose playback its position registers track. */

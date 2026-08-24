@@ -80,6 +80,15 @@
 #define NP_RING_OBJ         0x220106d0u
 #define NP_RING_WAITERS_OFF 0x04u
 #define NP_ENGOBJ           0x220106dcu
+/*
+ * [engobj+0x44]: the render pump's abort flag. Nonzero makes 0x22006118 return
+ * -1 at 0x22006170 before touching anything, which stops the motor re-posting
+ * a job and parks the whole render loop. The guest's own doorbell (0x2200683c)
+ * clears it.
+ */
+#define NP_ENG_ABORT_OFF    0x44
+/* The motor's job counter: 0 (or negative) means "nothing to render". */
+#define NP_JOBCOUNT         0x22008c1cu
 #define NP_ENG_GATE_OFF     71u
 #define NP_ENG_TYPE_OFF     88u   /* [engobj+88] render type (0xff = unconfigured) */
 #define NP_SIGNAL_STUB      0x22006870u  /* r0=ring;r1=0;b V()  (pure doorbell)  */
@@ -121,6 +130,7 @@ typedef struct {
     bool       type1;         /* HLE_NP_TYPE1: force engobj render type=1          */
     bool       call_engine;   /* HLE_NP_ENGINE: call engine directly vs ring bell  */
     bool       passive;       /* HLE_NP_PASSIVE: memory-only prefill, no PC hijack */
+    bool       job;           /* HLE_NP_JOB: keep jobcount primed + abort flag clear */
     int        prefills;      /* passive prefill ticks applied                     */
     uint8_t    win[NP_SRC_WINDOW];
     int        attempts;
@@ -382,6 +392,32 @@ static void np_do_prefill(CPUState *cs, run_on_cpu_data data)
     if (np.type1) {
         np_wr8(NP_ENGOBJ + NP_ENG_TYPE_OFF, 1);
     }
+
+    /*
+     * 3. The job counter and the pump's abort flag (HLE_NP_JOB).
+     *
+     * Decoded this session: the motor thread ("MeCCADecode", IRAM 0x22002f5c)
+     * does NOT act on the condvar notification it wakes from -- it re-tests the
+     * integer job counter at 0x22008c1c and goes straight back to its 3000 ms
+     * wait while that is <= 0 (0x22002fe0: ldr/cmp/ble). Only with a job does it
+     * call the render pump (0x22005dec -> 0x22006118), and it DECREMENTS the
+     * counter each pass. The loop is self-sustaining by design: when the pump
+     * returns 0 the motor immediately re-posts a job (0x22005e38 ->
+     * 0x220067e4, counter++), so the count holds steady and the render free-runs.
+     *
+     * What breaks it: the pump aborts with -1 before doing anything when
+     * [engobj+0x44] != 0 (0x22006170, writing status 5 to 0x22008c54). One -1
+     * and the motor skips the re-post, the counter decays to 0, and the loop
+     * parks for good -- which is exactly the "structural deadlock" of the last
+     * thirteen assaults. So: keep the abort flag clear and the counter primed,
+     * and one successful pump should make the native render self-sustaining.
+     */
+    if (np.job) {
+        np_wr8(NP_ENGOBJ + NP_ENG_ABORT_OFF, 0);   /* [engobj+0x44] = 0 */
+        if ((int32_t)np_rd32(NP_JOBCOUNT) <= 0) {
+            np_wr32(NP_JOBCOUNT, 1);
+        }
+    }
     np.prefills++;
     if (np.trace && np.prefills <= 6) {
         fprintf(stderr, "HLE_NP: PREFILL #%d gate[%08x]=1 r4[%08x]=0 "
@@ -465,6 +501,7 @@ void ipod_classic_hle_np_init(ARMCPU *cpu)
     np.type1 = np_env_on("HLE_NP_TYPE1");
     np.call_engine = np_env_on("HLE_NP_ENGINE");
     np.passive = np_env_on("HLE_NP_PASSIVE");
+    np.job = np_env_on("HLE_NP_JOB");
     np.src_buf = np_env_hex("HLE_NP_SRC", NP_COPY_SRC_BUF);
     np.gate_byte = np_env_hex("HLE_NP_GATE", NP_COPY_GATE_BYTE);
     np.r4 = np_env_hex("HLE_NP_R4", NP_COPY_R4);
