@@ -1904,3 +1904,116 @@ navtest sin tocar. `pctrace` ampliado para volcar `r4..r7` en `regpc`/`sendex`.
 Runners nuevos: `run_icount.sh`, `sweep_icount.sh`, `run_bind.sh`, `run_np_prime.sh`,
 `run_descr.sh`, `run_cascade.sh`, `run_pump.sh`, `copygate_hook.gdb`,
 `cascade_hook.gdb`.
+
+### 11.26 CAE EL MURO: la posición de SM1 era un OFFSET DE ANILLO — el render nativo NO estaba en deadlock, estaba FALLANDO
+
+**El hallazgo que cierra catorce asaltos.** Durante catorce sesiones el render nativo
+se caracterizó como un "deadlock de rendezvous estructural" del framework MeCCA.
+**Era incorrecto.** El render no esperaba a nadie: **tomaba un data abort** por una
+dirección que nuestro propio modelo le hacía calcular mal.
+
+**A) La cadena completa, localizada bloque a bloque** (`pctrace range=` + `trig=`,
+que fue la herramienta decisiva: traza el PC de cada bloque traducido dentro de una
+ventana):
+
+```
+pump 0x22006118 → render 0x0808170c → mixer 0x0809a74c → 0x08016f14
+   → 0x08016f68 → copy 0x08016e44 → gate [r7+5] cerrado → 0x08016ecc
+   → bl 0x08085ea0   ← AQUÍ SE DETIENE TODO
+```
+
+Cada paso se midió por el bloque siguiente que **no** llega a ejecutarse: la traza
+del render acaba en `0x08081a8c` (el bloque que contiene el `bl` al mixer), la del
+mixer acaba en `0x0809a880` (el bloque que contiene `bl 0x08016f14`), y la del
+render por-stream acaba en `0x08016ecc` (el bloque que contiene `bl 0x08085ea0`).
+
+**B) `0x08085ea0` no es una espera: es un memcpy.**
+
+```
+8085ea0:  ldr r3,[r1,#16]   ; bytes
+8085ea4:  ldr r1,[r1,#12]   ; base del destino
+8085ea8:  lsr r3,r3,#2      ; palabras
+8085eac:  add r1,r1,r2      ; destino = base + offset
+8085eb0:  cmp r3,#0
+8085eb4:  ldrne r2,[r0],#4
+8085ebc:  strne r2,[r1],#4
+8085ec0:  bne 0x8085eb0
+8085ec4:  bx lr             ← NUNCA se alcanza (medido, hits=0)
+```
+
+Volcado del descriptor en vivo (gdb, `memcpy_probe.gdb`): `[descr+12]=0`,
+`[descr+16]=0x28` → **40 bytes, 10 palabras**. Es la copia de silencio, diminuta.
+No es un bucle infinito.
+
+**C) El destino, y la prueba causal.** El destino medido fue `0x222dc000` en una
+corrida y `0x222fbc00` en otra — **crece con el tiempo de reproducción**. Con la
+posición de SM1 forzada a 0 (`SM1_POS=0`) el destino es **exactamente `0x22020000`**.
+Es decir:
+
+```
+destino = 0x22020000 (base de IRAM1) + posición_SM1 × 4
+```
+
+El búfer de salida de audio **vive en IRAM1** (128 KiB), y el firmware calcula su
+puntero de escritura como base + posición en tramas estéreo.
+
+**D) EL FALLO ERA NUESTRO.** `sm1_pos_reg()` devolvía la posición como
+`i2s->tx_samples / 2`, un **contador acumulativo que nunca envuelve**. A los ~1,9 s
+de reproducción (32768 tramas) el puntero se salía de IRAM1; las 10 escrituras
+caían en **memoria no mapeada**, tomaban un **data abort**, y el copy no retornaba —
+ni el mixer, ni el render, ni el pump. Desde fuera, indistinguible de un deadlock:
+todas las tareas paradas, ninguna IRQ pendiente, ningún poll de hardware.
+
+Esto explica por qué **nada** de lo intentado en catorce asaltos funcionaba: el
+sweep de `icount` (§11.24-A), el cebado de gates, forzar el `recv` del motor, el
+cebado del contador de jobs — todos atacaban un síntoma. Y explica también por qué
+forzar el gate del copy (§11.25-A) sólo producía una escritura fuera de rango: el
+puntero ya estaba corrupto antes de llegar ahí.
+
+**E) LA CORRECCIÓN (fidelidad de hardware, sin tocar el firmware).** La posición es
+un **offset dentro del anillo**, así que envuelve:
+
+```c
+#define S5L8702_SM1_POS_RING_FRAMES  (0x20000 / 4)   /* IRAM1 = 128 KiB */
+pos %= S5L8702_SM1_POS_RING_FRAMES;
+```
+
+Toda escritura que emite el firmware cae ahora dentro de IRAM1. `SM1_POS=<frames>`
+permite anular el wrap para experimentos.
+
+**F) MEDIDO (baseline de 14 asaltos → con el fix, build por defecto):**
+
+| contador | antes | después |
+|---|---|---|
+| `rendret` (0x22006304, el render retorna) | **0** | **2** |
+| `dpump` (0x22006118) | 1 | **5** |
+| `pumploop` (0x22006324) | 0 | **4** |
+| `pumppred` (0x0808af58) | 0 | **4** |
+| `mixer` (0x0809a74c) | 1 | **5** |
+| `copyent` (0x08016e44) | 1 | **144** |
+| `jobrepost` (0x220067e4) | 0 | **2** |
+| excepciones | 1 | 1 (limpio) |
+
+**El render nativo de Apple retorna por primera vez y el lazo cicla**, con el motor
+re-encolando jobs por su cuenta — el autosostenimiento descrito en §11.25-C existe y
+ahora se observa.
+
+**G) Lo que queda.** `copy32` sigue en **0**: el gate `[r7+5]` del copy nunca pasa
+porque el decodificador aún no publica trama (`decframe 0x081232d8` hits=0; de 87
+entradas al copy sólo 12 llegan al chequeo del gate, el resto toman la rama
+`[r4]!=0`). El siguiente eslabón es **quién manda al decodificador el mensaje de
+decodificar** (código `0x52800001`, caso 1 del switch `0x08123cfc`) y por qué no
+llega. Dado el precedente de esta sesión, merece buscarse **otro registro cuya
+semántica modelemos mal**, no lógica del guest.
+
+**H) Método que lo resolvió, para futuras sesiones.** Lo decisivo no fue una
+hipótesis sino una técnica: **traza de bloques acotada** (`range=LO-HI` con
+`trig=ADDR` para abrir la ventana) que muestra el último bloque ejecutado antes de
+que el control desaparezca, aplicada recursivamente hacia dentro de cada llamada.
+Cuatro corridas bastaron para pasar de "el render no retorna" a la instrucción
+exacta. Los contadores agregados (`pc=`) dicen *si* algo corre; la traza de bloques
+dice *dónde deja de correr*.
+
+**Higiene:** el fix es por defecto (Rockbox no lee SM1, así que no le afecta; boot y
+navegación tampoco entran en el bring-up). `SM1_POS` queda como knob de experimento.
+Herramientas nuevas: `run_sm1en.sh`, `run_rtrace.sh`, `memcpy_probe.gdb`.
