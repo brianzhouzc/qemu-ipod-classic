@@ -98,6 +98,49 @@ static bool sm1_pos_reg(IPodClassicSM1State *s, hwaddr offset, uint32_t *out)
         } else {
             pos = s->i2s ? s->i2s->tx_samples / 2 : 0;
         }
+        /*
+         * WRAP THE POSITION INTO THE RING. This is the fix for the wall that
+         * fourteen assaults called a "structural deadlock"; see wiki/19 §11.26.
+         *
+         * MEASURED: the render's output pointer is computed by the firmware as
+         *     dest = 0x22020000 + (this position * 4)
+         * i.e. IRAM1's base plus the position in stereo frames. Proof: with the
+         * position forced to 0 the copy's destination is exactly 0x22020000
+         * (IRAM1 base); left free-running it was 0x222dc000 and then 0x222fbc00
+         * on a later run -- 0x22020000 plus the audio bytes elapsed since play
+         * started.
+         *
+         * So the engine's position register is a RING OFFSET, not a cumulative
+         * total. Reporting the raw count walked the firmware's write pointer out
+         * of IRAM1 after ~1.9 s of playback; the stores then hit unmapped memory
+         * and took a data abort inside the tiny silence-copy at 0x08085ea0
+         * (40 bytes, 10 words), so the copy never returned -- and neither did
+         * the mixer 0x0809a74c, the render 0x0808170c, or the pump 0x22006118.
+         * That is what looked like a rendezvous deadlock from every angle: the
+         * render was not waiting for anything, it was faulting.
+         *
+         * The ring is IRAM1 (0x22020000, 128 KiB), so the position wraps every
+         * 128 KiB / 4 bytes-per-frame = 32768 stereo frames, which keeps every
+         * write the firmware issues inside that buffer.
+         *
+         * SM1_POS overrides the wrap for experiments (0 = pin the position at
+         * the ring base).
+         */
+        {
+            static int pos_mode = -1;
+            static uint64_t pos_wrap;
+            if (pos_mode < 0) {
+                const char *e = getenv("SM1_POS");
+                pos_wrap = (e && *e) ? strtoull(e, NULL, 0)
+                                     : S5L8702_SM1_POS_RING_FRAMES;
+                pos_mode = 1;
+                if (e && *e) {
+                    fprintf(stderr, "SM1_POS: ring wrap overridden to %llu frames\n",
+                            (unsigned long long)pos_wrap);
+                }
+            }
+            pos = pos_wrap ? (pos % pos_wrap) : 0;
+        }
         /* +0xa48 is the position the copy uses; +0xa44 is its companion,
          * answered 0 until measurement says otherwise. */
         *out = (offset == a48) ? (uint32_t)pos : 0;
@@ -145,35 +188,34 @@ static void sm1_irq_tick(void *opaque)
     uint64_t pos = sm1_stream_pos(s);
 
     /*
-     * Trigger = "the engine is running". NOT "the position moved": on silicon
-     * the engine is clocked and reports on its own, whereas our position only
-     * advances once PCM actually flows -- and PCM cannot flow until the render
-     * pump runs, which is what this interrupt unblocks. Gating on movement was
-     * circular and never fired (measured: raised=0).
+     * The trigger is the guest's own arming write to +0xa8c (see the write
+     * handler). Earlier attempts gated on our derived `powered` flag (never set
+     * on the play path) or on the stream position advancing (circular: the
+     * position cannot move until the render this interrupt unblocks has run).
+     * Both measured raised=0. Arming is the firmware's request, so honouring it
+     * is what the hardware would do.
+     *
+     * Cadence: the audio DMA delivers ~43 bursts/s (2048 stereo frames each,
+     * measured), so a frame-done report every ~25 ms is the right order. We tick
+     * at 5 ms and fire every fifth tick.
+     *
+     * Shape: assert with the status bit set, then drop both on the next tick, so
+     * the handler sees a discrete event and a missed one cannot wedge the line.
      */
     s->ticks++;
-    qemu_irq_lower(s->irq);
-    /*
-     * SM1_IRQ=2 pulses unconditionally; SM1_IRQ=1 only once the bring-up has
-     * powered the block. Unconditional is the diagnostic mode: `powered` was
-     * measured to stay false for a whole play run, so gating on it never
-     * asserted the line at all, and the VIC masks the line anyway until the
-     * guest unmasks it (VIC0 IntEnable bit 18, measured set during play) --
-     * so an early pulse is harmless and a late one lands exactly when the
-     * driver is ready for it.
-     */
-    if (s->irq_always || s->powered) {
+    if (s->irq_pending) {
+        s->irq_pending = false;
+        qemu_irq_lower(s->irq);
+    } else if ((s->irq_armed || s->irq_always) && (s->ticks % 5 == 0)) {
+        s->irq_pending = true;
         s->last_pos = pos;
         s->irqs++;
         qemu_irq_raise(s->irq);
         if (s->irqs <= 4 || s->irqs % 2000 == 0) {
             fprintf(stderr, "SM1_IRQ: line 18 raised #%" PRIu64
-                    " (powered=%d pos=%" PRIu64 ")\n",
-                    s->irqs, (int)s->powered, pos);
+                    " (armed=%d powered=%d pos=%" PRIu64 ")\n",
+                    s->irqs, (int)s->irq_armed, (int)s->powered, pos);
         }
-    } else if (s->ticks % 2000 == 0) {
-        fprintf(stderr, "SM1_IRQ: idle tick %" PRIu64 " (powered=0, pos=%"
-                PRIu64 ")\n", s->ticks, pos);
     }
     timer_mod(s->irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               (int64_t)SM1_IRQ_TICK_MS * 1000000);
@@ -256,11 +298,18 @@ static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
 
     case S5L8702_SM1_STAT:
         /*
-         * Clock/engine status. Only bit2 (clock ready) is decoded; it rises once
-         * the firmware has begun bringing the engine up. Everything else stays 0
-         * (the firmware masks off the top five bits itself). INFERIDO.
+         * Clock/engine status, read by getter 0x080a7638 (r1=0 -> [base+0xa98],
+         * top five bits masked off by the firmware itself).
+         *
+         * Bit 2 serves two readers:
+         *  - the bring-up spin at 0x08081af8 ("clock ready"), answered from
+         *    `powered` as before; and
+         *  - the VIC line-18 handler 0x08017378, which does `tst r0,#4` and only
+         *    signals the render-credit event 0x22008c58 when the bit is set. So
+         *    while we are asserting the engine interrupt the bit must read set,
+         *    or the handler would take its early exit and signal nothing.
          */
-        val = s->powered ? S5L8702_SM1_STAT_READY : 0;
+        val = (s->powered || s->irq_pending) ? S5L8702_SM1_STAT_READY : 0;
         break;
 
     case S5L8702_SM1_RUN:
@@ -329,6 +378,35 @@ static void ipod_classic_sm1_write(void *opaque, hwaddr offset,
     case S5L8702_SM1_RUN:        /* +0x400 start (nonzero) */
         if (value & S5L8702_SM1_RUN_MASK) {
             s->powered = true;
+        }
+        break;
+    case S5L8702_SM1_INTEN:      /* +0xa8c interrupt enable */
+        /*
+         * The engine's interrupt enable. The firmware arms it from a four-
+         * instruction leaf that writes the bare constant:
+         *
+         *   08017364: ldr r1, =0x38500000 ; mov r0, #4 ; str r0, [r1, #0xa8c]
+         *
+         * called at 0x080820e4 from the render's own path. Bit 2 here pairs with
+         * bit 2 of the status at +0xa98, which the VIC line-18 handler
+         * (0x08017378) tests before signalling the render-credit event
+         * 0x22008c58. In other words the firmware is asking the engine to
+         * interrupt it when a frame is done -- and then waits for exactly that.
+         *
+         * We used to keep +0xa8c as a plain latch and had no interrupt line at
+         * all, so the request could never be answered: the render pump's 500 ms
+         * wait (0x0808af58) always timed out and tore the codec down. Arming
+         * here makes the trigger the guest's own, rather than a timer we chose.
+         */
+        if (value & S5L8702_SM1_INTEN_FRAME) {
+            if (!s->irq_armed) {
+                s->irq_armed = true;
+                fprintf(stderr, "SM1_IRQ: guest armed the engine interrupt "
+                        "(+0xa8c = 0x%02x); VIC line 18 live\n",
+                        (uint32_t)value);
+            }
+        } else {
+            s->irq_armed = false;
         }
         break;
     default:

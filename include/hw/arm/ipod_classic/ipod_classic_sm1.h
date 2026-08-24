@@ -49,6 +49,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
 /* Clock/engine status word. Getter 0x080a7638(idx0). The bring-up spins on
  * bit 2 ("clock running / locked") at 0x08081af8 (`tst r0,#4; beq`). VERIFIED
  * that bit 2 is the awaited bit; that it means "clock ready" is INFERIDO. */
+/*
+ * +0xa8c: the engine's interrupt enable. The firmware arms it with the bare
+ * constant 4 from the leaf at 0x08017364 (ldr r1,=0x38500000 / mov r0,#4 /
+ * str r0,[r1,#0xa8c]), called from the render path at 0x080820e4. Bit 2 pairs
+ * with bit 2 of the status below, which the VIC line-18 handler 0x08017378
+ * tests before signalling the render-credit event 0x22008c58.
+ */
+#define S5L8702_SM1_INTEN       0xa8c
+#define S5L8702_SM1_INTEN_FRAME (1u << 2)
+
 #define S5L8702_SM1_STAT        0xa98
 #define S5L8702_SM1_STAT_READY  (1u << 2)
 
@@ -103,6 +113,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
 #define S5L8702_SM1_POS_A44     0xa44   /* idx0 companion               */
 #define S5L8702_SM1_POS_STRIDE  0x14
 #define S5L8702_SM1_POS_CHANS   4
+/*
+ * The position is a RING OFFSET. MEASURED: the firmware computes its render
+ * destination as 0x22020000 + position*4 -- IRAM1's base plus the position in
+ * stereo frames (with the position pinned to 0 the destination is exactly
+ * 0x22020000). IRAM1 is 128 KiB, so the position wraps every 32768 frames and
+ * every write the firmware issues lands inside that buffer. Reporting a
+ * cumulative count instead walked the pointer out of RAM after ~1.9 s and the
+ * resulting data abort froze the whole native render path. wiki/19 s11.26.
+ */
+#define S5L8702_SM1_POS_RING_FRAMES  (0x20000 / 4)
 
 struct IPodClassicI2SState;
 
@@ -157,7 +177,9 @@ struct IPodClassicSM1State {
      * stays byte-identical to the measured baseline.
      */
     bool     irq_enabled;
-    bool     irq_always;    /* SM1_IRQ=2: pulse regardless of `powered` */
+    bool     irq_always;    /* SM1_IRQ=2: pulse regardless of the guest's arming */
+    bool     irq_armed;     /* guest wrote bit 2 to +0xa8c (its own request)      */
+    bool     irq_pending;   /* line asserted now; makes +0xa98 bit 2 read set     */
     QEMUTimer *irq_timer;
     uint64_t last_pos;      /* stream position at the previous tick */
     uint64_t irqs;          /* lines raised, for the trace */
