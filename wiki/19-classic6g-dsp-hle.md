@@ -2017,3 +2017,64 @@ dice *dónde deja de correr*.
 **Higiene:** el fix es por defecto (Rockbox no lee SM1, así que no le afecta; boot y
 navegación tampoco entran en el bring-up). `SM1_POS` queda como knob de experimento.
 Herramientas nuevas: `run_sm1en.sh`, `run_rtrace.sh`, `memcpy_probe.gdb`.
+
+### 11.27 CORRECCIÓN GRAVE: el "decodificador de audio" del clúster `0x08123xxx` es el hilo de CARÁTULAS (`iMAImageCacheThread`)
+
+Hallazgo de un análisis multi-agente del desensamblado, **verificado a mano**. Obliga
+a reinterpretar buena parte de §11.9–§11.22.
+
+**A) La prueba.** El singleton en `0x0891233c` sobre el que se construye todo ese
+clúster se crea en `0x08123400`, que pasa a la creación de hilo (`0x0832dd88`) la
+cadena en `0x081234f4`. Sus words, en little-endian:
+
+```
+81234f4: 49414d69 → "iMAI"
+81234f8: 6567616d → "mage"
+81234fc: 68636143 → "Cach"
+8123500: 72685465 → "eThr"
+8123504: 00646165 → "ead\0"          ⇒ "iMAImageCacheThread"
+```
+
+Corroboran las cadenas vecinas del mismo islote de código: `"iTunes Image DB.itdb"`
+(`0x08122e9c`, `0x081d7cb0`), `"iTunes Image DB"` (`0x081f07e0`) e
+`"ImagePresentationEngine"` (`0x081d8f0c`).
+
+**B) Qué queda reatribuido.** Pertenecen al subsistema de **carátulas / iTunes Image
+DB**, no al audio:
+- el despachador `0x08123dcc` (y por tanto los contadores `disp`),
+- el switch `0x08123cfc` y su familia de códigos `0x52800000..0x52800009`,
+- el caso 1 (`0x08123d64` → `0x081232d8`), que es **"ejecuta el siguiente job de
+  imagen"**, no "decodifica una trama de audio",
+- el handler tipo-12 `0x08123970` (`h12`) y `dwork` `0x08123bfc`.
+
+Los cuatro emisores que mandan el código `0x52800001` son rutas de **píxeles**:
+`0x08122b28` y `0x08122be8` (expansión RGB565: constantes de formato `0x1888`/`0x565`,
+máscaras `0x7e0`/`0xf800`) y `0x0813ada8` / `0x0813b090` (YUV 4:2:0: `w*h*3/2`). En
+esa clase, `reason==1` significa **"mi superficie de destino todavía no está lista,
+re-encólame"** — un reintento, no un arranque.
+
+**C) Segunda reatribución.** `0x08025ac4` **no** "pide entrada por exchange 6 +
+RECV mbox 9": es un **emisor de traza**. Adquiere el canal de traza 9
+(`mov r0,#9; bl 0x8015730`), emite un registro (`bl 0x8015740`) y lo libera. Por
+tanto los "57 posts al exchange 6" de §11.14-A estaban contando **registros de
+traza**, no flujo de datos, y la conclusión "el lado de entrada está sano" no se
+sostiene sobre esa medida.
+
+**D) Lo que NO cambia.** El arreglo de §11.26 (la posición de SM1 como offset de
+anillo) es independiente de todo esto: se verificó **causalmente** por la dirección
+de destino del copy (`SM1_POS=0` → destino exactamente `0x22020000`) y por el efecto
+medido en el camino de render REAL (el memcpy pasa de no retornar nunca a retornar
+101/102 veces; `rendret` 0→2; `copy16`=2405 almacenamientos de PCM). Ninguna de esas
+medidas depende del clúster de imagen.
+
+**E) Consecuencia práctica.** `decframe = 0` **nunca fue** un indicador de audio, y
+tampoco `h12` ni `dwork`. La pregunta correcta, ahora despejada, es: **quién llena el
+anillo fuente del mixer en `0x08889098`**, del que el copy nativo lee. Ése es el
+decodificador de audio real, y está sin localizar.
+
+**F) Lección de método.** Dos premisas centrales del proyecto (el clúster del
+decodificador y el canal de entrada del exchange 6) resultaron ser subsistemas
+distintos, y sobrevivieron catorce asaltos porque nadie verificó la **identidad** de
+los objetos: bastaba decodificar una cadena. Antes de construir sobre un clúster,
+conviene confirmar a qué hilo/clase pertenece (nombre de hilo en la creación,
+cadenas vecinas, vtable).
