@@ -73,7 +73,13 @@ PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
 # Does the guest READ THE AUDIO FILE during playback? If StreamCache/MeCCAIOTask
 # never pull compressed data off the disk, the decoder has no input and every
 # downstream measurement is moot. Watch the ATA register window (0x38700000).
-PA="$PA,memw=0x38700000-0x38700400,memcap=40"
+# Watch the REAL play-time mixer source ring while the codec count is forced
+# non-zero. If decoded PCM lands here, the count was the last missing piece.
+# The DECODER OUTPUT buffers, from the live reader dump at the codec entry:
+# [reader+0x0c]=0x0ba77e70 [reader+0x10]=0x0ba77e74 [reader+0x14]=0x0ba77ef0.
+# The mixer reads a different region entirely (0x0888axxx), so if PCM lands here
+# the decoder works and only the hand-off to the mixer is missing.
+PA="$PA,memw=0x0ba77e00-0x0ba78200,memcap=40"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
