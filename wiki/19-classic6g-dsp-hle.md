@@ -4502,3 +4502,35 @@ Con esto el problema queda acotado sin ambigüedad posible:
 **Consecuencia para el trabajo futuro:** no volver a investigar el camino de salida.
 Está probado. Todo el esfuerzo va a por qué el reproductor aborta al abrirse
 (§11.83), con la cadena de llamadas de §11.93 como punto de entrada.
+
+## 11.96 REFUTADO el "bloqueo estructural" de `[engobj+0x44]`
+
+`ipod_classic_hle_np.c` documenta el mecanismo que se dio por causa raíz durante
+trece asaltos: la bomba de render aborta con −1 antes de hacer nada cuando
+`[engobj+0x44] != 0`, y *un solo* −1 hace que el motor deje de re-postear, el
+contador de trabajos decaiga a 0 y el lazo aparque para siempre. Encaja
+perfectamente con la firma de ocho búferes que aparece en todas las medidas.
+
+Medidas **las dos ramas de la puerta** por separado (no la comprobación, que es lo
+que cuenta un `pc=` en `0x22006170` y habría dado un "8" engañoso):
+
+```
+22006170: ldrb r0,[r4,#0x44]     la bandera
+2200617c: beq  0x22006194        <- CERO: camino vivo
+22006180: mov  r0,#5             <- NO cero: aborta con -1
+
+aborta (0x22006180) = 0
+sigue  (0x22006194) = 8
+```
+
+**La rama de aborto no se toma ni una vez.** La puerta pasa las ocho veces. El
+bloqueo estructural descrito ya no ocurre —probablemente lo resolvieron los arreglos
+previos (línea 18 del VIC, motor SHA-1, RTC)— y esa nota del árbol describe un estado
+anterior del emulador.
+
+La bandera **sí se escribe** durante la reproducción (`0x22006888` a los 148,6 s, y
+varios más a los 163,7 s), pero con valor que deja pasar la puerta.
+
+Hipótesis dieciséis, refutada. Y una nota de método que casi se cuela otra vez: poner
+la sonda en la instrucción de la comprobación cuenta cada evaluación, no cada aborto.
+**Hay que instrumentar las ramas, no la condición.**
