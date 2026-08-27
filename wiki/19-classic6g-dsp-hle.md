@@ -3786,3 +3786,38 @@ lectura vecina de `+0x404` (0x08091590 la enmascara con el bit 8 y nuestro cero 
 justo la respuesta de éxito).
 
 Es un hueco real del modelo y conviene taparlo, pero **no es el que calla la música**.
+
+## 11.71 CORRECCIÓN: el cambio de anillo no arregla el data abort (no se reproduce)
+
+§11.68 dijo que con el anillo corregido "el data abort de §11.36 desaparece". Puesto
+a prueba de la única forma honesta —**sin `IRAMSPILL`**, que es la muleta que lo
+tapaba— y en A/B:
+
+```
+A: anillo por defecto (32768 tramas), sin IRAMSPILL -> reinicios=0  excepciones=0
+B: anillo corregido   (16384 tramas), sin IRAMSPILL -> reinicios=0  excepciones=0
+```
+
+**Ninguna de las dos aborta.** Con `SM1_IRQ=1` el abort no se reproduce siquiera, así
+que el cambio de anillo no puede acreditarse con arreglarlo: no había nada que
+arreglar en esta configuración. (El reinicio de §11.36 se observó con `SM1_IRQ`
+apagado; con la cadena de interrupción viva el render toma otro camino.)
+
+Lo que **sí** queda medido del cambio de anillo, y sigue siendo verdad:
+
+| anillo | escrituras de `copy16` sobre el descriptor |
+|---|---|
+| 32768 tramas (por defecto) | 24 |
+| 24576 tramas | 12 |
+| 16384 tramas | **0** |
+
+Deja de corromper la zona de control, que es correcto por sí mismo. Pero no cambia
+`fetchok` (sigue 0) ni el WAV (sigue en clics). **No es el arreglo del silencio, y no
+debe presentarse como tal.**
+
+Y hay una relectura que conviene considerar antes de seguir tirando de este hilo: que
+`0x080a3c00` no dé búfer puede ser **comportamiento correcto** —no hay nada
+decodificado que entregar— en vez de una guarda rota. En esa lectura el fallo no está
+en quién escribe la palabra de estado sino en que el decodificador nunca produce, y
+`fetchbail` es síntoma, no causa. `framepull` y `pullpass` valen 1 en estas corridas,
+lo cual encaja.
