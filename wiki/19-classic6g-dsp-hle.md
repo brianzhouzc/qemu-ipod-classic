@@ -3118,3 +3118,32 @@ a esa tarea.
 temporizador del RTXC alimenta a ese despachador, y por qué sólo se mueve cuando el
 invitado atiende la rueda o el LCD. El temporizador del sistema NO es (§11.51: tick de
 1 kHz exacto), así que el candidato es el propio mecanismo de encolado de tareas.
+
+## 11.53 Tampoco es el DMA: el ISR corre 7 185 veces
+
+Confirmado que la tarea de audio no se auto-reloja (§11.52), el candidato natural era
+la interrupción de fin de transferencia de DMAC0: el canal de audio usa un LLI que se
+apunta a sí mismo, y si el modelo PL080 no dispara la interrupción en cada recarga, la
+tarea nunca recibiría su "búfer consumido".
+
+**Medido, llega de sobra.** El ISR registrado en IRQ 16 (`0x22002810`):
+
+```
+dmairq    (0x22002810, ISR de DMAC0)   = 7 185
+creditsig (evento del motor SM1)       =   394
+dpump     (bomba de render)            =     8
+```
+
+Siete mil interrupciones de DMA y casi cuatrocientas señales del motor, y la bomba
+corre ocho veces. **Ninguna de las dos fuentes periódicas despierta a esa tarea.**
+
+**El inventario de fuentes de reloj queda agotado:** el temporizador del sistema es
+correcto (§11.51), la interrupción del motor SM1 llega y se atiende (§11.42), la
+interrupción del DMA llega 7 185 veces, y el ritmado del I2S ayuda en vez de
+estorbar (§11.50). La tarea sencillamente no está colgada de ninguna de ellas en esta
+emulación.
+
+**Lo que queda por hacer, y no cabía en esta sesión:** seguir el despachador
+`0x22002ff8` hacia atrás -- qué cola del RTXC lee, quién la llena -- en vez de seguir
+probando fuentes de interrupción una por una. Las cuatro que existen ya están
+descartadas por medida, así que el fallo está en el encolado, no en la señal.
