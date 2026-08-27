@@ -3341,3 +3341,47 @@ estaba anotado en la cabecera de `run_play.sh`: en el lazo del códec
 el códec **sí se llama, pero con `r3 = min([obj2+0x44], [r4+8])`, y ambos campos
 están medidos a CERO**. Se le pide producir cero muestras. Así que la pregunta no
 es quién consume ni cuándo, sino **quién debe rellenar esos dos contadores**.
+
+## 11.59 REFUTADO: el formato de los MP3 no es la causa
+
+Los cuatro ficheros a los que apunta la base los escribió `patch_tracks.py` con un
+`shutil.copyfile` a secas: no comprueba que el formato del origen coincida con la
+extensión del destino ni toca el campo de tipo del registro. Y los originales
+descargados llevan delante un tag **ID3v2.4 de 682 KB** con carátula incrustada.
+Dos razones plausibles para que el decodificador no sacara nada.
+
+Prueba: reescritos los cuatro con `ffmpeg -map_metadata -1 -id3v2_version 0`,
+MP3 CBR 128 kbps 44,1 kHz estéreo, **sin ningún tag** — empiezan directamente en
+`fffb9064`, una trama MPEG-1 Layer III pelada. Instalados en las mismas rutas,
+con los tamaños y duraciones parcheados en la base.
+
+Resultado: la reproducción arranca (`StartPlayback`, `aacmath`, `framepull`,
+`copy16` todos activos) y el WAV sigue conteniendo **sólo clics**: 33 696 muestras
+no nulas de 26 122 218, pico 11444, y todos los recuentos por tramo son múltiplos
+exactos de 1248. Ese 1248 y ese pico son la firma del clic de la rueda. **El
+formato del fichero no es la causa.**
+
+## 11.60 Dos trampas del banco de pruebas que costaron tres corridas
+
+**`IRAMSPILL` es un número de BYTES, no un booleano.** `IRAMSPILL=1` mapea un solo
+byte y la corrida se reinicia igual, con el mismo data abort de `copy16`. El valor
+util es `0x10000`. El mensaje de arranque lo dice —"IRAMSPILL: 1 bytes mapped"—
+pero pasa desapercibido entre el ruido.
+
+**La región de verificación importa al pulsar SELECT.** `iremote.py press -u`
+repite la pulsación hasta que la pantalla cambia más que un umbral. Entrar en un
+submenú sólo redibuja la LISTA DE LA IZQUIERDA: el panel derecho sigue mostrando
+el mismo icono y "4 Songs". Verificando con `--region right` el diff sale 0, se
+reintenta quince veces, y las pulsaciones de más se meten en Cover Flow. Para
+transiciones de lista hay que usar `--region left`.
+
+**Y el recordatorio que más caro sale.** Con el acelerador SHA-1 activo la
+biblioteca sale VACÍA ("No Music" / "No Songs") — es el nudo de §11.35, no una
+regresión. Toda corrida que deba reproducir necesita `SHA1_ZERO=1`. Tres corridas
+seguidas se interpretaron como "la reproducción no arranca" cuando lo que pasaba
+es que no había biblioteca que reproducir.
+
+El menú, verificado en pantalla y en inglés: **Music, Videos, Photos, Podcasts,
+Extras, Settings, Shuffle Songs** — Music ya viene resaltado al aceptar el idioma,
+no hay que desplazarse. Dentro: **Cover Flow, Playlists, Artists, Albums,
+Compilations, Songs**, luego Genres, Composers, Audiobooks — Songs a cinco abajo.
