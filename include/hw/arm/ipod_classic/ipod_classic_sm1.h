@@ -97,6 +97,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
 #define S5L8702_SM1_SUB_CMD     0x10   /* within a sub-block */
 #define S5L8702_SM1_SUB_STATE   0x14   /* within a sub-block */
 #define S5L8702_SM1_SUB_STATE_READY 0x7
+/*
+ * The commands the power-up 0x080ba768 writes to sub+0x10, in order: 4 (power
+ * up), 16 (run) and finally 96 (stop). The state at sub+0x14 reads 7 for the
+ * first two and returns to 0 after the stop -- the render 0x0808170c requires
+ * that 0 at 0x080820f4 before it will build its engine context. wiki/19 s11.28.
+ */
+#define S5L8702_SM1_SUB_CMD_UP   4
+#define S5L8702_SM1_SUB_CMD_RUN  16
+#define S5L8702_SM1_SUB_CMD_STOP 96
 
 /*
  * Playback position registers. The audio driver reads the engine's per-channel

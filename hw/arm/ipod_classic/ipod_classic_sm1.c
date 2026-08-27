@@ -325,13 +325,44 @@ static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
     default:
         if (sm1_is_sub_state(offset)) {
             /*
-             * Sub-block state (sub+0x14). Reads 7 ("reached target state") once
-             * its command register (sub+0x10, four bytes below) has been written
-             * a non-zero command; 0 before that. This is what the 10-try
-             * power-up poll in 0x080ba768 waits for. INFERIDO (strong).
+             * Sub-block state (sub+0x14): a STATE MACHINE, not a sticky latch.
+             *
+             * It reports "reached target state" (7) while the channel is
+             * commanded up or running, and returns to 0 (idle) once it has been
+             * commanded to stop. Two firmware sites read it and they want
+             * OPPOSITE values, which is what forces the distinction:
+             *
+             *  - The power-up 0x080ba768 writes cmd 4, polls for 7 up to ten
+             *    times, writes cmd 16 (run) -- and finally writes cmd 96 (stop).
+             *  - The render 0x0808170c then reads sub-block 4's state at
+             *    0x080820f0 and REQUIRES 0:
+             *        80820f0: bl   0x80b8470     ; read sub+0x14, & 7
+             *        80820f4: cmp  r0, #0
+             *        80820f8: bne  0x80821a8     ; non-zero -> SKIP the build
+             *    The block it skips, 0x08082100-0x080821a0, is the engine
+             *    CONTEXT CONSTRUCTION: the buffer copy, the descriptor
+             *    allocation (0x080b67a8), the chain append (0x080bfa58) and the
+             *    address translation (0x08075d80).
+             *
+             * Answering a sticky 7 satisfied the power-up poll but made the
+             * render skip its own context build forever -- which is exactly the
+             * "missing render-context construction step" wiki/19 s11.25 was
+             * looking for, and why every gate forced downstream revealed the
+             * layer below it was also unbuilt.
+             *
+             * So: 7 while the last command is up (4) or run (16); 0 once the
+             * channel has been stopped (96) or never commanded.
              */
             uint32_t cmd = s->reg[(offset - 4) / 4];
-            val = cmd ? S5L8702_SM1_SUB_STATE_READY : 0;
+            switch (cmd) {
+            case S5L8702_SM1_SUB_CMD_UP:
+            case S5L8702_SM1_SUB_CMD_RUN:
+                val = S5L8702_SM1_SUB_STATE_READY;
+                break;
+            default:            /* 0 = never commanded, 96 = stopped */
+                val = 0;
+                break;
+            }
         } else if (sm1_pos_reg(s, offset, &val)) {
             /* Per-channel playback position; advances with I2S playback. */
         } else {

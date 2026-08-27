@@ -39,7 +39,12 @@ PA="$PA,pc=0x22006304:rendret,pc=0x22006324:pumploop,pc=0x22006310:pumpretry"
 PA="$PA,pc=0x0808af58:pumppred,pc=0x08017378:credithdlr,pc=0x080173cc:creditsig"
 PA="$PA,pc=0x0809a74c:mixer,pc=0x08016e44:copyent,pc=0x08016eb4:copy32"
 PA="$PA,pc=0x22002fe0:motorpred,pc=0x22002ff4:motorpump,pc=0x220067e4:jobrepost,pc=0x22006188:pumpabort"
-PA="$PA,pc=0x08123970:h12,pc=0x08123bfc:dwork,pc=0x081239bc:gateconsume,pc=0x081232d8:decframe"
+# NOTE: the 0x08123xxx cluster is the iMAImageCacheThread (album art), NOT audio.
+# The real question is who fills the mixer source ring at 0x08889098.
+# The engine-context build: 0x080820f0 reads sub-block 4 state; if != 0 it SKIPS
+# 0x08082100-0x080821a0 (buffer copy, descriptor alloc, chain append, addr xlate).
+PA="$PA,pc=0x080820f0:statetest,pc=0x08082100:ctxbuild,pc=0x080821a8:ctxskip"
+PA="$PA,pc=0x080b3104:addrxlate,pc=0x08083144:xlate_ok,pc=0x0808315c:xlate_fail"
 PA="$PA,pc=0x081e9e70:aacmath,pc=0x08016e88:gatechk,pc=0x08016e94:copygo"
 # The REACHABLE store: from the live call site the 32-bit path is structurally
 # unreachable ([r4]!=0 always diverts at 0x08016e84), so real PCM goes through
@@ -47,6 +52,9 @@ PA="$PA,pc=0x081e9e70:aacmath,pc=0x08016e88:gatechk,pc=0x08016e94:copygo"
 PA="$PA,pc=0x08016edc:hwpath,pc=0x08016ee8:hwgo,pc=0x08016f08:copy16,pc=0x08016f10:hwret"
 # The two sibling threads of MeCCADecode that nobody has ever studied.
 PA="$PA,pc=0x22004630:framedone,pc=0x22004754:endofstream,pc=0x08123cfc:decswitch"
+# Which case of the decoder switch actually arrives? case = [msg+4]-0x52800000
+PA="$PA,pc=0x08123d50:c0,pc=0x08123d64:c1_DECODE,pc=0x08123d48:c234,pc=0x08123d78:c5"
+PA="$PA,pc=0x08123d8c:c6,pc=0x08123d98:c7,pc=0x08123dac:c89,pc=0x08123dc0:cdefault"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
