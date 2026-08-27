@@ -182,6 +182,17 @@ static uint64_t sm1_stream_pos(IPodClassicSM1State *s)
     return s->i2s ? s->i2s->tx_samples / 2 : 0;
 }
 
+/* Drop the engine interrupt line; see the note where it is scheduled. */
+static void sm1_irq_off(void *opaque)
+{
+    IPodClassicSM1State *s = opaque;
+
+    if (s->irq_pending) {
+        s->irq_pending = false;
+        qemu_irq_lower(s->irq);
+    }
+}
+
 static void sm1_irq_tick(void *opaque)
 {
     IPodClassicSM1State *s = opaque;
@@ -203,14 +214,35 @@ static void sm1_irq_tick(void *opaque)
      * the handler sees a discrete event and a missed one cannot wedge the line.
      */
     s->ticks++;
-    if (s->irq_pending) {
-        s->irq_pending = false;
-        qemu_irq_lower(s->irq);
-    } else if ((s->irq_armed || s->irq_always) && (s->ticks % 5 == 0)) {
+    if (!s->irq_pending && (s->irq_armed || s->irq_always) && (s->ticks % 5 == 0)) {
         s->irq_pending = true;
         s->last_pos = pos;
         s->irqs++;
         qemu_irq_raise(s->irq);
+        /*
+         * The line is a LEVEL, but a short one.
+         *
+         * Holding it until the next 5 ms tick produced the storm in s11.41:
+         * 4 raises, 789 182 handler entries even after any block read became an
+         * acknowledge. That is ~197 000 re-entries inside one 5 ms window, which
+         * is only possible because virtual time barely advances while the CPU
+         * spins in the interrupt loop -- so a coarse timer is exactly the wrong
+         * thing to be holding an interrupt line with.
+         *
+         * MEASURED, a bare pulse does not work: with SM1_IRQ_PULSE=1 (raise and
+         * lower in the same instant) the handler count went to ZERO and so did
+         * creditsig. The VIC wants a level; an edge is lost. So the line has to
+         * stay up long enough to be dispatched and no longer.
+         *
+         * SM1_IRQ_ASSERT_US is that window, and it is a MODEL CHOICE, not a fact
+         * about the part: what the real engine's line does is UNDETERMINED, and
+         * what the firmware touches to acknowledge it has not been found -- the
+         * handler's status getter at 0x080a7638 does not appear to reach this
+         * block, or broadening the read acknowledge would have ended the storm
+         * instead of trimming it by a third.
+         */
+        timer_mod(s->irq_off_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)S5L8702_SM1_IRQ_ASSERT_US * 1000);
         if (s->irqs <= 4 || s->irqs % 2000 == 0) {
             fprintf(stderr, "SM1_IRQ: line 18 raised #%" PRIu64
                     " (armed=%d powered=%d pos=%" PRIu64 ")\n",
@@ -523,6 +555,7 @@ static void ipod_classic_sm1_init(Object *obj)
     s->irq_always = e && *e == '2';
     if (s->irq_enabled) {
         s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sm1_irq_tick, s);
+        s->irq_off_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sm1_irq_off, s);
         timer_mod(s->irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   (int64_t)SM1_IRQ_TICK_MS * 1000000);
         fprintf(stderr, "SM1_IRQ: engine interrupt armed on VIC0 line 18\n");

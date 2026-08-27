@@ -2769,3 +2769,41 @@ algo que no es nuestra subida -- el modelo del VIC, o un segundo usuario de la l
 la cola: es la consecuencia aritmética de una profundidad de 1, que a su vez viene de
 una posición que apenas avanza porque el sistema está ahogado. Hay **un** problema,
 no tres.
+
+## 11.42 La tormenta, resuelta: de 1 196 485 entradas a 2 399
+
+§11.41 dejó la tormenta medida pero viva. La forma de la línea era el problema, y
+dos experimentos la acotan:
+
+**Un pulso no vale.** Con `SM1_IRQ_PULSE=1` (subir y bajar en el mismo instante) el
+manejador entra **cero** veces y `creditsig` también cae a cero: el VIC quiere
+**nivel**, un flanco se pierde. Dato limpio, y descarta la solución obvia.
+
+**Lo que sobraba era el tiempo.** La línea se sostenía hasta el siguiente tick de
+5 ms, y ~197 000 reentradas por subida sólo son posibles porque el tiempo virtual
+apenas avanza mientras la CPU gira en el bucle de interrupción. Un temporizador
+grueso es exactamente lo que no debe sostener una línea de interrupción. Acotando la
+ventana con un one-shot propio:
+
+| ventana | entradas al manejador | `creditsig` | `dpump` | `copy16` |
+|---|---|---|---|---|
+| hasta el tick de 5 ms | 1 196 485 | 490 | 8 | 4 808 |
+| ídem + ack en cualquier lectura | 789 182 | 493 | 8 | 4 808 |
+| **250 us** | 43 750 | 482 | 8 | 4 808 |
+| **20 us** | **2 399** | **2 399** | **16** | **9 616** |
+
+**500 veces menos**, y el detalle que importa: a 20 us `creditsig == credithdlr`, o
+sea **cada interrupción hace trabajo útil**, frente a 490 productivas de 1,2 millones.
+El pipeline de render vuelve a doblar: `dpump` 8 -> 16, `rendret` 4 -> 8, `pcmout`
+4 -> 8, `copy16` 4 808 -> 9 616.
+
+`S5L8702_SM1_IRQ_ASSERT_US` es una **elección de modelo**, marcada como tal: lo que
+hace la línea del motor real está SIN DETERMINAR, y qué toca el firmware para
+reconocerla no se ha encontrado -- el getter del manejador (`0x080a7638`) no parece
+llegar a este bloque, o ampliar el reconocimiento a cualquier lectura habría acabado
+con la tormenta en vez de recortarla un tercio.
+
+**Y sigue sin haber música.** `aacmath` y `framepull` siguen en **1**, y el WAV
+sigue trayendo sólo clics (18 720 muestras no nulas, pico 11444). Quitado el ahogo,
+la cola de decodificación sigue con profundidad 1. La tormenta era una causa real de
+lentitud -- 500 veces -- pero no era la única que separa a este emulador de la música.

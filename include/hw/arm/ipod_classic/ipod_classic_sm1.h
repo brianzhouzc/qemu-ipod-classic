@@ -56,6 +56,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
  * with bit 2 of the status below, which the VIC line-18 handler 0x08017378
  * tests before signalling the render-credit event 0x22008c58.
  */
+/*
+ * How long the engine interrupt line is held. A MODEL CHOICE: measured, a bare
+ * pulse is lost (the VIC wants a level) and holding it to the next 5 ms tick
+ * gives ~197 000 handler re-entries per raise, because virtual time barely
+ * advances while the CPU spins in the interrupt loop.
+ *
+ * Measured handler entries per run, four raises each:
+ *   held to next 5 ms tick   1 196 485   (any-read acknowledge: 789 182)
+ *   250 us                      43 750
+ * with creditsig steady at ~482 throughout, i.e. the guest keeps servicing it.
+ * The guest never deasserts the line itself -- what it touches to acknowledge
+ * has not been found -- so the count scales with this window and nothing else.
+ */
+#define S5L8702_SM1_IRQ_ASSERT_US  20
+
 #define S5L8702_SM1_INTEN       0xa8c
 #define S5L8702_SM1_INTEN_FRAME (1u << 2)
 
@@ -190,6 +205,7 @@ struct IPodClassicSM1State {
     bool     irq_armed;     /* guest wrote bit 2 to +0xa8c (its own request)      */
     bool     irq_pending;   /* line asserted now; makes +0xa98 bit 2 read set     */
     QEMUTimer *irq_timer;
+    QEMUTimer *irq_off_timer;  /* bounds how long the line stays asserted */
     uint64_t last_pos;      /* stream position at the previous tick */
     uint64_t irqs;          /* lines raised, for the trace */
     uint64_t ticks;         /* timer ticks, for the idle diagnostic */
