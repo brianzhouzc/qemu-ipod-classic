@@ -172,6 +172,24 @@ static void chan_reload(IPodClassicTimerChannel *c)
                       'A' + c->index, mode);
     }
 
+    /*
+     * TIMERTRACE=1: what rate does each channel actually end up at?
+     *
+     * Needed because the audio task is dispatched with 17-21 SECOND gaps where
+     * it should run ~40 times a second (wiki/19 s11.50), and the natural
+     * suspect is a kernel tick that runs far too slowly. PCLK is not modelled
+     * -- chan_freq substitutes ECLK for it -- so a channel the guest programmed
+     * against PCLK comes out at the wrong rate, and this says by how much.
+     */
+    if (getenv("TIMERTRACE")) {
+        uint32_t f = chan_freq(c);
+        fprintf(stderr, "TIMERTRACE: chan %c  freq=%u Hz  data0=%u  pre=%u  "
+                        "con=%08x cmd=%08x  -> period %.3f ms\n",
+                'A' + c->index, f, (unsigned)c->data0, (unsigned)c->pre,
+                (unsigned)c->con, (unsigned)c->cmd,
+                f ? (double)limit * 1000.0 / (double)f : 0.0);
+    }
+
     /* A zero period would make the ptimer fire continuously. */
     if (limit == 0) {
         limit = chan_is_32bit(c) ? 0x100000000ULL : 0x10000;

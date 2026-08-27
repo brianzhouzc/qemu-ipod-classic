@@ -3056,3 +3056,34 @@ estrangular la cadena. Medido al revés: **sin** él todo empeora (`dpump` 16 ->
 naturales son el tick del kernel -- el canal de 1 kHz del temporizador (ECLK/2,
 DATA0 = 6000) -- y cualquier `sleep` que la tarea pida en ticks: si un tick nuestro
 dura mil veces lo que debe, una siesta de 10 ms se convierte en 20 segundos.
+
+## 11.51 El temporizador está bien: la hipótesis del tick, refutada
+
+§11.50 dejó como candidato principal un tick de kernel demasiado lento -- si un tick
+durase mil veces lo debido, la siesta de 10 ms de la tarea de audio se convertiría en
+los 20 segundos medidos. `TIMERTRACE=1` lo zanja:
+
+```
+chan A   freq=6000000 Hz  data0=6000  pre=0   -> periodo 1.000 ms
+chan B   freq=6000000 Hz  data0=6000  pre=0   -> periodo 1.000 ms
+chan E   freq=1000000 Hz  (libre, 32 bits)    -> el contador de microsegundos
+avisos "selects PCLK": 0
+```
+
+El tick del kernel corre a **exactamente 1 kHz**, que es lo que debe, y el contador de
+microsegundos a 1 MHz. Y **ningún** canal selecciona PCLK, así que la sustitución
+ECLK-por-PCLK que documenta `chan_freq` -- la parte no modelada -- nunca llega a
+aplicarse en esta ruta. El modelo de temporizadores no es el problema.
+
+**Balance de lo descartado, todo con medida:** el códec, la cola de decodificación, el
+camino de salida, la firma del iTunesDB, el bit 12 del estado, el crédito, la
+semántica del evento, el timeout de la espera, la cadencia del motor SM1, el ritmado
+de audio y ahora el reloj del sistema.
+
+**Lo que queda en pie:** la tarea de audio se activa en ráfagas separadas 17-21
+segundos (§11.50), y los instantes medidos -- 80,9 s, 98,4 s, 119,6 s -- caen dentro
+del guion de navegación del arnés, que duerme 6, 15 y 15 segundos entre pulsaciones.
+Eso sugiere que la tarea se está despertando **cuando algo del interfaz la toca**, no
+sobre un reloj de audio propio. Comprobarlo es la siguiente medida: una corrida que
+llegue a reproducir y luego no toque ninguna tecla, y ver si las ráfagas siguen
+apareciendo o se detienen.
