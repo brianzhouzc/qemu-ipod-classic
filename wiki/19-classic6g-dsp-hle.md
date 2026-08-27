@@ -3643,3 +3643,44 @@ abort del final, no el pisotón del descriptor que ocurre 2,3 KB antes.
 Si el anillo va de `0x22020000` a `0x22038000`, son `0x18000` bytes = **24576
 tramas**. Hay override por entorno (`SM1_POS=N`), así que se comprueba sin
 recompilar.
+
+## 11.67 De dónde sale el destino de `copy16`, sin inferencias
+
+§11.66 atribuyó el pisotón al tamaño del anillo, apoyándose en que el destino sería
+`0x22020000 + posición*4`. Eso venía del comentario del header, no de leer el código.
+Leído:
+
+```
+8016e58: mov r2, sp          ; parametro de salida
+8016e60: bl  0x08091710      ; el getter de posicion del SM1
+...
+8016e94: ldr r2, [sp]        ; lee lo que el getter escribio
+8016e9c: ldr r3, [r4,#12]    ; base
+8016ea4: add r2, r3, r2      ; destino = base + valor, suma de BYTES, sin escalar
+```
+
+Y el getter no devuelve la posición cruda:
+
+```
+8091734: add r1, r3, r1, lsl #2   ; base del bloque + canal*0x14
+8091738: ldr r3, [r1,#0xa48]      ; NUESTRO registro de posicion
+809173c: ldr r0, [r0,#4]          ; una base que mantiene el FIRMWARE
+8091740: add r0, r0, r3           ; base + posicion
+8091744: str r0, [r2]             ; <- esto es el offset que usa copy16
+```
+
+Luego **destino = `[r4+12]` + `[tabla+4]` + posición**, con un acumulador del propio
+firmware en medio. Dos consecuencias:
+
+1. La aritmética de §11.66 (destino máximo ~0x22040960 contra el abort en 0x22040a16)
+   **no prueba la atribución**: con esa indirección el ajuste puede ser casualidad.
+   La parte medida de §11.66 —que `copy16` es el ÚNICO escritor del descriptor— sigue
+   en pie; la explicación de por qué llega hasta allí, no.
+2. Bajar el envoltorio a 24576 tramas redujo los pisotones de 24 a 12 pero **no los
+   eliminó**, y `fetchok` siguió en 0. Coherente con lo anterior: nuestro registro
+   contribuye, pero no manda solo.
+
+La medida que hace falta es la que está corriendo: capturar `r2` (destino) y `r3`
+(base) en la cabeza del bucle `0x08016efc`, que es destino de salto y por tanto da
+lecturas de registro fiables. Con eso se sabe el rango real que barre la copia y si
+el envoltorio lo gobierna, en vez de deducirlo.
