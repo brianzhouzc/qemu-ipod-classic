@@ -3147,3 +3147,43 @@ emulación.
 `0x22002ff8` hacia atrás -- qué cola del RTXC lee, quién la llena -- en vez de seguir
 probando fuentes de interrupción una por una. Las cuatro que existen ya están
 descartadas por medida, así que el fallo está en el encolado, no en la señal.
+
+## 11.54 La cadena entera, del altavoz a la cola de trabajos
+
+Estado al cierre de la sesión, con cada eslabón medido:
+
+```
+[ARRIBA]  quien encola trabajos     0x220067b8 / 0x220067fc   4 veces cada uno  <-- AQUI
+              |  (count++ en 0x22008c1c, luego senal a 0x220106d0)
+          cola de trabajos          0x22008c1c                8 items
+              |
+          despachador               0x22002fe0..0x2200302c    lazo "while count>0"
+              |  (bl 0x22005dec, que salta a la bomba)
+          bomba de render           0x22006118                8 vueltas
+              |
+          espera del evento         0x0808af58                8 llamadas, 8 EXITOS
+              |
+          posicion / profundidad    [obj+0x2b4]=0 [obj+0x2b8]=4   profundidad 1
+              |
+          codec                     0x081e9e70                1 vez
+              |
+[ABAJO]   WAV                       solo clics
+```
+
+El despachador es un lazo `while (count > 0) { procesar; count-- }` sobre
+`[r5+0x0c]` con `r5 = 0x22008c10`, o sea la cuenta en **`0x22008c1c`** -- el mismo
+contador que una sesión anterior ya había señalado. Vigilando esa palabra salen
+exactamente cuatro ráfagas, dos encolados y dos desencolados cada una: **ocho items,
+ocho vueltas de la bomba**. Cuadra perfecto y no queda nada por explicar aguas abajo.
+
+**Todo lo de abajo está medido y sano o descartado:** el códec, la cola de
+decodificación, el evento, la espera, el camino de salida, el DMA (su ISR corre 7 185
+veces), el motor SM1, el temporizador del sistema y el ritmado del I2S. **El fallo
+está arriba del todo: nadie encola trabajo de audio salvo cuatro veces.**
+
+**Por dónde entrar la próxima vez:** `0x220067b8` está en una rutina que antes limpia
+una fila de campos (`[r4+0x2c]`..`[r4+0x80]`, `[r4+0x8c]`) -- tiene forma de
+arranque/reinicio, no de bombeo periódico. `0x220067fc` incrementa además un contador
+propio en `[r0+0x68]`. Ambos terminan señalando `0x220106d0`. Lo que hay que averiguar
+es qué debería llamarlos cuarenta veces por segundo durante la reproducción, y no lo
+hace.
