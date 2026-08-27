@@ -4157,3 +4157,34 @@ las capturas de esta sesión se queda en la lista de canciones y no pasa a
 búferes medidos no son "el principio de una reproducción que se apaga" sino otra cosa
 —los sonidos de la interfaz, por ejemplo— y toda la cadena que se ha estado trazando
 describe algo que nunca fue la reproducción.
+
+## 11.83 EL SÍNTOMA REAL: el reproductor se abre y se cierra solo
+
+Capturas tras pulsar reproducir, en la misma corrida:
+
+```
++5 s   la animacion de portada, girando -> EL REPRODUCTOR SE ESTA ABRIENDO
++20 s  de vuelta en la lista de canciones
++45 s  de vuelta en la lista de canciones
++70 s  de vuelta en la lista de canciones
+```
+
+Y el diff de la pulsación es de 42 416 píxeles: la pantalla cambia mucho y **vuelve**.
+No es que "Reproduciendo" se quede colgada en la animación, como se anotó en §11.39:
+**el reproductor arranca y aborta**, devolviendo el control a la lista.
+
+Ese es el síntoma que había que tener desde el principio, y reordena la lectura de
+todo lo demás: los ocho búferes, los ocho `dpump`, los cuatro `fetchbail` no son "una
+reproducción que se apaga poco a poco" sino **el intento de apertura y su
+cancelación**. Después de eso no hay nada que replanificar, y por eso la CPU se queda
+en el WFI (§11.78).
+
+Descartado además, en la misma línea, que el registro de la pista esté mal: volcado
+el `mhit`, el campo de tipo en `+0x18` contiene la fourcc `'MP3 '`, y tamaño,
+duración, bitrate (128) y frecuencia (44100 en 16.16 = 0xac440000) cuadran con los
+ficheros que hay en disco.
+
+**Para la próxima sesión, la pregunta correcta es otra:** no "por qué no sale audio"
+sino **"por qué el reproductor aborta al abrirse"**. Se ataca desde la UI hacia
+dentro —qué error devuelve la apertura de la pista— y no desde el DMA hacia fuera,
+que es por donde se ha entrado todas las veces y donde todo está sano.
