@@ -3603,3 +3603,43 @@ tamaño del anillo que gobierna ese offset es una INFERENCIA del modelo
 mientras que lo alto de IRAM1 resulta contener las estructuras de control del audio
 (tabla en 0x22038000, búfer en 0x22038100, descriptor en 0x2203ff28). Un anillo de
 128 KB desde 0x22020000 las cubre a las tres.
+
+## 11.66 CONFIRMADO: el render pisa su propia estructura de control
+
+Watch de escrituras sobre el descriptor, con reproducción viva:
+
+```
+--- mem-write watch 0x2203ff28-0x2203ff40: 24 stores from 1 distinct PC(s) ---
+    writer pc=0x08016f08  stores=24
+```
+
+**Un solo escritor, y es `copy16`** — el bucle que copia el PCM decodificado al
+anillo del render. Escribe muestras de audio encima de `0x2203ff28`, palabra de
+estado incluida. Es decir: el render destruye la estructura que la vuelta siguiente
+necesita para saber dónde escribir, y por eso `0x080a3c00` falla el 100 % de las
+veces (§11.65).
+
+**La aritmética cuadra al byte.** `copy16` escribe en `[r4+12] + offset` con
+`[r4+12] = 0x22020000` y `offset = posición * 4`, y el modelo envuelve la posición a
+`S5L8702_SM1_POS_RING_FRAMES = 0x20000/4` = 32768 tramas:
+
+```
+destino maximo = 0x22020000 + 0x20000 + (trozo de ~2,4 KB) = ~0x22040960
+abort observado en s11.36:                                    0x22040a16
+```
+
+Ese envoltorio **es una inferencia del modelo**, escrita en el propio comentario del
+header: *"IRAM1 is 128 KiB, so the position wraps every 32768 frames"*. Nunca se
+midió. Y lo que ahora sabemos es que lo alto de IRAM1 **no es anillo**: contiene las
+estructuras de control del audio —tabla en `0x22038000`, búfer en `0x22038100`,
+descriptor en `0x2203ff28`—. Un anillo de 128 KB desde `0x22020000` las cubre a las
+tres.
+
+Con eso, el fallo de `copy16` (§11.36) deja de ser un misterio aparte: **es el mismo
+fallo**. No es que la copia se desmadre, es que le estamos diciendo que el anillo es
+el doble de grande de lo que es. Y `IRAMSPILL` nunca podía arreglarlo: evita el
+abort del final, no el pisotón del descriptor que ocurre 2,3 KB antes.
+
+Si el anillo va de `0x22020000` a `0x22038000`, son `0x18000` bytes = **24576
+tramas**. Hay override por entorno (`SM1_POS=N`), así que se comprueba sin
+recompilar.
