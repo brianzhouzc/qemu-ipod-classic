@@ -78,6 +78,44 @@ static const unsigned char pl080_id[] =
 static const unsigned char pl081_id[] =
 { 0x81, 0x10, 0x04, 0x0a, 0x0d, 0xf0, 0x05, 0xb1 };
 
+/*
+ * DMATRACE=1: report what the guest programs into each DMA channel, and how
+ * many terminal-count interrupts each channel raises.
+ *
+ * This exists to settle one question for the iPod classic 6G audio work. The
+ * DMA interrupt handler was measured running 7 185 times, which was taken as
+ * evidence that the DMA was healthy -- but a global handler count does not say
+ * WHICH channel those interrupts came from. If they are all display or ATA
+ * traffic and nothing ever points a channel at the I2S TX FIFO (request line
+ * 0xA), then the audio DMA never runs at all and the conclusion was wrong.
+ * Observational only, and silent unless the variable is set.
+ */
+static int dmatrace = -1;
+
+static bool pl080_trace_on(void)
+{
+    if (dmatrace < 0) {
+        const char *e = getenv("DMATRACE");
+        dmatrace = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return dmatrace == 1;
+}
+
+/*
+ * Both DMACs share this model, so the trace has to say which one it is. The
+ * machine creates DMAC0 before DMAC1, so labelling by first-seen instance is
+ * enough here and costs no plumbing through the device tree.
+ */
+static const void *pl080_trace_first;
+
+static const char *pl080_trace_tag(PL080State *s)
+{
+    if (!pl080_trace_first) {
+        pl080_trace_first = s;
+    }
+    return (pl080_trace_first == s) ? "dmac0" : "dmac1";
+}
+
 static void pl080_update(PL080State *s)
 {
     bool tclevel = (s->tc_int & s->tc_mask);
@@ -259,6 +297,18 @@ again:
                 if (ch->ctrl & PL080_CCTRL_I) {
                     //printf("Setting interrupt status of channel %d\n", c);
                     s->tc_int |= 1 << c;
+                    if (pl080_trace_on()) {
+                        s->tc_count[c]++;
+                        if (s->tc_count[c] <= 3
+                                || s->tc_count[c] % 500 == 0) {
+                            fprintf(stderr,
+                                    "DMATRACE %s ch%d TC #%u srcid=%d dstid=%d "
+                                    "srcend=0x%08x dst=0x%08x lli=0x%08x\n",
+                                    pl080_trace_tag(s), c, s->tc_count[c],
+                                    src_id, dest_id, ch->src, ch->dest,
+                                    ch->lli);
+                        }
+                    }
                     /*
                      * A paced peripheral gets exactly one chunk per request
                      * pulse: consume the request so the next iteration stalls
@@ -316,7 +366,7 @@ void pl080_pace_request(PL080State *s, int line)
     s->req_single &= ~(1u << line);
 }
 
-static uint64_t pl080_read(void *opaque, hwaddr offset,
+static uint64_t pl080_read_inner(void *opaque, hwaddr offset,
                            unsigned size)
 {
     PL080State *s = (PL080State *)opaque;
@@ -385,6 +435,33 @@ static uint64_t pl080_read(void *opaque, hwaddr offset,
     }
 }
 
+/*
+ * Trace wrapper. The channel-register cases above return directly, so the tally
+ * cannot live inside them without restructuring the switch. This asks the one
+ * question that matters for the audio work: which DMAC register does the
+ * firmware POLL to decide how much room the output has, and what value does the
+ * model hand back? The codec is being called with a sample count of zero, and
+ * that count is derived from the guest's own book-keeping of DMA progress.
+ */
+static uint64_t pl080_read(void *opaque, hwaddr offset, unsigned size)
+{
+    uint64_t val = pl080_read_inner(opaque, offset, size);
+
+    if (pl080_trace_on() && offset < 0x200) {
+        static uint64_t n[128];
+        unsigned slot = (unsigned)(offset >> 2) & 127;
+        uint64_t c = ++n[slot];
+
+        if ((c & (c - 1)) == 0 || c % 100000 == 0) {
+            fprintf(stderr, "DMATRACE %s RD +0x%03" HWADDR_PRIx
+                    " -> 0x%08x  n=%llu\n",
+                    pl080_trace_tag((PL080State *)opaque),
+                    offset, (uint32_t)val, (unsigned long long)c);
+        }
+    }
+    return val;
+}
+
 static void pl080_write(void *opaque, hwaddr offset,
                         uint64_t value, unsigned size)
 {
@@ -437,6 +514,17 @@ static void pl080_write(void *opaque, hwaddr offset,
                 s->paced_pending &= ~(1u << i);
             }
             s->chan[i].conf = value;
+            if (pl080_trace_on() && (value & PL080_CCONF_E)) {
+                fprintf(stderr,
+                        "DMATRACE %s ch%d ENABLE conf=0x%08x flow=%d "
+                        "srcid=%d dstid=%d src=0x%08x dst=0x%08x lli=0x%08x "
+                        "xsize=%u\n",
+                        pl080_trace_tag(s), i, (uint32_t)value,
+                        (int)((value >> 11) & 7), (int)((value >> 1) & 0x1f),
+                        (int)((value >> 6) & 0x1f), s->chan[i].src,
+                        s->chan[i].dest, s->chan[i].lli,
+                        (unsigned)(s->chan[i].ctrl & 0xfff));
+            }
             pl080_run(s);
             break;
         }

@@ -83,6 +83,13 @@ struct PL080State {
      * (CONFIG.E=0). Never set for non-paced lines, so stock DMA is unaffected.
      */
     uint32_t paced_pending;
+    /*
+     * Terminal-count tallies, one per channel, kept only while DMATRACE is set.
+     * They exist to answer WHICH channel raised a DMA interrupt: a global ISR
+     * hit count says the controller is alive but not whether the audio channel
+     * is the one doing the work. Not migrated -- purely observational.
+     */
+    uint32_t tc_count[PL080_MAX_CHANNELS];
     qemu_irq irq;
     qemu_irq interr;
     qemu_irq inttc;

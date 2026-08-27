@@ -208,6 +208,47 @@ static void i2s_wav_sample(IPodClassicI2SState *s, uint64_t value, unsigned size
     }
 }
 
+/*
+ * I2SCOUNT=1: tally accesses per register instead of printing every one.
+ *
+ * I2STRACE prints a line per access, which is unusable for exactly the question
+ * that matters here -- whether the firmware SPINS on a register. The CLKCON bug
+ * above was found that way and needed 161 million reads to show itself; a
+ * per-line trace of that is not something anyone can read. The STATUS register
+ * at +0x3c is the remaining unknown in this device: its bits are undocumented
+ * and the model answers 0 forever, so if the audio driver polls it for a "FIFO
+ * has room" or "TX ready" condition it would write one burst and wait for ever
+ * -- which is the shape of the bug being chased. Counting answers that in one
+ * run. The tally prints on a doubling schedule so a genuine spin is loud and a
+ * handful of accesses stays quiet.
+ */
+static int i2scount = -1;
+
+static bool i2s_count_on(void)
+{
+    if (i2scount < 0) {
+        const char *e = getenv("I2SCOUNT");
+        i2scount = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return i2scount == 1;
+}
+
+static void i2s_count_hit(hwaddr off, const char *dir, uint32_t val)
+{
+    /* One slot per 4-byte register in the low 0x44 bytes; the rest share [17]. */
+    static uint64_t rd[18], wr[18];
+    uint64_t *tab = (*dir == 'r') ? rd : wr;
+    unsigned slot = (off < 0x44) ? (unsigned)(off >> 2) : 17;
+    uint64_t n = ++tab[slot];
+
+    /* Powers of two: 1, 2, 4, ... plus every millionth once past that. */
+    if ((n & (n - 1)) == 0 || n % 1000000 == 0) {
+        fprintf(stderr, "I2SCOUNT %s +0x%02" HWADDR_PRIx " %-7s n=%llu "
+                "last=0x%08x\n", dir, off, i2s_reg_name(off),
+                (unsigned long long)n, val);
+    }
+}
+
 /* -------------------------------------------------------------- pacing */
 
 /*
@@ -561,6 +602,9 @@ static uint64_t ipod_classic_i2s_read(void *opaque, hwaddr offset,
         break;
     }
 
+    if (i2s_count_on()) {
+        i2s_count_hit(offset, "rd", val);
+    }
     if (i2s_trace_on()) {
         fprintf(stderr, "I2STRACE rd +0x%02" HWADDR_PRIx " -> 0x%08x  %-7s "
                 "pc~0x%08x\n", offset, val, i2s_reg_name(offset),
@@ -613,6 +657,9 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
         break;
     }
 
+    if (i2s_count_on()) {
+        i2s_count_hit(offset, "wr", (uint32_t)value);
+    }
     if (i2s_trace_on() && offset != S5L8702_I2S_TXDB0) {
         /* The FIFO gets thousands of writes a boot; count, do not print. */
         fprintf(stderr, "I2STRACE wr +0x%02" HWADDR_PRIx " = 0x%08x  %-7s "

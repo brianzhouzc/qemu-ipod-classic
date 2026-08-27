@@ -3294,3 +3294,50 @@ Instrumentos nuevos: `SHA1TRACE`, `SHA1_ZERO`, `PMUTRACE`, `PMUBATT`, `TIMERTRAC
 `QEMU_DEBUG`, `IRAMSPILL`, `SM1_IRQ_EVERY`, `SM1_IRQ_PULSE`, `SM1_FRAME_BIT`, y las
 sondas `abort_probe`, `limit_probe`, `posinc_probe`, `slot_probe`, `dma_probe`,
 `dma2_probe`, mas `run_nav.sh`, `run_quiet.sh` y `run_settle.sh`.
+
+## 11.58 CORRECCIÓN de §11.57: el lazo de salida SÍ gira, 7 500 veces
+
+§11.57 concluyó "no arranca el lazo". Medido directamente con una traza nueva en
+el PL080 (`DMATRACE=1`, cuenta qué se programa en cada canal y cuántos
+terminal-count levanta cada uno), eso es **falso para el lado de la salida**:
+
+```
+dmac0 ch1 ENABLE conf=0x00008a81 flow=1 srcid=0 dstid=10
+          src=0x22008c5c  dst=0x3ca00010  lli=0x22010020  xsize=2048
+dmac0 ch1 TC #7500 srcid=0 dstid=10
+```
+
+`dstid=10` es `IIS0_TX`; `0x3ca00010` es el FIFO del I2S. El canal drena un
+**doble búfer de 4 KB en IRAM0** (0x22008c5c / 0x22009c5c) hacia el FIFO y
+levanta más de **7 500** terminal-counts por corrida. Eso son ~15 millones de
+muestras entregadas, que es exactamente el tamaño del WAV (32 MB). El consumidor
+está sano y va al tempo correcto.
+
+**Por qué el descarte anterior del DMA no valía.** §11.53 dio el DMA por bueno
+porque "su ISR corre 7 185 veces". Una cuenta global del manejador no dice de qué
+canal vienen las interrupciones: podían ser todas del display o del ATA. Ahora se
+sabe que son del canal de audio, pero eso hubo que medirlo, no suponerlo. La
+lección se repite en esta investigación: **un contador agregado no responde una
+pregunta sobre un componente concreto.**
+
+**Y un detalle que reordena el problema.** En la corrida `dma1` la reproducción no
+llegó a arrancar siquiera (`StartPlayback hits=0`, `dpump=0`, `aacmath=0`) y aun
+así el canal entregó 7 500 búferes. Es decir, **ese canal es una bomba de silencio
+que corre desde el arranque**, independientemente de que haya o no reproducción.
+
+**Dónde queda el fallo, entonces.** No en que el lazo no gire, sino en que **nadie
+rellena de audio los búferes de IRAM0 que el DMA drena**. Y el sitio exacto ya
+estaba anotado en la cabecera de `run_play.sh`: en el lazo del códec
+
+```
+81e9434: ldr r1, [r0, #0x44]     ; r0 = obj2
+81e9438: ldr r0, [r4, #8]
+81e9440: cmp r1, r0
+81e9444: movle r0, r1            ; r0 = min(...)
+81e9448: mov r3, r0              ; 3er argumento = cuenta de muestras
+81e9458: bl 0x81e9e70            ; el codec
+```
+
+el códec **sí se llama, pero con `r3 = min([obj2+0x44], [r4+8])`, y ambos campos
+están medidos a CERO**. Se le pide producir cero muestras. Así que la pregunta no
+es quién consume ni cuándo, sino **quién debe rellenar esos dos contadores**.
