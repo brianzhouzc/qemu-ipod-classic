@@ -4052,3 +4052,48 @@ Y encaja también con §11.77: no había un conducto equivocado que trazar, porq
 palabra", sino: *el SM1 levanta 2 646 interrupciones y su manejador señala el evento
 otras tantas; ¿por qué eso no despierta a ninguna tarea?* La señal llega y el sistema
 sigue durmiendo. Eso es una cuestión de planificación del kernel RTXC, no de audio.
+
+## 11.79 Los punteros de la estructura son datos estáticos del firmware
+
+Watch sobre los campos de puntero del global (`0x0896a688-0x0896a698`):
+
+```
++0us   pc=0x22000198  addr=0x0896a688
++28us  pc=0x22000198  addr=0x0896a68c
++29us  pc=0x220001a0  addr=0x0896a690
++30us  pc=0x220001a0  addr=0x0896a694
+(y ninguna mas en toda la corrida)
+```
+
+Se escriben en el microsegundo cero, desde código de IRAM0 (`0x22000198`, la rutina
+de copia de la que también sale el `memset` de §11.63). Es decir, **son datos
+estáticos de la imagen**, copiados durante el arranque: la dirección `0x2203ff28` no
+la calcula nadie en ejecución, viene fijada en el firmware. Ahí es donde sus autores
+pusieron la estructura de control del audio, en lo alto de IRAM1.
+
+Cronología del fallo en la misma corrida:
+
+```
+fetchbail #1 .. #4   +142,2 s .. +142,4 s      (al pulsar reproducir)
+fetchbail #5 .. #6   +163,6 s
+fetchbail #7 .. #8   +169,7 s
+fetchok              0
+```
+
+Ocho intentos, ocho fallos, ninguno acierta.
+
+## 11.80 SONDA (no arreglo): poner el bit a mano
+
+La guarda exige un bit —1 o 2— en la palabra de 16 bits de `0x2203ff28`, que está a
+cero y que nadie escribe nunca. Escribirlo a mano por gdb con la máquina en marcha
+responde una pregunta que ninguna lectura del desensamblado puede responder: **¿es
+esa guarda el único bloqueo, o hay más detrás?**
+
+Si tras ponerlo `fetchok` deja de ser cero y el WAV cambia, el mecanismo queda
+confirmado y se sabe qué tiene que producir el modelo. Si no cambia nada, la guarda
+es síntoma y hay que mirar más arriba —lo cual, con la CPU dormida el 88 % del tiempo
+(§11.78), es lo más probable—.
+
+Queda dicho de forma explícita: **esto es instrumentación de diagnóstico**, escribir
+memoria del invitado desde fuera. No es un arreglo, no puede quedarse, y no cuenta
+como "el reproductor funciona".
