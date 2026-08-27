@@ -3385,3 +3385,33 @@ El menú, verificado en pantalla y en inglés: **Music, Videos, Photos, Podcasts
 Extras, Settings, Shuffle Songs** — Music ya viene resaltado al aceptar el idioma,
 no hay que desplazarse. Dentro: **Cover Flow, Playlists, Artists, Albums,
 Compilations, Songs**, luego Genres, Composers, Audiobooks — Songs a cinco abajo.
+
+## 11.61 CORRECCIÓN de etiqueta: `0x081e9e70` no es un códec
+
+Todo el trabajo anterior lo llama `aacmath` y lo trata como el decodificador, y de
+ahí sale la frase "el códec se llama pero con cuenta cero". Leído el desensamblado,
+eso no se sostiene:
+
+```
+81e9e70: ...
+81e9e94: bl 0x81c0c50          ; obtiene un objeto
+81e9ed8: bl 0x80f8ba8          ; <-- "siguiente" de una lista
+81e9ec4: cmp r0, r6            ; el [+4] de cada elemento contra los dos valores
+81e9ecc: cmp r0, r7
+81e9ef0: bl 0x80f8ab4          ; actúa sobre el que encaja
+```
+
+`0x80f8ba8` es un iterador de lista enlazada sin ninguna ambigüedad: cursor en
+`[obj+0x30]`, cabeza en `[obj+0x28]`, avanza por el puntero `next` y devuelve
+`cursor+8`. Y `0x80f8ab4` recorre un array de punteros de función
+(`[r5+4] + i*4`, llamando a `0x83613a8`). Eso es **despacho de notificaciones a
+suscriptores**, no aritmética sobre PCM.
+
+Así que `aacmath=1` nunca significó "el decodificador produjo una trama", y
+`min([obj2+0x44],[r4+8]) = 0` no significa "se le pide producir cero muestras":
+son los extremos de un rango que se usa para elegir a quién notificar. La
+conclusión que colgaba de esa lectura queda retirada.
+
+**La lección, que ya va dos veces en esta investigación:** una etiqueta puesta por
+conjetura (`aacmath`, `pullbail`) se propaga a través de docenas de medidas y las
+contamina todas. Antes de construir sobre un nombre, leer las diez instrucciones.
