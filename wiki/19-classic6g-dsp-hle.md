@@ -3500,3 +3500,59 @@ tempo, el driver responde con silencio porque no tiene nada, y el productor
 despachador de la cola de trabajos, que recibió ocho elementos — que es el número
 que viene arrastrándose desde el sitio de envío del firmware. La cadena entera es
 coherente; lo que falta es lo que debería repetir el envío.
+
+## 11.64 La puerta que apaga el render: `0x080a3c00` y un bit de estado
+
+Con las tres variables puestas (`SHA1_ZERO=1`, `IRAMSPILL=0x10000`, **`SM1_IRQ=1`**)
+la cadena de despertar funciona:
+
+```
+credithdlr  2646     el manejador de la linea 18 entra
+creditsig   2646     y senala el evento 0x22008c58 otras tantas
+evwait         8     pero el render solo lo espera OCHO veces
+dpump         16     copy16 9616     WAV: solo clics
+```
+
+**`SM1_IRQ=1` gatea la creación misma del temporizador** (`ipod_classic_sm1.c`,
+`s->irq_enabled`). Sin ella no hay tick, no hay aserción y `raises=0`. El mensaje
+que sí aparece — "guest armed the engine interrupt; VIC line 18 live" — es el
+FIRMWARE armándola, no el modelo levantándola: leerlo como confirmación costó cinco
+corridas. La señal buena es "engine interrupt armed on VIC0 line 18" al arrancar y
+luego "line 18 raised #N".
+
+**Y ahora el lazo, desmontado.** El bucle del render en IRAM:
+
+```
+22006324: bl 0x22003850   -> veneer a 0x0808af58 (la espera del evento)
+22006328: cmp r0, #0
+2200632c: beq 0x22006310  -> duerme 10 y reintenta... solo DOS veces
+22006338: str fp, [sp,#24]        <- pone la longitud a CERO
+2200633c: bl 0x22003858   -> veneer a 0x080a3c00
+22006340: ldr r1, [sp,#24]
+22006344: cmp r1, #0
+22006348: bne 0x22006370          <- trajo datos: camino vivo
+22006358: bne 0x220061fc          <- no trajo: SALIDA
+```
+
+La espera tiene éxito. Lo que decide es `0x080a3c00`, que calcula puntero y longitud
+del búfer PCM y los escribe en los dos parámetros de salida — **pero sólo si pasa una
+guarda**:
+
+```
+80a3c18: ldr  r1, [r4,#4]     ; r4 = 0x0896a684 (global), r1 = descriptor
+80a3c1c: ldrh r2, [r1]        ; palabra de estado de 16 bits
+80a3c20: cmp  r0, #6          ; r0 = (estado==6) ? 2 : 1
+80a3c2c: tst  r2, r0
+80a3c30: beq  0x80a3cbc       ; <-- bit ausente: sale SIN escribir nada
+80a3c34: ldrh r0, [r1,#2]     ; segunda guarda: indice de sub-bloque == 0
+80a3c4c: cmpeq r3, #1         ;   y [entrada+10] == 1
+80a3c50: bne  0x80a3cbc       ; <-- tambien sale
+80a3c6c: str  r1, [r5]        ; puntero del bufer
+80a3c70: str  r0, [r6]        ; LONGITUD
+```
+
+Si el bit no está, la longitud se queda en el cero que el llamador puso, y el render
+abandona. **Esa palabra de estado de 16 bits es un espejo de hardware**, y el bloque
+que lo alimenta es justo el que estamos modelando. Si el modelo no pone ese bit, el
+fallo es nuestro y tiene arreglo. La medida que lo decide —cuántas veces se toma cada
+salida— está corriendo.
