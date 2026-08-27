@@ -2983,3 +2983,40 @@ cuántas veces gira ese lazo.
 tras ocho vueltas. Es una tarea del RTXC; el patrón a buscar es una condición de
 salida del bucle, no un bloqueo -- la espera de dentro lleva timeout 500 y por tanto
 nunca cuelga indefinidamente (§11.47).
+
+## 11.49 La espera NO falla: tiene éxito siempre. Sube otra vez el objetivo
+
+§11.48 dejó al que espera invocado sólo ocho veces, y el lazo que lo llama parecía
+explicarlo:
+
+```
+22006324:  bl 0x22003850      llama al que espera
+22006328:  cmp r0, #0
+2200632c:  beq 0x22006310     devolvio 0 = fallo: dormir y reintentar
+22006310:  mov r0,#10 ; bl ... dormir
+2200631c:  cmp r7, #1
+22006320:  bgt 0x220061fc     tras DOS intentos, abandonar
+```
+
+De ahí salió la hipótesis natural: la espera (timeout 500) vence, y el lazo se rinde
+a los dos reintentos. **Medido, es falsa.**
+
+```
+loopcall (0x22006324, la llamada)        = 8
+waitok   (0x22006330, la rama de EXITO)  = 8
+```
+
+`waitok == loopcall`: **la espera tiene éxito las ocho veces.** La rama de reintento
+no se toma nunca. Y subiendo la cadencia del motor a `SM1_IRQ_EVERY=1` --
+`creditsig` de 1 841 a **8 180** -- ni `dpump` ni `aacmath` se mueven. La cadencia no
+es el motor de nada aquí.
+
+**Así que el objetivo sube otra vez.** El lazo no se rinde: sencillamente **la función
+que lo contiene sólo se ejecuta ocho veces**. `dpump` (`0x22006118`) corre 16 veces y
+dentro de ella esta espera ocurre 8, siempre con éxito. La pregunta viva es quién
+llama a `0x22006118` y por qué sólo dieciséis veces.
+
+**Advertencia de método, otra vez la misma.** Leí el `beq` de reintento como el camino
+habitual sin comprobarlo. Contar la rama de éxito costaba una corrida y habría evitado
+toda la teoría del timeout. Antes de razonar sobre qué rama toma un salto, hay que
+contarla.

@@ -214,7 +214,26 @@ static void sm1_irq_tick(void *opaque)
      * the handler sees a discrete event and a missed one cannot wedge the line.
      */
     s->ticks++;
-    if (!s->irq_pending && (s->irq_armed || s->irq_always) && (s->ticks % 5 == 0)) {
+    /*
+     * SM1_IRQ_EVERY overrides how many 5 ms ticks pass between reports.
+     *
+     * Needed to test a specific failure: the audio task's loop at 0x22006324
+     * calls the event waiter, and when the waiter returns failure it sleeps and
+     * retries -- but only TWICE (`cmp r7,#1 ; bgt exit`) before giving up. The
+     * waiter's own wait carries a timeout of 500. So if a frame report does not
+     * arrive inside that timeout the whole audio pump bails after two attempts,
+     * which is exactly the eight invocations measured. Making the report more
+     * frequent says whether the cadence is what misses the timeout.
+     */
+    static int every = -1;
+    if (every < 0) {
+        const char *e = getenv("SM1_IRQ_EVERY");
+        every = (e && *e) ? atoi(e) : 5;
+        if (every < 1) {
+            every = 1;
+        }
+    }
+    if (!s->irq_pending && (s->irq_armed || s->irq_always) && (s->ticks % every == 0)) {
         s->irq_pending = true;
         s->last_pos = pos;
         s->irqs++;
