@@ -2948,3 +2948,38 @@ conviene poder volver a probarlo.
 También queda visto que la espera lleva **timeout 500**, así que no es un bloqueo
 eterno: el que espera se despierta solo aunque nadie señale. Eso descarta que el corte
 sea un deadlock en ese punto.
+
+## 11.48 Corrección: el corte no está en el evento, está por encima
+
+§11.45 situó el corte en el factor ~114 entre `creditsig` (1 822) y `dpump` (16), y
+§11.47 fue a buscar la semántica del evento. **Las dos apuntaban al sitio
+equivocado.**
+
+El que espera (`0x0808af58`) se invoca a través de un trampolín en IRAM
+(`0x22003850`: `ldr pc,[pc,#-4]` seguido de la dirección), así que se puede contar:
+
+```
+waitcall  (trampolin 0x22003850)  =    8
+waitfn    (0x0808af58)            =    8
+dowait    (0x0808afb0, la espera) =    8
+bit12set  (rama del bit 12)       =    0
+creditsig (senales del evento)    = 1841
+dpump                             =   16
+```
+
+**Al que espera sólo se le LLAMA ocho veces.** No es que la espera falle ni que se
+pierdan señales: las 1 841 señales nunca iban a consumirse porque **nadie estaba
+esperándolas**. Buscar la semántica del evento RTXC habría sido tiempo perdido.
+
+El corte está más arriba: **el lazo de la tarea que debería bombear audio gira ocho
+veces en toda la corrida**. Todo lo de aguas abajo -- la espera, el evento, la
+posición, la profundidad de cola, el códec, las muestras -- es consecuencia de eso.
+
+Y esto explica por qué ninguna de las mejoras de aguas abajo movió `aacmath`: la
+tormenta (§11.42) hizo que el sistema respirara y el render doblara, pero no cambió
+cuántas veces gira ese lazo.
+
+**Dónde mirar ahora:** quién llama al trampolín `0x22003850` y por qué su lazo termina
+tras ocho vueltas. Es una tarea del RTXC; el patrón a buscar es una condición de
+salida del bucle, no un bloqueo -- la espera de dentro lleva timeout 500 y por tanto
+nunca cuelga indefinidamente (§11.47).
