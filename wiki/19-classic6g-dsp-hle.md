@@ -4307,3 +4307,39 @@ es un despacho de notificaciones, §11.61), `pullbail` (que es el epílogo), la 
 `pull`/notificador/petición (que es código de arranque, §11.77) y ahora
 `StartPlayback`. **El mapa de direcciones heredado hay que tratarlo como sospechoso
 hasta que cada nombre se vuelva a comprobar con una medida.**
+
+## 11.90 EL HALLAZGO QUE INVALIDA EL PLANTEAMIENTO: todo pasa en el segundo 0
+
+`cap=8` en el arnés registra sólo los **ocho primeros aciertos de cada sitio**, así
+que todos los tiempos leídos en esta investigación son los del principio, no los del
+grueso. Subido el tope a 20 000 y hecho el histograma por segundo:
+
+```
+copy16     4808  ->  TODO en el segundo 0
+dpump         8  ->  todo en el segundo 0
+mixer         8  ->  todo en el segundo 0
+pcmout        4  ->  todo en el segundo 0
+fetchbail     4  ->  todo en el segundo 0
+creditsig   325  ->  290 en el segundo 0, 32 en el 10, 3 en el 11
+```
+
+Se pulsa reproducir a los **~140 segundos**. **Ninguno de estos sitios se ejecuta al
+reproducir: todos ocurren en el primer segundo del arranque.**
+
+Con esto se cierra el círculo de §11.77, §11.81 y §11.89, y la conclusión es más
+fuerte de lo que parecía: **toda la maquinaria de audio que esta investigación ha
+estado midiendo —el render, el mixer, la copia de PCM, la bomba, la búsqueda de
+búferes— es el empuje de silencio del arranque.** Los "ocho búferes", los "ocho
+dpump", los "cuatro fetchbail" que se llevan meses persiguiendo no describen una
+reproducción rota: describen la inicialización, que funciona.
+
+Y por tanto: **al pulsar reproducir no se entra en el conducto de audio en absoluto.**
+El reproductor se abre, aborta (§11.83) y ni siquiera llega a tocar el render. Eso
+explica sin residuo por qué la CPU se queda en el WFI y por qué cada nivel que se
+trazaba daba "ocho veces".
+
+**Consecuencia para el trabajo futuro.** Los contadores heredados (`dpump`, `mixer`,
+`copy16`, `pcmout`, `rendret`, `aacmath`, `framepull`) **no sirven para medir la
+reproducción**. Cualquier conclusión anterior que los use como evidencia de qué pasa
+al reproducir hay que releerla como evidencia de qué pasa al arrancar. Y toda medida
+nueva tiene que llevar **marca de tiempo y tope alto**, o vuelve a mentir igual.
