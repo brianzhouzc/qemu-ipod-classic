@@ -4010,3 +4010,45 @@ y seguir subiendo por llamadores dentro de él sólo produce más niveles dormid
 por el monitor mientras suena la canción y hacer un histograma. Eso dice, sin
 hipótesis previas, qué está ejecutando el aparato durante los 60 segundos en los que
 debería estar decodificando, y en qué región vive ese código (IRAM0, IRAM1 o DRAM).
+
+## 11.78 EL DATO QUE FALTABA: la CPU está DORMIDA el 88 % del tiempo
+
+Muestreo del PC por el monitor, 300 muestras mientras la canción "suena":
+
+```
+0x22003b20   264  (88,0%)  IRAM0
+0x00004da8    10   (3,3%)  vector/bajo
+0x22003e8c     4   (1,3%)
+... el resto, colas de 1-5 muestras
+reparto: IRAM0 275, direcciones bajas 25, DRAM 0
+```
+
+Y `0x22003b20` es, en `iram.dis`:
+
+```
+22003b0c: nop / nop / nop / nop
+22003b1c: mcr 15, 0, r0, cr7, cr0, {4}    <-- WAIT FOR INTERRUPT
+22003b20: nop                             <-- donde cae el 88% de las muestras
+22003b24: nop / nop / nop
+22003b30: b 0x22003b0c
+```
+
+Es el **lazo ocioso del kernel**, y el PC está en la instrucción siguiente al WFI.
+
+**El aparato no está atascado: está dormido.** Eso reencuadra la investigación entera.
+No hay un bucle que se coma la CPU, ni un interbloqueo, ni una espera que falle: no
+hay trabajo. Cero muestras en DRAM significa que durante esos 60 segundos **no se
+ejecuta código de aplicación en absoluto**, y por tanto tampoco decodificador —
+cualquier decodificador, en cualquier sitio del mapa.
+
+Encaja con todo lo medido y explica de golpe por qué cada nivel que se trazaba daba
+"ocho veces" o "una vez": no es que ocho eventos se pierdan, es que el sistema
+despierta ocho veces y se vuelve a dormir.
+
+Y encaja también con §11.77: no había un conducto equivocado que trazar, porque
+**durante la reproducción no se ejecuta prácticamente nada**.
+
+**La pregunta correcta, por fin.** No "qué eslabón está roto" ni "quién escribe tal
+palabra", sino: *el SM1 levanta 2 646 interrupciones y su manejador señala el evento
+otras tantas; ¿por qué eso no despierta a ninguna tarea?* La señal llega y el sistema
+sigue durmiendo. Eso es una cuestión de planificación del kernel RTXC, no de audio.
