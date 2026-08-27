@@ -44,7 +44,15 @@ PA="$PA,pc=0x0816bf48:pcmout,pc=0x081e9e70:aacmath"
 # These are the only four sites in the image that write that field.
 PA="$PA,pc=0x081cc1f4:cred1,pc=0x081cc7a4:cred2,pc=0x081d7548:cred3,pc=0x081e360c:cred4"
 PA="$PA,pc=0x081c0fd4:credread,pc=0x081e93d8:framepull,pc=0x081c1508:fpull2"
-PA="$PA,memw=0x08889000-0x0888a000,memcap=30"
+# Is the PLAY-time source the same buffer as the boot-time one? 0x08016edc is a
+# branch target (TB head, so the register read is reliable): r0 = source pointer,
+# r4 = descriptor. If these differ from 0x08889098/0x0bb12d54, the memw watch
+# below has been aimed at the wrong region all along.
+PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
+# CORRECTED WINDOW: the play-time copy reads from 0x0888a2xx-0x0888a6xx (measured
+# live), not from the boot-time 0x08889098. The earlier watch missed the real
+# buffer entirely, which is why it only ever saw memset.
+PA="$PA,memw=0x0888a000-0x0888c000,memcap=40"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \

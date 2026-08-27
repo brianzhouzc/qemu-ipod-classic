@@ -2165,3 +2165,94 @@ el audio, sin instrumentación nuestra.
 retailOS (Rockbox no lee SM1). Sondas nuevas en `run_pump.sh`
 (`statetest`/`ctxbuild`/`ctxskip`/`pcmout`/`copy16`) y guarda de puerto para que las
 corridas repetidas dejen de colisionar en silencio.
+
+### 11.29 El SHA-1 no estaba modelado: caen el panic y los reinicios — y el aparato queda navegable por primera vez
+
+Sesión centrada en **usar** el reproductor, no sólo en medirlo. Tres resultados: un
+tercer fallo de fidelidad hallado y corregido, la mecánica de navegación
+caracterizada (llevaba invalidando pruebas en silencio), y el estado del audio
+acotado con datos limpios.
+
+**A) El reinicio cada ~46 s no era la batería: era un PANIC del firmware.**
+De las siete rutas al reset `0x08322b10` sólo dispara `0x08021c00`, y lo que hay
+inmediatamente antes es:
+
+```
+8021bec:  ldr r1, =0x08375894
+8021bf8:  svc 0x00123456      ; imprime por semihosting
+8021c00:  b   0x8322b10       ; y reinicia
+```
+
+La cadena en `0x08375894` es literalmente **`"CPU_exception_handler"`**. Pero con
+`-d int` se midieron **100 119 excepciones, TODAS IRQ**, ninguna de aborto: la CPU
+nunca falla. Es la ruta de panic propia del firmware.
+
+**Causa:** el **acelerador SHA-1** (`0x38000000`) era una ventana no implementada y
+el retailOS lo usa de verdad. Con `-d unimp`: escribe la config en `+0x00`, arma el
+modo memoria en `+0x80`, fija el tamaño en `+0x8c` y lee el digest de
+`+0x20..+0x34` — recibiendo **ceros**. Un hash que nunca cuadra acaba en el panic.
+
+**Arreglo:** el bloque del S5L8720 ya modelado en `hw/arm/ipod_touch_sha1.c` tiene
+**exactamente** ese mapa de registros, así que sirve tal cual al S5L8702.
+Reutilizado, no reescrito. **Medido: `resets=0 panics=0`** (antes 1-2 por corrida).
+
+**B) El intercambio que impone, medido (A/B sobre la MISMA imagen).**
+
+| | Biblioteca | Reinicios |
+|---|---|---|
+| `SHA1_OFF=1` | **4 canciones** | 1 |
+| por defecto | "No hay música" | **0** |
+
+Con el motor funcionando el firmware **valida de verdad** el hash del iTunesDB de la
+imagen y lo rechaza; antes pasaba cualquier cosa porque el digest era ceros. El
+arreglo es correcto como hardware; lo que destapa es que la biblioteca de la imagen
+lleva una firma que este dispositivo no reproduce (`SysInfo` tiene
+`FirewireGuid: 0000000000000000`). Se deja `SHA1_OFF` porque poder hacer el A/B
+sobre la misma imagen es lo que distingue "el modelo está mal" de "la imagen está
+mal".
+
+**C) La navegación, caracterizada — invalidaba pruebas en silencio.**
+1. Un arranque limpio (con `-snapshot` no persiste nada) entra en el **selector de
+   idioma**, no en el menú principal. Si no se descarta primero, **cada pulsación
+   posterior está eligiendo idioma en vez de canción** — así acabó el menú en griego
+   varias veces, y así se explican navegaciones "que no hacían nada".
+2. El clickwheel del retailOS **descarta ~5 de cada 7 pulsaciones de SELECT**
+   (documentado en `iremote.py`). Una sola pulsación es **indistinguible de un botón
+   muerto**; hay que usar la forma con reintentos. Con reintentos, SELECT entra.
+3. `tools/session-dbg/run_play.sh` incorpora ambas cosas y conduce el aparato hasta
+   reproducir, midiendo el audio por **RMS del WAV del I2S**, no de vista.
+
+**D) El estado del audio, acotado.** Con reproducción lanzada (`StartPlayback=1`):
+
+```
+dpump=3  engine=2  rendret=1  ctxbuild=1  mixer=3
+copyent=87  copy16=1203        <- el render NATIVO escribe PCM
+framepull=1  aacmath=1  fpull2=0  credread=8
+escritores del crédito +0x2b8:  0x081cc1f4=1  0x081cc7a4=16  0x081d7548=0  0x081e360c=1
+WAV 91 s: 0,19 % de muestras no nulas, todas ráfagas idénticas de 1248 con pico
+constante 11444  ->  son los CLICS DE UI, no música.
+```
+
+**E) Dos cosas descartadas con datos limpios.**
+- **El DSP no interviene.** Durante la reproducción **no hay ni un acceso** a
+  `0x39000000`/`0x3F000000`. Los únicos bloques sin implementar que se tocan son
+  gpio/eic/miu/lcd/wdt. La vieja teoría del CalmADM2E queda cerrada por medida.
+- **`0x0816bf48` no es el empuje de PCM por trama.** Se llama **una vez** y con
+  `r1 = 0x080338f4`, que es una dirección de **código**: es el registro del sumidero
+  de audio. (`r0=0x0bb169dc r2=0x08a873c0 r3=0`.)
+
+**F) Un error propio, corregido y verificado.** El anillo fuente que se vigilaba
+(`0x08889098`) es el del render de **arranque**; en reproducción real el copy lee de
+`0x0888a2xx-0x0888a6xx` (medido en vivo con `regpc` en `0x08016edc`). Se repitió la
+vigilancia sobre la ventana correcta (`0x0888a000-0x0888c000`) **y la conclusión no
+cambia**: 4096 escrituras, **sólo** de las dos rutinas de memset de IRAM
+(`0x22000198`, `0x220001a0`), todas en el arranque. **Nadie deposita PCM
+decodificado**, y por eso el render nativo —que ya funciona— copia silencio.
+
+**VEREDICTO.** El aparato es hoy **navegable y estable** (sin reinicios), su
+**pipeline de render nativo funciona** de punta a punta, y la biblioteca se lee con
+`SHA1_OFF=1`. Lo que **no** hay es música: el decodificador de audio no llega a
+producir tramas. Con el DSP descartado, el clúster de imagen descartado y el
+sumidero identificado, lo que queda es RE del lazo de decodificación —
+concretamente por qué `0x081e93d8` extrae una sola trama pese a que el crédito
+`+0x2b8` se escribe 18 veces.
