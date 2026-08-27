@@ -157,7 +157,14 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
                         prev_sec, prev_dst, head[0], head[1], head[2], head[3],
                         head[4], head[5], head[6], head[7]);
             }
-            prev_dst = (uint32_t)s->dma_cur;
+            /*
+             * OJO: `s->dma_cur` ya se ha adelantado `len` bytes unas lineas mas
+             * arriba, asi que el principio de ESTA transferencia es
+             * `dma_cur - len`. Leer sin restarlo mira el final del bloque y
+             * devuelve ceros, que se lee igual que "el dato no llega" -- un
+             * falso positivo listo para colarse en una conclusion.
+             */
+            prev_dst = (uint32_t)(s->dma_cur - len);
             prev_sec = ide_get_sector(is);
             int64_t sec = prev_sec;
             uint64_t n = ++rd_ops;

@@ -4228,3 +4228,48 @@ transferencia y, en la siguiente (cuando la anterior ya ha terminado), leer sus
 primeras palabras y publicarlas junto al sector del que venían. La canción empieza en
 el LBA 347224 y sus ficheros empiezan por `ff fb 90 64`, así que la comprobación es
 exacta: o aparece esa cabecera, o el dato no llega donde debe.
+
+## 11.86 VERIFICADO: los bytes del MP3 aterrizan bien
+
+Primer intento, engañoso: todos los aterrizajes salían `00 00 00 00`. La causa era un
+fallo de la propia sonda — `s->dma_cur` ya se ha adelantado `len` bytes cuando se lee,
+así que estaba mirando el FINAL del bloque. Corregido a `dma_cur - len`:
+
+```
+ATALND lba=347224 dst=0x0bee0720 -> ff fb 90 64 00 0f f0 00   <-- cabecera de trama MP3
+ATALND lba=347344 dst=0x0be53240 -> ff fb 90 64 97 01 05 6b
+ATALND lba=181568 dst=0x0bee0720 -> eb 58 90 6d 6b 66 73 2e   <-- control: arranque FAT32
+224 aterrizajes dentro de la cancion
+```
+
+El control es tan importante como la medida: `eb 58 90` + "mkfs." es un sector de
+arranque FAT32 legítimo en el primer sector de la partición, lo que confirma que la
+sonda mira donde debe. **El camino de entrada queda verificado de punta a punta:
+sector correcto, destino correcto, bytes correctos.**
+
+Merece anotarse el patrón, porque ha mordido tres veces hoy: una ventana de `memw`
+demasiado pequeña (§11.36), un volcado sobre un búfer ya reutilizado (§11.85) y este
+desplazamiento. Los tres devuelven CEROS, y un cero se lee igual que un hallazgo.
+**Toda sonda nueva necesita un control conocido antes de creerse su resultado.**
+
+## 11.87 Estado al cierre del tramo
+
+Todos los subsistemas verificados, ninguno falla:
+
+| pieza | evidencia |
+|---|---|
+| lectura de disco | el fichero entero, del primer byte al ultimo (§11.73) |
+| **datos en memoria** | **`ff fb 90 64` en el destino correcto (§11.86)** |
+| salida DMA -> I2S | 18 500 buferes entregados (§11.58) |
+| driver de salida | `memset` a cero por underrun, correcto (§11.63) |
+| cadena de interrupcion SM1 | 2 646 senales (§11.64) |
+| metadatos de la pista | fourcc `'MP3 '`, tamano y duracion cuadran (§11.83) |
+| CPU | **~89 % dormida en el WFI, cero muestras en DRAM (§11.78, §11.82)** |
+
+Y el síntoma: **el reproductor se abre —animación de portada— y vuelve a la lista**
+(§11.83).
+
+Con la entrada verificada y la salida verificada, no queda ningun subsistema al que
+culpar: **la decision de abortar es del propio reproductor**. La proxima sesion tiene
+que entrar por ahi, desde la UI hacia dentro, y no por el DMA hacia fuera como se ha
+hecho todas las veces.
