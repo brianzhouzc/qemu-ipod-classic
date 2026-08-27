@@ -4128,3 +4128,32 @@ medidas se han tomado *bien entrada* la reproducción, cuando ya está todo dorm
 El fallo ocurre **en el instante de pulsar play** —el primer `fetchbail` es lo
 primero que pasa—, así que lo que importa es qué código corre en esa ventana y qué
 deja sin hacer. Es lo que mide el muestreo en curso.
+
+## 11.82 Ni siquiera al pulsar play se pone a trabajar
+
+Muestreo del PC en la ventana del arranque de la reproducción (400 muestras,
+pulsando reproducir a los 2 s del inicio del muestreo):
+
+```
+ocioso (0x22003b20): 358 de 400  = 89,5%
+PCs no ociosos: colas de 1-13 muestras en vectores y kernel de IRAM0
+DRAM: CERO muestras
+```
+
+§11.78 midió el 88 % ocioso bien entrada la reproducción, y quedaba la duda de si el
+arranque de la canción sí traía una ráfaga de trabajo. No la trae: **el aparato está
+igual de dormido en el instante de pulsar play**. Y sigue sin aparecer una sola
+muestra en DRAM, que es donde vive el código de aplicación.
+
+(Nota de método: el muestreo por el monitor es intrusivo —cada `info registers`
+detiene la máquina un instante— así que estos porcentajes valen para comparar entre
+sí, no como medida absoluta de carga. La conclusión que soportan es cualitativa y
+robusta: no hay ráfaga de trabajo donde debería haberla.)
+
+Queda una comprobación elemental que no se ha hecho en toda la investigación, y que
+puede reordenarlo todo: **qué muestra la pantalla después de pulsar reproducir.** En
+las capturas de esta sesión se queda en la lista de canciones y no pasa a
+"Reproduciendo". Si el reproductor no llega siquiera a abrirse, entonces los ocho
+búferes medidos no son "el principio de una reproducción que se apaga" sino otra cosa
+—los sonidos de la interfaz, por ejemplo— y toda la cadena que se ha estado trazando
+describe algo que nunca fue la reproducción.
