@@ -3020,3 +3020,39 @@ llama a `0x22006118` y por qué sólo dieciséis veces.
 habitual sin comprobarlo. Contar la rama de éxito costaba una corrida y habría evitado
 toda la teoría del timeout. Antes de razonar sobre qué rama toma un salto, hay que
 contarla.
+
+## 11.50 La tarea de audio se planifica cada ~20 SEGUNDOS
+
+`0x22006118` no aparece como literal ni como destino de `bl` en ningún sitio: se le
+llama por un puntero construido en ejecución, así que el desensamblado no lo
+encuentra. Capturado en vivo con `regpc`, el llamador es **único**:
+
+```
+lr=0x22002ff8   r0=0x220106dc  r1=0x22006118  r5=0x22008c10
+```
+
+`r1` es la propia dirección de la bomba pasada como argumento: `0x22002ff8` es un
+**despachador de tareas** del RTXC. Y los tiempos son lo que importa:
+
+```
++80.597 s  +80.760 s  +80.804 s  +80.814 s  +80.864 s  +80.874 s  +80.925 s  +80.935 s
++98.428 s  ...                                          <- hueco de 17,5 s
++119.650 s ...                                          <- hueco de 21 s
+```
+
+Ráfagas de pares separados ~10 ms, y entre ráfaga y ráfaga **17 a 21 segundos**. La
+tarea que debe bombear audio se planifica unas tres veces por corrida en vez de unas
+cuarenta veces por segundo. Ese factor de ~1000 es del mismo orden que el déficit de
+audio (19 KB movidos donde harían falta 17,6 MB), así que es la explicación, no un
+síntoma más.
+
+**Descartado de camino: el ritmado de audio.** `AUDIOPACE` compuerta la línea de
+petición de DMAC0 con un temporizador al ritmo de muestreo, así que era sospechoso de
+estrangular la cadena. Medido al revés: **sin** él todo empeora (`dpump` 16 -> 4,
+`copy16` 9 616 -> 2 404). Ayuda, y debe quedarse puesto.
+
+**El hilo, ahora sí acotado a una pregunta de planificación:** por qué el despachador
+`0x22002ff8` deja pasar 20 segundos entre activaciones de esta tarea. Los candidatos
+naturales son el tick del kernel -- el canal de 1 kHz del temporizador (ECLK/2,
+DATA0 = 6000) -- y cualquier `sleep` que la tarea pida en ticks: si un tick nuestro
+dura mil veces lo que debe, una siesta de 10 ms se convierte en 20 segundos.
