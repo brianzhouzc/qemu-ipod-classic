@@ -4407,3 +4407,40 @@ final de lista:      e es no-op  ->  usar q,e  (neta 0);  e,q neta -1
 Y una nota de navegación que sí es robusta: para llegar a la última entrada de un
 menú, bajar de sobra y dejar que la lista tope, en vez de contar posiciones. Contar
 seis desplazamientos cayó en "Settings"; topar la lista acierta siempre.
+
+## 11.93 LA CADENA DE LLAMADAS DEL REPRODUCTOR, capturada en tiempo de reproducción
+
+Con el ancla de §11.92 (una lectura de disco dentro del fichero de la canción) se
+puede además **barrer la pila del invitado** en ese instante y quedarse con los
+valores que caen en el rango de código del firmware. El SP es constante en todas las
+lecturas (`0x0bee0374`), o sea misma tarea y misma pila, así que la lectura es
+estable:
+
+```
+0x0805a70c   lectura de disco (driver ATA)
+0x08326518   <- lr, retorno del `bl 0x805a6f4` en 0x08326514 (capa de ficheros)
+0x0827a6fc
+0x08246948
+0x08246678
+0x082465f0   retorno de un `blx r1` (despacho virtual)
+0x0813b20c   retorno de un `blx r1` en 0x0813b208
+0x0808dfa8   retorno de un `blx r2` en 0x0808dfa4
+0x0813b220
+0x0808df88
+```
+
+**Es el primer punto de apoyo real dentro del reproductor**, con marcos de pila
+auténticos en vez de etiquetas heredadas —que han resultado equivocadas cuatro de
+cuatro veces (§11.89)—. Y explica por qué ninguna búsqueda estática los encontraba:
+casi todos los marcos son retornos de **despachos virtuales** (`blx` a punteros de
+tabla), que no aparecen como `bl` a una dirección fija.
+
+**Confirmado además que el aborto es general.** Reproduciendo por "Shuffle Songs" en
+vez de por la lista de canciones —camino de entrada completamente distinto— el
+resultado es idéntico: `copy16=8`, `dpump=8`, y a los 33 segundos de vuelta en el
+menú. No es un problema de cómo se elige la pista.
+
+**Por dónde seguir.** Los marcos altos (`0x0808df88`, `0x0813b220` y sus llamadores)
+son el código que gobierna la reproducción. Ahí hay que buscar la condición que
+decide abandonar, con la misma disciplina que ha hecho falta aquí: medir con marca de
+tiempo, tope alto y un control conocido al lado de cada sonda.

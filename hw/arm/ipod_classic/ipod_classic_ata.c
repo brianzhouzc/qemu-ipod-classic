@@ -15,6 +15,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
 #include "qemu/module.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
@@ -187,10 +188,48 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
                         uint64_t k = ++in_song;
                         if ((k & (k - 1)) == 0) {
                             CPUState *cs = current_cpu;
+                            uint32_t pc = 0, lr = 0, sp = 0;
+                            if (cs) {
+                                CPUARMState *e = &ARM_CPU(cs)->env;
+                                pc = (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs);
+                                /*
+                                 * LR y SP del invitado en el momento de pedir el
+                                 * sector: el PC solo da la rutina del driver, que
+                                 * es comun a todo el disco. El LR nombra a QUIEN
+                                 * la llama, y eso ya es codigo del reproductor.
+                                 */
+                                lr = (uint32_t)e->regs[14];
+                                sp = (uint32_t)e->regs[13];
+                            }
                             fprintf(stderr, "ATASONG #%" PRIu64 " byte=%" PRIu64
-                                    " pc~0x%08x\n", k, byte,
-                                    cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs)
-                                       : 0);
+                                    " pc~0x%08x lr=0x%08x sp=0x%08x\n",
+                                    k, byte, pc, lr, sp);
+                            /*
+                             * LA CADENA DE LLAMADAS, que es lo que hace falta.
+                             * El LR solo da un nivel. Barriendo la pila y
+                             * quedandose con los valores que caen en el rango de
+                             * codigo del firmware salen las direcciones de
+                             * retorno de los marcos de arriba -- o sea el camino
+                             * desde el reproductor hasta esta lectura. Con la
+                             * pila fija (mismo SP en todas las lecturas) esto es
+                             * estable y repetible. Hay falsos positivos (datos
+                             * que parecen punteros), asi que se publican en
+                             * crudo y se filtran leyendo el desensamblado.
+                             */
+                            if (cs && k == 1) {
+                                for (int w = 0; w < 96; w++) {
+                                    uint32_t v = 0;
+                                    address_space_read(&address_space_memory,
+                                                       sp + w * 4,
+                                                       MEMTXATTRS_UNSPECIFIED,
+                                                       &v, 4);
+                                    if (v >= 0x08000000 && v < 0x08400000
+                                        && (v & 3) == 0) {
+                                        fprintf(stderr, "  ATASTACK +0x%03x = "
+                                                "0x%08x\n", w * 4, v);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
