@@ -284,6 +284,30 @@ static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
 {
     IPodClassicSM1State *s = opaque;
     uint32_t val;
+    bool was_pending = s->irq_pending;
+
+    /*
+     * ANY read of this block acknowledges the engine interrupt.
+     *
+     * It used to be only +0xa98, on the reasoning that the line-18 handler's
+     * status getter reads exactly that. MEASURED, that is not enough: in one run
+     * the model raised the line FOUR times and the handler at 0x08017378 was
+     * entered 1,196,485 times -- and QEMU's own -d int log counted ~1.05 million
+     * IRQ exceptions. The line stays asserted for the whole 5 ms until the next
+     * tick drops it, and the guest re-enters the handler for that entire window,
+     * which starves every audio thread. That is why the decode side crawled:
+     * dpump ran 8 times and creditsig 493 while the handler ran 1.2 million.
+     *
+     * Whatever the getter at 0x080a7638 actually touches, the handler does reach
+     * this block, so taking any read as the acknowledge cannot leave the level
+     * wedged. The STAT value below still reports bit 2 from the pre-clear state,
+     * so the handler that triggered on this interrupt still sees it set and
+     * signals its event.
+     */
+    if (was_pending) {
+        s->irq_pending = false;
+        qemu_irq_lower(s->irq);
+    }
 
     /* Above the modelled low page: a plain zero window, as before. */
     if (offset >= S5L8702_SM1_REG_BYTES) {
@@ -309,19 +333,13 @@ static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
          *    while we are asserting the engine interrupt the bit must read set,
          *    or the handler would take its early exit and signal nothing.
          */
-        val = (s->powered || s->irq_pending) ? S5L8702_SM1_STAT_READY : 0;
+        val = (s->powered || was_pending) ? S5L8702_SM1_STAT_READY : 0;
         /*
-         * READ-TO-CLEAR. The line-18 handler's only interaction with the block is
-         * this status read (0x08017378 -> getter 0x080a7638 -> [base+0xa98]); it
-         * writes no acknowledge anywhere. So the read has to be the acknowledge,
-         * or the level stays asserted and the VIC re-dispatches the handler
-         * forever -- measured 1,673,711 entries in one run before this, versus
-         * the ~40/s the engine actually reports at.
+         * The acknowledge itself happens at the top of this function, for ANY
+         * offset -- see the note there for why narrowing it to this register was
+         * measured insufficient. `was_pending` is the pre-clear state, so a
+         * handler that got here because of this interrupt still reads bit 2 set.
          */
-        if (s->irq_pending) {
-            s->irq_pending = false;
-            qemu_irq_lower(s->irq);
-        }
         break;
 
     case S5L8702_SM1_RUN:

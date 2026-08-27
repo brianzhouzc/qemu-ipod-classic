@@ -2728,3 +2728,44 @@ no da error: da CERO, y el cero parece un hallazgo. Ya pasó con
 `0x22040000-0x22040800` (§11.36), donde el silencio hizo concluir que el abort era de
 lectura cuando el puntero ya iba por `0x2204221x`. Antes de creerse un "nadie escribe
 aquí", hay que confirmar la dirección base con una lectura independiente.
+
+## 11.41 La causa de que todo vaya lentísimo: una TORMENTA de interrupciones
+
+Siguiendo la cadena desde el códec hacia arriba, con el desensamblado en la mano:
+
+- `framepull` (`0x081e93d8`) pasa sus dos puertas; su bucle en `0x081e9460` ejecuta
+  el códec **una vez por unidad de profundidad de cola** ("while `[obj+0x40]` != r6",
+  r6 desde `[obj+0x3c]` bajando). Medido prod=3 cons=2 -> profundidad 1 -> una llamada.
+  Eso explica `aacmath=1` **sin necesidad de ningún fallo en el códec**.
+- La profundidad la fija `0x81c08bc` a partir de dos campos: `[obj+0x2b4]` (posición)
+  y `[obj+0x2b8]` (límite). Medidos: límite **4**, posición **0**.
+- La posición no está muerta: avanza 0 -> 1 -> 2 -> 3, de uno en uno
+  (`adds r2,r1,r2` en `0x81cc404`, con reposición a cero si sale negativa). Sólo que
+  avanza **tres veces en toda la corrida**.
+
+**Todo va unas cuatro órdenes de magnitud demasiado lento. Y aquí está por qué:**
+
+```
+credithdlr (manejador de la IRQ linea 18, 0x08017378)  = 1 196 485
+creditsig  (donde señala el evento, 0x080173cc)        =       490
+dpump      (bomba del render)                          =         8
+SM1_IRQ: line 18 raised                                =         4
+```
+
+El modelo levanta la línea **cuatro veces** y el firmware entra al manejador **1,2
+millones**. El log `-d int` de QEMU lo confirma por otra vía: ~1,05 millones de
+excepciones IRQ. La línea se queda asertada los 5 ms que van hasta el siguiente tick
+y el invitado reentra sin parar durante toda esa ventana, ahogando a los hilos de
+audio. Por eso `dpump` corre 8 veces mientras el manejador corre un millón.
+
+**Arreglo parcial, medido.** El reconocimiento por lectura estaba limitado a `+0xa98`
+porque el getter del manejador (`0x080a7638`) lee ese registro. No basta: ampliado a
+**cualquier** lectura del bloque SM1, las entradas bajan de 1 196 485 a **789 182**
+(-34 %). Sigue siendo una tormenta, así que la línea la mantiene o la re-despacha
+algo que no es nuestra subida -- el modelo del VIC, o un segundo usuario de la línea
+18. Esa es la pista viva.
+
+**Lo que esto reordena.** El "códec que corre una vez" no es un fallo del códec ni de
+la cola: es la consecuencia aritmética de una profundidad de 1, que a su vez viene de
+una posición que apenas avanza porque el sistema está ahogado. Hay **un** problema,
+no tres.
