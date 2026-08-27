@@ -3755,3 +3755,34 @@ siquiera `SM1TRACE=1` podía enseñarlo: si el firmware sube descriptores o cód
 DSP ahí, lleva toda la investigación cayendo en un agujero sin que ninguna medida lo
 notase. Añadido un contador (misma escala logarítmica, apagado sin la variable) que
 reporta cuántas escrituras van arriba y en qué rango. Corriendo.
+
+## 11.70 El punto ciego, medido: una segunda página de registros, no una carga
+
+Con el contador nuevo (`SM1HI=1`, variable propia porque `SM1TRACE` genera un log
+capaz de tumbar el sistema de ficheros entero — pasó):
+
+```
++0x1000 = 0 / 1 / 3      desde codigo IRAM (0x2200239c)
++0x1008 = 1              mas de 1024 veces, desde 0x080915f0
+rango visto: +0x01000 .. +0x0100c     (11 lineas en toda la corrida)
+```
+
+No hay carga masiva de código ni de descriptores: lo que se descartaba es **una
+segunda página de control pequeña**, `+0x1000..+0x100c`. El despachador que la
+escribe (0x080915a4) traduce una máscara de bits a parejas activar/desactivar:
+
+```
+bit 8 -> +0x1004 = 3, +0x1008 = 1, +0x100c = 1
+bit 0 -> +0x1008 = 1
+bit 1 -> +0x1008 = r2
+bit 2 -> +0x100c = 1
+bit 3 -> +0x100c = r2
+bit 9 -> +0x1004 = 0, +0x1008 = 0
+```
+
+Todos son **stores**; en toda la zona del driver (`0x8091xxx`) no hay ni una lectura
+de esa página, así que devolver cero no engaña a nadie. Descartada también la
+lectura vecina de `+0x404` (0x08091590 la enmascara con el bit 8 y nuestro cero es
+justo la respuesta de éxito).
+
+Es un hueco real del modelo y conviene taparlo, pero **no es el que calla la música**.
