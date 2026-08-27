@@ -4641,3 +4641,42 @@ Buscar `strh` con desplazamiento 10 no discrimina —es un offset demasiado com�
 de veinte candidatos genéricos—, así que el camino útil es al revés: partir de quién
 escribe el **búfer** `0x22038100` (un watch como los que ya han funcionado tres veces
 en esta sesión) y subir desde ahí.
+
+## 11.99 CAUSA RAÍZ ESTABLECIDA: el productor del mecanismo de ranuras no existe
+
+Tres watches independientes, en corridas completas con reproducción real:
+
+```
+tabla de ranuras   0x22038000-0x22038040  ->  0 escrituras
+bufer PCM          0x22038100-0x22038180  ->  0 escrituras
+palabra de estado  0x2203ff28-0x2203ff40  ->  0 escrituras (solo copy16 pisandola, s11.66)
+```
+
+**Nadie escribe nada en el mecanismo de ranuras, nunca.** La estructura existe —sus
+punteros son datos estáticos copiados en el microsegundo cero (§11.79)— pero el lado
+productor está sencillamente ausente.
+
+Con eso la cadena queda cerrada de punta a punta, y cada eslabón con su medida:
+
+```
+el productor de ranuras            NUNCA CORRE          <-- LA CAUSA
+la busqueda 0x080a3c00             falla el 100% (4-8)      consecuencia correcta
+la bomba de render sale por 0x220061fc                       consecuencia correcta
+el motor deja de re-postear, el contador decae               consecuencia correcta
+el driver de salida hace memset de silencio (~4000)          comportamiento CORRECTO
+el DMA entrega 18 500 buferes de ceros al I2S                comportamiento CORRECTO
+el WAV trae solo los clics de la rueda                       consecuencia
+```
+
+**Todo lo que se ha perseguido durante meses aguas abajo son consecuencias.** El
+consumidor funciona y hace lo correcto al no encontrar datos; el driver hace lo
+correcto al sacar silencio; el DMA hace lo correcto al entregarlo. El fallo es que
+nada produce.
+
+Y esto cierra también, con evidencia, por qué el reproductor se abre y aborta
+(§11.83): abre, pide un búfer, no lo hay, y se cierra.
+
+**Lo que queda por saber, en una frase:** qué tarea del firmware debería llenar esas
+ranuras y por qué no arranca. No es un problema del camino de audio —entrada y salida
+están DEMOSTRADAS (§11.86, §11.95)— sino de que una tarea productora nunca llega a
+existir o nunca se planifica.
