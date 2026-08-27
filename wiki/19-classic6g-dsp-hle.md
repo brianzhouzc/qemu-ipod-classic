@@ -4534,3 +4534,63 @@ varios más a los 163,7 s), pero con valor que deja pasar la puerta.
 Hipótesis dieciséis, refutada. Y una nota de método que casi se cuela otra vez: poner
 la sonda en la instrucción de la comprobación cuenta cada evaluación, no cada aborto.
 **Hay que instrumentar las ramas, no la condición.**
+
+## 11.97 El camino real de la bomba, y la CAUSA acotada: el bloque de descriptores nunca se monta
+
+**El recorrido interno de la bomba**, trazado con `range=0x22006100-0x22006600` y
+disparo en su propia entrada (rango pequeño, una ventana por invocación):
+
+```
+0x22006118 entrada -> 0x2200615c -> 0x22006194 (la puerta de [engobj+0x44] PASA)
+-> 0x220061d0 -> 0x220061e0 -> 0x220061f0 -> 0x22006204 -> 0x22006234
+-> 0x2200624c -> 0x22006260 -> 0x22006294 -> 0x220062e4 -> 0x22006304
+-> 0x22006324 (espera del evento, con exito) -> 0x2200633c (la busqueda de bufer)
+-> 0x22006340 -> 0x2200634c -> 0x220061fc   <-- SALE
+```
+
+Sale por `bne 0x220061fc`, que es exactamente la rama de "la longitud devuelta es
+cero". Esto **reabre** lo que §11.81 habia cerrado: aquel experimento puso el bit de
+la guarda 25 segundos DESPUES de pulsar play, cuando la bomba ya no se invocaba. La
+medida era correcta; el experimento estaba mal cronometrado y la conclusion que
+colgaba de el, equivocada.
+
+**Repetido bien** —sosteniendo el bit desde antes de pulsar y durante toda la
+ventana— sigue fallando:
+
+```
+fetchok 0   vivo (0x22006370) 0   sale (0x220061fc) 8
+```
+
+Porque la busqueda tiene DOS guardas, y la segunda exige
+`[0x22038000 + indice*4 + 10] == 1` en la tabla de ranuras. Y esa tabla tambien esta
+a ceros.
+
+**La medida que lo cierra.** Watch de escrituras sobre `0x22038000-0x22038040`
+durante una corrida completa con reproduccion:
+
+```
+total escrituras: 0
+```
+
+**Nadie escribe la tabla de ranuras jamas** — ni en el arranque ni al reproducir.
+Junto con el descriptor de `0x2203ff28`, cuyo unico escritor era `copy16` pisandolo
+(§11.66), la conclusion queda establecida desde dos angulos independientes:
+
+> **El bloque de descriptores de audio en lo alto de IRAM1 nunca se inicializa.**
+> Por eso la busqueda falla el 100 % de las veces, la bomba sale sin producir, el
+> motor deja de re-postear y el lazo aparca. Esa es la causa, y todo lo demas que se
+> ha medido en meses son sus consecuencias.
+
+Y como el DSP esta refutado (§11.74) y ningun canal de DMA escribe ahi (§11.58), lo
+que falta es **codigo del firmware que no llega a ejecutarse**.
+
+**El siguiente paso, concreto.** El global que guarda esos punteros (`0x0896a684`)
+se referencia desde seis sitios del firmware:
+
+```
+0x080821b4   0x08085f38   0x0808afc8   0x080a3ccc (la busqueda)   0x080b5320   0x08272f34
+```
+
+Uno de ellos deberia montar la tabla. Poner un `pc=` en cada uno y ver cual **no**
+corre al reproducir nombra al inicializador que falta, y de ahi a la condicion que
+lo gatea — que es donde estara el fallo del modelo.
