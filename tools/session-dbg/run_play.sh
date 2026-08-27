@@ -1,0 +1,90 @@
+#!/bin/bash
+# Drive the retailOS to actually PLAY a song, and measure whether audio comes out.
+#
+# Navigation notes learned the hard way:
+#  - A fresh boot (-snapshot keeps nothing) starts in the LANGUAGE picker, not the
+#    main menu. It has to be dismissed first or every later keypress is choosing a
+#    language instead of a song.
+#  - The retailOS clickwheel DROPS roughly five of every seven SELECT presses
+#    (documented in iremote.py), so every SELECT here uses the retrying form.
+#    A single press looks exactly like a dead button.
+#  - SHA1_OFF=1 keeps the library readable (the engine, once modelled, rejects the
+#    image's iTunesDB hash) at the cost of the ~46 s panic-reset coming back, so
+#    this has to reach playback quickly.
+#
+# Measures: the native render counters plus the I2S WAV, so "did music come out"
+# is answered by RMS rather than by looking at the screen.
+set +e
+TAG=${1:-play}
+shift 2>/dev/null
+ROOT=$HOME/qemu-ios
+OSOS=$ROOT/assets/classic6g/osos_decrypted.bin
+IMG=${IMG:-$HOME/6g/Emulti.img}
+OUT=$HOME/6g/remote; mkdir -p "$OUT"
+export IREMOTE_OUT=$OUT
+cd "$ROOT" || exit 1
+IR="python3 tools/ipod_classic/iremote.py"
+LOG=$HOME/6g/meas_$TAG.log; rm -f "$LOG"
+WAV=$HOME/6g/$TAG.wav; rm -f "$WAV"
+PLUG=$ROOT/build/contrib/plugins/libpctrace.so
+BIN=$ROOT/build/qmus_$TAG
+cp "$ROOT/build/qemu-system-arm" "$BIN"
+for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":4455 " || break; sleep 2; done
+
+export AUDIOPACE=1 AUDIOWAV="$WAV"
+for kv in "$@"; do export "$kv"; done
+
+PA="nodefault=on,always=on,cap=8,window=300000,out=$LOG"
+PA="$PA,pc=0x08150d84:StartPlayback,pc=0x22006118:dpump,pc=0x0808170c:engine"
+PA="$PA,pc=0x22006304:rendret,pc=0x08082100:ctxbuild,pc=0x0809a74c:mixer"
+PA="$PA,pc=0x08016e44:copyent,pc=0x08016f08:copy16,pc=0x08016eb4:copy32"
+PA="$PA,pc=0x0816bf48:pcmout,pc=0x081e9e70:aacmath"
+# The production-credit gate: the frame-pull 0x081e93d8 bails when
+# [[[reader+4]+0x30]+0x2b8] is 0, so the decoder stops after one frame.
+# These are the only four sites in the image that write that field.
+PA="$PA,pc=0x081cc1f4:cred1,pc=0x081cc7a4:cred2,pc=0x081d7548:cred3,pc=0x081e360c:cred4"
+PA="$PA,pc=0x081c0fd4:credread,pc=0x081e93d8:framepull,pc=0x081c1508:fpull2"
+PA="$PA,memw=0x08889000-0x0888a000,memcap=30"
+
+setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
+  -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
+  -display none -serial null -monitor "tcp:127.0.0.1:4455,server,nowait" \
+  -gdb tcp::1234 \
+  -plugin "$PLUG,$PA" >"$OUT/qmus_$TAG.out" 2>"$OUT/qmus_$TAG.err" &
+echo "launched $TAG"
+if [ -n "$PCMPROBE" ]; then
+  ( timeout 200 gdb-multiarch -q -batch -x tools/session-dbg/pcmdump_probe.gdb \
+      >"$OUT/gdb_$TAG.out" 2>"$OUT/gdb_$TAG.err" ) &
+  sleep 3
+fi
+sleep 50
+$IR wake e >/dev/null 2>&1
+sleep 2
+
+# 1. Dismiss the language picker (accept whatever is highlighted).
+$IR press ret 250 -u -w e --region right -r 15 -t 3000 -s 5 --name lang >/dev/null 2>&1
+sleep 3
+$IR shot ${TAG}_menu >/dev/null 2>&1
+
+# 2. Main menu -> last entry (Shuffle Songs) -> SELECT, retrying.
+$IR seq e:120 wait:1 e:120 wait:1 e:120 wait:1 e:120 wait:1 e:120 wait:1 e:120 wait:2 z >/dev/null 2>&1
+$IR shot ${TAG}_shuffle >/dev/null 2>&1
+$IR press ret 250 -u -w e --region right -r 15 -t 3000 -s 5 --name go >/dev/null 2>&1
+sleep 6
+$IR shot ${TAG}_play1 >/dev/null 2>&1
+
+# 3. Let it run, then look again.
+sleep 15
+$IR shot ${TAG}_play2 >/dev/null 2>&1
+sleep 15
+$IR shot ${TAG}_play3 >/dev/null 2>&1
+
+echo "=== [$TAG] counters ==="
+sed -n '/PCTRACE summary/,$p' "$LOG" | head -20
+exec 3<>/dev/tcp/127.0.0.1/4455 && echo quit >&3 && sleep 3 && exec 3<&-
+sleep 2
+echo "=== [$TAG] summary ==="
+sed -n '/PCTRACE summary/,$p' "$LOG" | head -20
+echo "resets=$(grep -ac 'software reset' "$OUT/qmus_$TAG.err")"
+echo "wav=$(stat -c%s "$WAV" 2>/dev/null || echo 0) bytes"
+echo "DONE $TAG"
