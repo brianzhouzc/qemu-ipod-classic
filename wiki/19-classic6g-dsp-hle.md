@@ -3721,3 +3721,37 @@ debería llenarla. Las dos posibilidades:
 exactamente lo que un motor de audio reporta a la CPU. Distinguirlas es la medida que
 está corriendo: vigilar quién escribe el global que registra el bloque nombra al
 código de montaje.
+
+## 11.69 Quién monta el bloque, y un punto ciego del modelo
+
+**El global SÍ se mantiene.** Watch sobre `0x0896a684-0x0896a6a4`: lo escriben once
+sitios del motor de audio (`0x08081754`, `0x08081764`, `0x08081984`, `0x08081aa0`,
+`0x08081b6c`, `0x080820e0`, `0x0808214c`, `0x08082174`, `0x08082184`, `0x08082190`,
+`0x08085ef8`), en `+0`, `+1`, `+2`, `+0x14` y `+0x18`. Así que la estructura de
+control está viva y el firmware la mantiene; lo único que nadie escribe es el bloque
+al que apunta.
+
+**Y ese bloque cae donde nosotros escribimos.** `S5L8702_BOOTINFO_BASE = 0x2203ff00`,
+y el arranque de la máquina hace `cpu_physical_memory_write(0x2203ff00, zero, 0x100)`.
+El descriptor del audio está en `0x2203ff28` — dentro de esos 256 bytes. El comentario
+del header dice *"away from anything the firmware uses"*, marcado ASSUMED; no lo está.
+Es una escritura única de init, así que no pisa nada más tarde, pero explica el cero
+que se lee: lo pusimos a cero y nadie lo tocó después.
+
+**El firmware NO le da direcciones de IRAM1 al SM1.** Buscadas en `SM1TRACE`: cero
+coincidencias con `2203ff` y con `22038`. Pero sí le da trabajo, y mucho:
+
+```
++0xc48 (COMMIT)   519 escrituras
++0x400 (RUN)      518
++0x110, +0xb10, +0xa90, +0xa8c, +0x99c...   la puesta en marcha
+```
+
+519 «commits» al motor, y el modelo los acepta sin hacer nada.
+
+**El punto ciego.** La ventana del bloque mide 1 MB y sólo se modelan sus primeros
+4 KB. Todo lo de arriba se descartaba en silencio **antes** de la traza, así que ni
+siquiera `SM1TRACE=1` podía enseñarlo: si el firmware sube descriptores o código de
+DSP ahí, lleva toda la investigación cayendo en un agujero sin que ninguna medida lo
+notase. Añadido un contador (misma escala logarítmica, apagado sin la variable) que
+reporta cuántas escrituras van arriba y en qué rango. Corriendo.

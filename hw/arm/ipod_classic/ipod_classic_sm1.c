@@ -487,6 +487,37 @@ static void ipod_classic_sm1_write(void *opaque, hwaddr offset,
     IPodClassicSM1State *s = opaque;
 
     if (offset >= S5L8702_SM1_REG_BYTES) {
+        /*
+         * A BLIND SPOT worth naming. The block's window is 1 MB and only its
+         * first 4 KB is modelled; everything above was dropped here silently,
+         * BEFORE the trace below, so SM1TRACE could never show it either. If
+         * the firmware puts descriptors -- or DSP code -- up there, the whole
+         * lot has been going into a hole and no measurement in this
+         * investigation would have noticed.
+         *
+         * Counting is enough to answer that, and costs nothing when the trace
+         * is off. Doubling schedule so a bulk upload is loud and a stray write
+         * stays quiet.
+         */
+        if (sm1_trace_on()) {
+            static uint64_t hi_writes;
+            static hwaddr hi_lo = (hwaddr)-1, hi_hi;
+            uint64_t n = ++hi_writes;
+
+            if (offset < hi_lo) {
+                hi_lo = offset;
+            }
+            if (offset > hi_hi) {
+                hi_hi = offset;
+            }
+            if ((n & (n - 1)) == 0 || n % 100000 == 0) {
+                fprintf(stderr, "SM1TRACE HI-WRITE #%" PRIu64 " +0x%05"
+                        HWADDR_PRIx " = 0x%08x  (rango visto +0x%05" HWADDR_PRIx
+                        "..+0x%05" HWADDR_PRIx ")  pc~0x%08x\n",
+                        n, offset, (uint32_t)value, hi_lo, hi_hi,
+                        sm1_trace_pc());
+            }
+        }
         return;
     }
 
