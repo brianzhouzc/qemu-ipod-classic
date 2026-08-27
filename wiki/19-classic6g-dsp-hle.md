@@ -3846,3 +3846,32 @@ los bytes del MP3 llegan del disco.
 Queda por separar *cuándo*: si el bloque se lee de golpe al abrir la pista o en goteo
 mientras suena. Es lo que mide `ATALBA=2`, cuyo resultado se cruza con el rango de la
 canción y con el reloj virtual.
+
+## 11.73 El fichero se lee ENTERO, y en dos ráfagas
+
+Con `ATALBA=2` (todas las lecturas, con reloj virtual), cruzado con el rango de la
+canción:
+
+```
+368 lecturas dentro de la cancion tras pulsar play
+primera: +136 844 374us  byte 177 778 688   <- el primer byte del fichero
+ultima:  +153 057 975us  byte 182 513 664   <- el ultimo
+reparto: dos rafagas, ~136,9-137,3 s y ~152,9-153,1 s
+total leido en la corrida: 51 804 KB
+```
+
+El fichero se lee **de principio a fin**, no en goteo. Eso es lo que hace un iPod de
+verdad: llenar un búfer grande para poder parar el disco. Así que el decodificador
+tiene la canción **completa en memoria** y aun así no sale una muestra.
+
+Con esto el fallo queda encerrado en el paso de decodificación, y la sospecha tiene
+por fin un nombre concreto en el árbol: en la tabla de bloques sin implementar de
+`ipod_classic.c` están **`s5l8702.adm` y `s5l8702.adm-sfr`**. ADM es el
+**CalmADM2E**, el DSP de audio del SoC — un stub que devuelve ceros y descarta lo que
+se le escribe.
+
+Si el firmware le entrega ahí el trabajo de decodificar, todo lo medido encaja sin
+forzar nada: entrada correcta, salida correcta, estructuras de control en IRAM1
+vacías porque quien las llena no existe, y silencio perfectamente ordenado. La medida
+que lo confirma o lo tumba —cuánto tráfico recibe ese bloque, y si se le vuelca
+código— está corriendo con `-d unimp`.
