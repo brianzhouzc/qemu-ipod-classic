@@ -4776,3 +4776,41 @@ modelo que publique la memoria como ya hacen `ATASONG`/`ATALND`.
 `0x2203fa5a`. Cubre `0x2203ff28`, lo que confirma por tercera vez el pisotón del
 descriptor con el envoltorio por defecto (§11.66), y confirma que la región que
 escribe el render es disjunta de los búferes que el DMA reproduce (§11.100).
+
+## 11.103 `[r4+12]` no es una base: es un desplazamiento
+
+Leído con un breakpoint de gdb en `0x08016edc` (que sí puede leer memoria, cosa que
+`regpc` no):
+
+```
+COPYBASE base=0x000119b4  count=20    r4=0x0bb12d54
+COPYBASE base=0x000117ac  count=520   r4=0x0bb12d54
+COPYBASE base=0x00011660  count=328   r4=0x0bb12d54
+COPYBASE base=0x00010000  count=16    r4=0x0bb12d54
+COPYBASE base=0x000100ac  count=112   r4=0x0bb12d54
+```
+
+Los valores de `[r4+12]` están entre `0x10000` y `0x119b4`: **no son direcciones,
+son desplazamientos**. Y `[r4+16]` (el contador) va de 4 a 520 bytes por copia, no
+kilobytes.
+
+Eso corrige la lectura de §11.67. La suma real es:
+
+```
+destino = [r4+12] (desplazamiento pequeno)
+        + [tabla+4] (una BASE que mantiene el firmware)
+        + [bloque+0xa48] (NUESTRO registro de posicion del SM1)
+```
+
+O sea que la dirección de destino la dominan un valor del firmware **y nuestro
+registro**, no un puntero de la estructura de copia. Eso refuerza que el envoltorio
+del anillo (`S5L8702_SM1_POS_RING_FRAMES`, marcado como inferencia en el propio
+header: *"IRAM1 is 128 KiB, so the position wraps every 32768 frames"*) es un
+candidato serio a estar mal — pero también explica por qué cambiarlo movía el destino
+sólo parcialmente (§11.68): hay dos sumandos más, y uno es del firmware.
+
+**Y una nota de herramienta, que ya ha costado dos intentos:** `regpc` del plugin da
+registros, no memoria. Para leer `[registro+desplazamiento]` hay que usar un
+breakpoint de gdb con `printf`, o publicar la memoria desde el modelo como hacen
+`ATASONG`/`ATALND`. Intentar deducirlo filtrando capturas de registros dio muestras
+de audio disfrazadas de direcciones (§11.102).
