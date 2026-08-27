@@ -32,6 +32,8 @@
 #include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
+/* The S5L8720's SHA-1 block; the S5L8702 drives the same register map. */
+#include "hw/arm/ipod_touch_sha1.h"
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
@@ -333,7 +335,7 @@ static inline qemu_irq s5l8702_get_irq(IPodClassicMachineState *s, int n)
  */
 static const struct { const char *name; hwaddr base; hwaddr size; }
 ipod_classic_unimplemented[] = {
-    { "s5l8702.sha1",     SHA1_MEM_BASE,     0x100000 },
+    /* s5l8702.sha1 (0x38000000) is a real device now; see the machine init. */
     { "s5l8702.miu",      MIU_MEM_BASE,      0x100000 },
     /* DMAC0 and DMAC1 are real PL080s now; see the machine init. */
     { "s5l8702.usb-otg",  USBOTG_MEM_BASE,   0x100000 },
@@ -775,6 +777,28 @@ static void ipod_classic_machine_init(MachineState *machine)
      * ipod_classic_sm1.c and wiki/19 section 11. Full 1 MB window so every
      * undecoded offset still reads 0 like the device it replaces.
      */
+    /*
+     * The SHA-1 accelerator (0x38000000).
+     *
+     * It was an unimplemented zero window, and the retailOS uses it: measured
+     * live it writes the config at +0x00, arms memory mode at +0x80, sets the
+     * input size at +0x8c and then reads the digest words back from +0x20..+0x34
+     * -- and got zeros for the digest every time. A hash that never matches is
+     * how the firmware ends up in its own panic path (0x08021bec, which prints
+     * "CPU_exception_handler" through semihosting and then software-resets at
+     * 0x08322b10), which is the ~46 s reboot that has made every measurement in
+     * this project noisy and stops playback before it can start.
+     *
+     * The S5L8720 block modelled in hw/arm/ipod_touch_sha1.c has exactly the
+     * register map this guest drives (SHA_CONFIG 0x0, SHA_MEMORY_MODE 0x80,
+     * SHA_INSIZE 0x8c, digest at 0x20..0x34), so the same device serves the
+     * S5L8702. Reused rather than re-written.
+     */
+    dev = qdev_new("ipodtouch.sha1");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion(sysmem, SHA1_MEM_BASE,
+                                &IPOD_TOUCH_SHA1(dev)->iomem);
+
     dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SM1_MEM_BASE);
