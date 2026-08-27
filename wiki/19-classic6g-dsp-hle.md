@@ -3946,3 +3946,40 @@ que hay que saber ahora es cuántas veces se invoca este notificador **durante l
 reproducción** y por cuál de las tres salidas se va: si no se invoca, el fallo está
 más arriba; si se invoca y se cae por la salida A, el tramo pedido no cuadra con la
 capacidad y eso es aritmética de búferes que se puede seguir. Corriendo.
+
+## 11.76 El notificador tampoco se llama mientras suena
+
+Captura en la entrada del notificador (`0x081ea2c0`):
+
+```
+6 llamadas en TODA la corrida, todas con lr=0x081c17f0 (un unico llamador)
+   hits 1-3:  +15,4 / +16,3 / +17,9 ms     arranque
+   hits 4-6:  +16,17 s                     todavia muy antes de reproducir
+notifyfire 1   notifyskip 6   pull 0   dpump 8
+r0=0x09555db0  r3=1 (estado pedido)  r4=0x0ba90c98  (el objeto de la cola)
+```
+
+(Los 6 "skip" con 1 "fire" no se contradicen: `0x081ea388` es también la caída
+natural después del `blx`, así que toda llamada pasa por ahí.)
+
+**Durante la reproducción, entre los 130 y los 190 segundos, el notificador no se
+invoca ni una sola vez.** Así que el fallo no está en sus tres salidas: está en quien
+debería llamarlo.
+
+Ese llamador es único, `0x081c17f0`, dentro de una función que empieza en
+`0x081c1794` y que **arranca con una puerta**:
+
+```
+81c1794: push {r1, r2, r3, r4, r5, lr}
+81c1798: mov  r4, r0
+81c179c: ldrb r0, [r0, #0x70]      <-- un byte de estado del objeto
+81c17ac: cmp  r0, #0
+81c17b4: bne  0x81c1808            <-- si NO es cero, se salta la notificacion entera
+81c17c0: ldr  r0, [r4, #0x48]      (camino vivo: despacho virtual por [+0x18])
+```
+
+Si ese byte se queda distinto de cero, la petición al decodificador no sale nunca, por
+muchas veces que se llame. La medida en curso cuenta las llamadas durante la
+reproducción y por cuál de las dos salidas se van; `r0` en la entrada da además la
+dirección exacta del byte, con lo que el siguiente paso —quién lo escribe— es un
+watch de una línea.
