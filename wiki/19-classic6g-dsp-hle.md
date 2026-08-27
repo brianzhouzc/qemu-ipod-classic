@@ -4714,3 +4714,43 @@ ejemplo, que es cuando `copy16` acumula sus 4 808 pasadas).
 (`0x22010020`) llega a apuntar a IRAM1 en vez de a `0x22008c5c`. Un watch sobre esos
 16 bytes lo contesta en una corrida, y distingue "falta una copia" de "falta
 reprogramar el DMA".
+
+## 11.101 RESUELTA la ambigüedad de §11.100: falta la COPIA, no reprogramar el DMA
+
+Watch sobre el descriptor del DMA de audio (`0x22010020`, 16 bytes) durante una
+corrida con reproducción:
+
+```
++0us      escrito por las rutinas de copia del arranque (0x08000294/98)
++7 ms     reescrito desde IRAM (0x22000294/98)
++20,38 s  reescrito por 0x22004b4c..0x22004b60  <- la rotacion del ping-pong
+400 escrituras en total
+el descriptor al final:  src=0x22009c5c  dst=0x3ca00010  next=0x22010020
+```
+
+**El origen es SIEMPRE IRAM0** —`0x22008c5c` o su pareja `0x22009c5c`—, nunca IRAM1.
+El firmware alterna entre los dos búferes del ping-pong y ahí acaba la historia.
+
+Eso resuelve la ambigüedad que §11.100 dejaba abierta: **no falta reprogramar el DMA,
+falta quien copie el PCM decodificado dentro de esos búferes de IRAM0.** Las dos
+lecturas posibles quedan reducidas a una, con medida.
+
+El código que rota el descriptor está en `0x22004b10..0x22004b64` y es el constructor
+del LLI:
+
+```
+22004b14: ldr r0, [r0, r4, lsl #2]   ; bufer[indice] de un array de punteros
+22004b4c: str lr, [r3, #12]          ; ctrl
+22004b54: str lr, [r3, #4]           ; dst  (el FIFO del I2S)
+22004b5c: str lr, [r3]               ; src  (el bufer elegido)
+22004b60: str r3, [r3, #8]           ; next -> el mismo descriptor
+```
+
+Es decir: el driver elige `bufer[indice]`, lo pone como origen y lo encola. Lo que
+**nadie** hace es llenarlo antes con audio — sólo el `memset` de silencio (§11.63) lo
+toca.
+
+**El punto exacto donde seguir**, y ya sin ambigüedad: quién debería escribir
+`0x22008c5c` / `0x22009c5c` con PCM antes de que la rotación los encole. Ese es el
+productor ausente de §11.99, localizado ahora en una dirección concreta y con el
+código que lo consume a la vista.
