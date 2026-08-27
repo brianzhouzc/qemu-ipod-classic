@@ -4097,3 +4097,34 @@ es síntoma y hay que mirar más arriba —lo cual, con la CPU dormida el 88 % d
 Queda dicho de forma explícita: **esto es instrumentación de diagnóstico**, escribir
 memoria del invitado desde fuera. No es un arreglo, no puede quedarse, y no cuenta
 como "el reproductor funciona".
+
+## 11.81 RESULTADO DE LA SONDA: la guarda no era el bloqueo
+
+```
+antes:     0x2203ff28 = 0x0000    fetchbail=4  fetchok=0
+escrito:   0x2203ff28 = 0x0003    (el bit que la guarda exige, puesto por gdb)
+45 s despues: fetchbail=4  fetchok=0  dpump=0
+WAV: sigue en clics, pico 11444
+```
+
+`fetchbail` **no sube** y `dpump` es **cero**: tras poner el bit, la búsqueda de
+búfer no se vuelve a llamar ni una sola vez, porque el render no vuelve a
+ejecutarse. La guarda de `0x080a3c00` no era el bloqueo — es que **nadie replanifica
+al render para reevaluarla**. Y gdb, al enganchar, encontró la CPU en `0x22003b20`:
+el WFI de nuevo.
+
+Queda retirada toda la línea de §11.64-§11.65: localizar la guarda estaba bien como
+observación, pero la conclusión "ahí se apaga el reproductor" era falsa. Se apaga
+antes, y por eso la guarda sólo se evalúa ocho veces.
+
+Con esto y con §11.78, el diagnóstico converge en una sola frase: **el sistema
+procesa unos pocos búferes al pulsar reproducir y luego se duerme, y nada lo vuelve
+a despertar para trabajar.** Las 2 646 interrupciones del SM1 entran, su manejador
+señala un evento, y la CPU vuelve al WFI: no hay tarea esperando ese evento porque la
+que debía esperarlo ya terminó.
+
+**Lo que hay que mirar, y no se ha mirado.** Todos los muestreos y casi todas las
+medidas se han tomado *bien entrada* la reproducción, cuando ya está todo dormido.
+El fallo ocurre **en el instante de pulsar play** —el primer `fetchbail` es lo
+primero que pasa—, así que lo que importa es qué código corre en esa ventana y qué
+deja sin hacer. Es lo que mide el muestreo en curso.
