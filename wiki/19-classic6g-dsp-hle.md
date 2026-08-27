@@ -3556,3 +3556,50 @@ abandona. **Esa palabra de estado de 16 bits es un espejo de hardware**, y el bl
 que lo alimenta es justo el que estamos modelando. Si el modelo no pone ese bit, el
 fallo es nuestro y tiene arreglo. La medida que lo decide —cuántas veces se toma cada
 salida— está corriendo.
+
+## 11.65 LOCALIZADO: la guarda de `0x080a3c00` falla el 100 % de las veces
+
+Medido con la reproducción viva (`SHA1_ZERO=1 IRAMSPILL=0x10000 SM1_IRQ=1`, y
+comprobando que los contadores no fueran cero antes de creer nada):
+
+```
+fetch      4      se llama cuatro veces
+fetchok    0      NUNCA sale por el camino vivo
+fetchbail  4      SIEMPRE sale por la guarda
+```
+
+Y el descriptor, leído de la máquina en marcha:
+
+```
+0896a684: 0x00000000 0x2203ff28 0x2203ff00 0x22038000
+0896a694: 0x22038100 0x00000000 0x00000000 0x00000001
+
+2203ff28: 0x0000 0x0000 0x0000 0x0000 0x0000 0x0000 0x0000 0x0000
+```
+
+`[0x0896a684+4] = 0x2203ff28`, y **su palabra de estado de 16 bits está a CERO**. La
+guarda es `tst r2, r0` con `r0` valiendo 1 o 2, así que con `r2 = 0` no pasa jamás:
+`0x080a3c00` vuelve sin escribir la longitud, el llamador la lee como cero y el
+render abandona tras sus dos reintentos. **Todas las veces.**
+
+Esa es la cadena completa del silencio, sin huecos:
+
+```
+el DMA drena 4 KB de IRAM0 y pide mas            18 500 veces
+el driver responde con un memset a CERO           ~4 000 veces   (underrun correcto)
+el SM1 senala "trama lista"                        2 646 veces
+el render despierta, pide un bufer PCM...
+  ...0x080a3c00 mira [0x2203ff28] = 0, y no da nada    100 % fallo
+el render abandona tras 2 reintentos
+```
+
+**Queda una pregunta, y es la que decide de quién es el fallo:** ¿esa palabra está a
+cero porque nadie la escribe nunca (entonces falta algo que el modelo debería
+producir), o porque algo la pisa? El candidato para lo segundo tiene motivo y
+oportunidad: `copy16` (0x08016f08) escribe su PCM en `[r4+12] + offset` y se sale por
+encima de `0x22040000` — luego **pasa por encima de `0x2203ff28` en el camino**. Y el
+tamaño del anillo que gobierna ese offset es una INFERENCIA del modelo
+(`S5L8702_SM1_POS_RING_FRAMES = 0x20000/4`, "IRAM1 son 128 KiB"), no una medida —
+mientras que lo alto de IRAM1 resulta contener las estructuras de control del audio
+(tabla en 0x22038000, búfer en 0x22038100, descriptor en 0x2203ff28). Un anillo de
+128 KB desde 0x22020000 las cubre a las tres.
