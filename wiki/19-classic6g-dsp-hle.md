@@ -4343,3 +4343,32 @@ trazaba daba "ocho veces".
 reproducción**. Cualquier conclusión anterior que los use como evidencia de qué pasa
 al reproducir hay que releerla como evidencia de qué pasa al arrancar. Y toda medida
 nueva tiene que llevar **marca de tiempo y tope alto**, o vuelve a mentir igual.
+
+## 11.91 CORRECCIÓN a §11.90: generaliza de una sola corrida
+
+§11.90 concluyó que "todo pasa en el segundo 0" a partir de la corrida `uc1`. Puesto
+al lado de otra corrida de la misma sesión, no se sostiene tal cual:
+
+```
+uc1:  copy16 4808, dpump 8, mixer 8, fetchbail 4   ->  TODOS en el segundo 0
+pt1:  copy16 8, dpump 8, mixer 8, fetchbail 8      ->  primera a los 142,16 s
+```
+
+Las marcas de tiempo del plugin son de **reloj de pared**, relativas a la primera
+línea registrada (`t0` se fija en el primer log de cualquier tipo), así que las dos
+lecturas son válidas y dicen cosas distintas: en `uc1` el conducto de audio corrió en
+el arranque y no al reproducir; en `pt1` corrió al reproducir, a los 142 segundos.
+
+**Lo que se sostiene** y sigue siendo importante:
+
+- `cap=8` ocultaba la distribución temporal en todas las corridas anteriores, y sin
+  marca de tiempo los contadores no distinguen arranque de reproducción. Esa parte
+  de §11.90 es correcta y vale como aviso permanente.
+- Los "ocho búferes" no son una medida estable de nada: **el mismo contador vale 8 en
+  el arranque o 8 al reproducir según la corrida**, y compararlos entre corridas sin
+  mirar el reloj es lo que ha sostenido conclusiones durante meses.
+
+**Lo que NO se sostiene**, y queda retirado: la frase "al pulsar reproducir no se
+entra en el conducto de audio en absoluto". En `pt1` sí se entra. Lo correcto es que
+**a veces se entra y a veces no**, y esa variabilidad entre corridas es en sí misma
+un hecho que hay que explicar antes de seguir.
