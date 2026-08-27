@@ -4471,3 +4471,34 @@ cambiaron de tamaño (~500 bytes) y de sitio en el disco, así que el rango
 `ATALBA_LO/HI` —calculado con `filefrag` sobre los ficheros ANTERIORES— dejó de
 cubrirlos. **Cada vez que se tocan los ficheros hay que recalcular el rango**, o la
 sonda mide un sitio donde ya no hay nada.
+
+## 11.95 CONTROL POSITIVO: el camino de salida SÍ puede llevar música
+
+Faltaba un control que separa dos cosas que se venían confundiendo. Que el DMA
+entregue 18 500 búferes y que los clics de rueda lleguen al WAV prueba que el camino
+lleva **PCM corto** (un clic son 1 248 muestras); no prueba que sostenga música
+durante minutos. Nunca se había verificado.
+
+El shim `HLE_AUDIO_DATAPATH` decodifica en el anfitrión y mete el PCM en el mismo
+canal de DMA del firmware. **No es una solución** —no es el reproductor de retailOS—
+pero como control responde justo eso:
+
+```
+con decodificacion en el anfitrion:  14 987 242 muestras, 5 506 568 no nulas (36,74%), pico 32768
+con el reproductor de retailOS:      16 799 744 muestras,    27 456 no nulas ( 0,16%), pico 11444
+```
+
+**Música real contra clics.** El camino de salida —DMA, I2S, ritmado, captura— queda
+**demostrado** de punta a punta con audio sostenido, no inferido.
+
+Con esto el problema queda acotado sin ambigüedad posible:
+
+| lado | estado |
+|---|---|
+| entrada (disco -> memoria) | **demostrado**: el fichero entero, y `ff fb 90 64` en el destino correcto (§11.86) |
+| salida (memoria -> altavoz) | **demostrado**: 36,74 % de muestras no nulas con audio real (aquí) |
+| decodificación en el firmware | **es lo único que falla** |
+
+**Consecuencia para el trabajo futuro:** no volver a investigar el camino de salida.
+Está probado. Todo el esfuerzo va a por qué el reproductor aborta al abrirse
+(§11.83), con la cadena de llamadas de §11.93 como punto de entrada.
