@@ -2896,3 +2896,25 @@ están medidos y son consecuencia.
 qué espera exactamente la bomba en `0x22006118`. Si son objetos distintos, o si la
 semántica del evento RTXC es de "un solo disparo" que se pierde mientras el que espera
 no está bloqueado, ahí está la explicación.
+
+## 11.46 La línea 18 queda CONFIRMADA por el propio firmware
+
+`S5L8702_SM1_IRQ = 18` se eligió porque la tabla de Rockbox tiene un **hueco** en 18,
+y eso nunca fue prueba de nada. Ahora sí lo es. En el arranque del render, en IRAM:
+
+```
+220069c4:  mov r0,#8       ; bl 0x22003870    crea el objeto
+220069cc:  mov r1,#18      ; bl 0x22003888    numero de IRQ: 18
+220069d4:  ldr r1,=0x08017378 ; bl 0x22003890 registra ESE manejador
+220069e4:  ldr r1,=0x08017378 ; bl 0x22003898 lo habilita
+220069ec:  ldr r0,=0x22008c58 ; bl 0x220037f8 crea el evento
+```
+
+El firmware registra `0x08017378` -- el manejador que hemos estado contando -- en la
+**IRQ 18**, y a continuación crea el evento `0x22008c58` que ese manejador señala.
+La eleccion de linea era correcta, y ya no por descarte.
+
+Queda por tanto una sola pregunta abierta en toda la ruta: **quién espera en ese
+evento y por qué arranca 16 veces cuando se le señala 1 822** (§11.45). El objeto se
+pasa por puntero, así que el que espera no se localiza con una búsqueda del literal
+`0x22008c58`; hay que seguir el manejador devuelto por `0x220037f8`.
