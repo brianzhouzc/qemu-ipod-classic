@@ -4594,3 +4594,50 @@ se referencia desde seis sitios del firmware:
 Uno de ellos deberia montar la tabla. Poner un `pc=` en cada uno y ver cual **no**
 corre al reproducir nombra al inicializador que falta, y de ahi a la condicion que
 lo gatea — que es donde estara el fallo del modelo.
+
+## 11.98 La semántica de la tabla de ranuras, y quién la consume
+
+Sondeados los seis sitios que referencian el global `0x0896a684`, con marca de
+tiempo:
+
+```
+ctx    (0x08082100)  n=4  +137,07 s    corre al reproducir
+s2     (0x08085ef8)  n=3  +137,21 s    corre
+evwait (0x0808af58)  n=4  +137,07 s    corre
+fetch  (0x080a3c00)  n=4  +137,17 s    corre, y falla
+s5     (0x080b5300)  n=0               NUNCA
+```
+
+El que nunca corre resultó ser, leído, la rutina de **"ranura consumida"**
+(`0x080b52f0`):
+
+```
+80b52f4: ldr  r4, [pc,#36]        ; el global del audio
+80b52fc: ldr  r0, [r4,#20]        ; indice de ranura
+80b5300: ldr  r1, [r4,#12]        ; base de la tabla = 0x22038000
+80b5304: add  r3, r1, r0, lsl #2
+80b5308: strh r2, [r3,#10]        ; pone a CERO [tabla + indice*4 + 10]
+80b5314: bl   0x8014848           ; envuelve el indice
+80b5318: str  r1, [r4,#20]        ; y lo avanza
+```
+
+Escribe **cero** en exactamente el campo que la segunda guarda de la búsqueda exige
+valer **uno**. Con eso la semántica queda fijada sin ambigüedad:
+
+> `[tabla + indice*4 + 10]` es el flag **"ranura lista"**: **1 = hay datos**,
+> y `0x080b52f0` lo baja al consumirla. `[global+0x14]` es el índice en curso.
+
+Que no corra nunca es **coherente**, no un fallo: no hay nada que consumir. Y
+desplaza la pregunta al **productor**: quién debe poner ese campo a 1 y llenar el
+búfer en `0x22038100`.
+
+De los seis sitios, tres corren al reproducir (`ctx`, `s2`, `evwait`) y ninguno es el
+productor: `s2` es control del motor (escribe la segunda página de registros vía
+`0x080915a4`), `evwait` es la espera del evento con su timeout de 500 ms, y `ctx` es
+el constructor de contexto. Así que **el productor está fuera de esos seis**, o es
+uno de ellos por una vía que no se ha seguido todavía.
+
+Buscar `strh` con desplazamiento 10 no discrimina —es un offset demasiado común, más
+de veinte candidatos genéricos—, así que el camino útil es al revés: partir de quién
+escribe el **búfer** `0x22038100` (un watch como los que ya han funcionado tres veces
+en esta sesión) y subir desde ahí.
