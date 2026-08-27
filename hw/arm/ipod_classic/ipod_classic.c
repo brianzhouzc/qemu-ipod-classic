@@ -182,8 +182,33 @@ static void ipod_classic_memory_setup(MachineState *machine,
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(machine);
 
     MemoryRegion *iram0;
+    MemoryRegion *sdram;
+    MemoryRegion *sdram_uncached;
 
-    allocate_ram(sysmem, "sdram", SDRAM_MEM_BASE, SDRAM_MEM_SIZE);
+    sdram = allocate_ram(sysmem, "sdram", SDRAM_MEM_BASE, SDRAM_MEM_SIZE);
+
+    /*
+     * DRAM ALSO ANSWERS AT 0x88000000, and this is not decoration.
+     *
+     * The SoC exposes the same DRAM twice, cached low and uncached with bit 31
+     * set, and the firmware uses both at once: the note on DMAC0 below already
+     * says the guest programs a channel with the cached alias (0x0be55320)
+     * while the CPU runs on the uncached one (0x8be55320).
+     *
+     * MEASURED with SHA1TRACE=1: the SHA-1 engine is handed 0x8ba718c0 and
+     * 0x8ba7192c, which are 0x88000000 + 0x03a718c0 and + 0x03a7192c -- offsets
+     * comfortably inside 64 MB, i.e. the uncached view of 0x0ba718c0. With
+     * nothing mapped there, cpu_physical_memory_read returned ZEROS and the
+     * engine hashed nothing at all. Any digest the firmware compared against
+     * was therefore guaranteed to mismatch, which is what emptied the music
+     * library the moment the accelerator was wired up.
+     */
+    sdram_uncached = g_new(MemoryRegion, 1);
+    memory_region_init_alias(sdram_uncached, NULL, "sdram-uncached", sdram, 0,
+                             SDRAM_MEM_SIZE);
+    memory_region_add_subregion(sysmem, SDRAM_UNCACHED_MEM_BASE,
+                                sdram_uncached);
+
     iram0 = allocate_ram(sysmem, "iram0", IRAM0_MEM_BASE, IRAM0_MEM_SIZE);
     allocate_ram(sysmem, "iram1", IRAM1_MEM_BASE, IRAM1_MEM_SIZE);
     allocate_ram(sysmem, "edgeic", EDGEIC_MEM_BASE, EDGEIC_MEM_SIZE);
@@ -802,13 +827,22 @@ static void ipod_classic_machine_init(MachineState *machine)
      * instead of being accepted by a check that could never fail. Being able to
      * A/B the two on the same image is what tells those apart.
      */
+    /*
+     * The 1 MB window is backed EITHER WAY, and the engine sits on top of it.
+     *
+     * It used to be one or the other: with SHA1_OFF the whole megabyte was a
+     * stub, and with the engine wired only its 0x100 bytes of registers were
+     * mapped, leaving 0x38000100..0x380fffff unassigned. So the switch changed
+     * far more than whether digests were real -- every access to the rest of
+     * the block behaved differently -- and that is not a difference any A/B
+     * comparison between the two should be carrying.
+     */
+    create_unimplemented_device("s5l8702.sha1", SHA1_MEM_BASE, 0x100000);
     if (!getenv("SHA1_OFF")) {
         dev = qdev_new("ipodtouch.sha1");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-        memory_region_add_subregion(sysmem, SHA1_MEM_BASE,
-                                    &IPOD_TOUCH_SHA1(dev)->iomem);
-    } else {
-        create_unimplemented_device("s5l8702.sha1", SHA1_MEM_BASE, 0x100000);
+        memory_region_add_subregion_overlap(sysmem, SHA1_MEM_BASE,
+                                            &IPOD_TOUCH_SHA1(dev)->iomem, 1);
     }
 
     dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);

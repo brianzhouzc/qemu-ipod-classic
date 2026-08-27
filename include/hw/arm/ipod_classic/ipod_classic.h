@@ -39,6 +39,15 @@
 /* RAM. DRAM_ORIG / IRAM_ORIG / IRAM0_SIZE / IRAM1_SIZE in s5l87xx.h. */
 #define SDRAM_MEM_BASE    0x08000000
 #define SDRAM_MEM_SIZE    0x04000000   /* 64 MB */
+
+/*
+ * The same DRAM again, uncached, with bit 31 set. The firmware uses both views
+ * in the same breath -- it programs DMAC0 with a cached address while the CPU
+ * runs on the uncached one -- and it hands the SHA-1 engine uncached addresses
+ * (measured: 0x8ba718c0, i.e. this base + 0x03a718c0). See the note where the
+ * alias is created.
+ */
+#define SDRAM_UNCACHED_MEM_BASE  0x88000000
 #define IRAM0_MEM_BASE    0x22000000
 #define IRAM0_MEM_SIZE    0x00020000   /* 128 KB */
 #define IRAM1_MEM_BASE    0x22020000

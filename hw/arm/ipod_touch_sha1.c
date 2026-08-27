@@ -27,6 +27,7 @@ static void sha1_reset(IPodTouchSHA1State *s)
 	memset(&s->hashout, 0, 0x14);
 	s->hw_buffer_dirty = false;
 	s->hash_computed = false;
+	s->memory_fed = false;
 }
 
 static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
@@ -50,14 +51,91 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 		case 0x20 ... 0x34:
 			//fprintf(stderr, "Hash out %08x\n",  *(uint32_t *)&s->hashout[offset - 0x20]);
             if(!s->hash_computed) {
-                // lazy compute the final hash by inspecting the last eight bytes of the buffer, which contains the length of the input data.
-                uint64_t data_length = swapLong(((uint64_t *)s->buffer)[s->buffer_ind / 8 - 1]) / 8;
+                /*
+                 * How many of the buffered bytes are the message?
+                 *
+                 * Two firmwares drive this block differently and the model has
+                 * to cope with both:
+                 *
+                 *  - The iPod Touch code this was ported from pads the message
+                 *    ITSELF, so the buffer ends with the standard SHA-1 trailer
+                 *    and the real length is in its last eight bytes, in bits.
+                 *    Hashing everything would then pad an already-padded
+                 *    message and give the wrong digest.
+                 *
+                 *  - The Classic's retailOS does NOT pad. MEASURED with
+                 *    SHA1TRACE=1: it hands over 64 and then 4096 bytes in memory
+                 *    mode with no trailer at all, so the last eight bytes read
+                 *    as zero. Trusting them made data_length 0, and the engine
+                 *    answered da39a3ee5e6b4b0d3255bfef95601890afd80709 -- the
+                 *    SHA-1 of the EMPTY STRING -- for every request. No database
+                 *    could ever pass a check against that, which is exactly why
+                 *    wiring this accelerator turned the music library empty.
+                 *
+                 * The two cases are told apart by HOW the data arrived, not by
+                 * what the last bytes look like. A first attempt trusted the
+                 * trailer whenever it was a plausible length, and immediately
+                 * misread 34 out of 64 bytes of ordinary data as a length --
+                 * these messages look random, so any 8 bytes of them can pass
+                 * for one. Memory mode means the guest already said how much to
+                 * hash, via SHA_INSIZE; only the block-at-a-time register path
+                 * carries a message the guest padded itself.
+                 */
+                uint64_t data_length;
+                if (s->memory_fed) {
+                    data_length = s->buffer_ind;
+                } else {
+                    uint64_t declared = s->buffer_ind >= 8
+                        ? swapLong(((uint64_t *)s->buffer)[s->buffer_ind / 8 - 1]) / 8
+                        : 0;
+                    data_length = (declared > 0 && declared <= s->buffer_ind)
+                        ? declared : s->buffer_ind;
+                }
 
                 SHA_CTX ctx;
                 SHA1_Init(&ctx);
                 SHA1_Update(&ctx, s->buffer, data_length);
                 SHA1_Final(s->hashout, &ctx);
                 s->hash_computed = true;
+
+                /*
+                 * SHA1TRACE=1: what is the firmware actually hashing?
+                 *
+                 * This matters because with this engine wired the firmware
+                 * rejects the iTunesDB outright (0 songs), and there are two
+                 * very different reasons that could happen: the database really
+                 * fails a signature check, or THIS MODEL returns the wrong
+                 * digest and nothing could ever match. The lazy length above is
+                 * an assumption -- that the guest writes its own SHA-1 padding
+                 * and the "length in bits" trailer -- and a real accelerator
+                 * usually pads itself. Printing the declared length, the length
+                 * actually fed in, the head of the data and the digest says
+                 * which of the two is happening, and whether the input is even
+                 * the database (an mhbd magic would be unmistakable).
+                 */
+                if (getenv("SHA1TRACE")) {
+                    static int n;
+                    if (n++ < 12) {
+                        fprintf(stderr,
+                                "SHA1TRACE #%d: buffered=%u bytes, trailer says %"
+                                PRIu64 ", memory_mode=%u start=0x%08x insize=%u\n",
+                                n, s->buffer_ind, data_length,
+                                s->memory_mode, s->memory_start, s->insize);
+                        fprintf(stderr, "  head: %02x %02x %02x %02x %02x %02x %02x %02x"
+                                "   '%c%c%c%c'\n",
+                                s->buffer[0], s->buffer[1], s->buffer[2], s->buffer[3],
+                                s->buffer[4], s->buffer[5], s->buffer[6], s->buffer[7],
+                                isprint(s->buffer[0]) ? s->buffer[0] : '.',
+                                isprint(s->buffer[1]) ? s->buffer[1] : '.',
+                                isprint(s->buffer[2]) ? s->buffer[2] : '.',
+                                isprint(s->buffer[3]) ? s->buffer[3] : '.');
+                        fprintf(stderr, "  digest:");
+                        for (int i = 0; i < 20; i++) {
+                            fprintf(stderr, "%02x", s->hashout[i]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
             }
 
 			return *(uint32_t *)&s->hashout[offset - 0x20];
@@ -87,6 +165,13 @@ static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, u
 						cpu_physical_memory_read(s->memory_start + i * 0x40, s->buffer + s->buffer_ind, 0x40);
 						s->buffer_ind += 0x40;
 					}
+					/*
+					 * Remember that the guest sized this message itself. The
+					 * digest read needs to know: a message that arrived this
+					 * way is NOT padded, so its last eight bytes are data, not
+					 * a length.
+					 */
+					s->memory_fed = true;
 				}
 			} else {
 				s->config = value;
