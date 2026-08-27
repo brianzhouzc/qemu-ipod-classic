@@ -3904,3 +3904,45 @@ Van catorce hipótesis refutadas con medida en esta investigación. Las dos últ
 —formato del fichero (§11.59) y DSP (aquí)— eran de las más plausibles, y ninguna se
 sostuvo. Lo que queda por responder es estrecho: **quién debería llamar al pull de
 tramas más de una vez, y qué se lo impide.**
+
+## 11.75 El pull de tramas se llama UNA vez, a los 16 ms del arranque
+
+Captura de registros en la entrada del pull (`0x081e93d8`, entrada de función, así
+que la lectura es fiable):
+
+```
+pullwho hit#1  +16877us  lr=0x081ea388  r0=0x093effbc r1=0 r5=1 r6=r7=0xffffffff
+llamadores distintos: 1
+credread 8   pullpass 1   pullret 1   fetchok 0   StartPlayback 2   dpump 8
+```
+
+**+16 877 µs son 16 milisegundos: eso es el arranque, no la reproducción**, que
+empieza pasados los 130 segundos. Así que la ruta de decodificación **no se entra ni
+una vez mientras suena la canción**. Todo lo que se midió aguas abajo de ahí —y las
+conclusiones que colgaban de "el códec corre una vez"— describían un evento de
+arranque.
+
+`credread=8` no lo contradice: es un ayudante compartido, llamado también desde otros
+sitios, y ocho coincide con `dpump`.
+
+**Quién lo llama.** `lr = 0x081ea388` es el retorno de un `blx r2` en `0x081ea384`,
+dentro de un notificador que empieza en `0x081ea2c0` y tiene tres salidas:
+
+```
+81ea2cc: cmn r6,#1 / cmnne r7,#1     el rango pedido es (-1,-1)?
+81ea2e0: ldrne r1,[r4,#0x20]         si no: capacidad
+81ea2ec: cmpne r0,r1                 tramo pedido == capacidad?
+81ea2fc: popne {..,pc}               <-- SALIDA A: vuelve sin notificar
+81ea344: ldrb r0,[r4,#0x1c]          estado guardado
+81ea348: cmp r0,r5                   != al pedido?
+81ea34c: bne 0x81ea370               --> NOTIFICA
+81ea350: cmp r9,#0                   si son iguales, histeresis por signo
+81ea384: blx r2                      <-- SALIDA B: notifica (y de aqui el pull)
+81ea388: ...                         <-- SALIDA C: no hay flanco, no notifica
+```
+
+La única ejecución medida traía `r6=r7=-1` (rango "todo") y estado 1, y disparó. Lo
+que hay que saber ahora es cuántas veces se invoca este notificador **durante la
+reproducción** y por cuál de las tres salidas se va: si no se invoca, el fallo está
+más arriba; si se invoca y se cae por la salida A, el tramo pedido no cuadra con la
+capacidad y eso es aritmética de búferes que se puede seguir. Corriendo.
