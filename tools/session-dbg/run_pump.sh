@@ -60,6 +60,8 @@ PA="$PA,pc=0x081e9e70:aacmath,pc=0x08016e88:gatechk,pc=0x08016e94:copygo"
 # to "MeCCA_PCM_Output.wav" (flag struct at 0x08948f24), writing r6/r4*4 bytes --
 # so this function RECEIVES the produced PCM.
 PA="$PA,pc=0x0816bf48:pcmout,pc=0x0816c05c:pcmdump,pc=0x0816bed0:pcmhelper"
+# What PCM does the output path receive? (the firmware dump uses r6=buf, r4=count)
+PA="$PA,regpc=0x0816bf48:pcmargs,regpc=0x0816c0b0:pcmbuf,regcap=12"
 PA="$PA,pc=0x08016edc:hwpath,pc=0x08016ee8:hwgo,pc=0x08016f08:copy16,pc=0x08016f10:hwret"
 # The two sibling threads of MeCCADecode that nobody has ever studied.
 PA="$PA,pc=0x22004630:framedone,pc=0x22004754:endofstream,pc=0x08123cfc:decswitch"
