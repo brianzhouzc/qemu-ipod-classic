@@ -2256,3 +2256,67 @@ producir tramas. Con el DSP descartado, el clúster de imagen descartado y el
 sumidero identificado, lo que queda es RE del lazo de decodificación —
 concretamente por qué `0x081e93d8` extrae una sola trama pese a que el crédito
 `+0x2b8` se escribe 18 veces.
+
+### 11.30 El lazo del decodificador, acotado: al códec se le pide CERO muestras (y eso no es la causa única)
+
+Continuación de §11.29, ya con el aparato estable y navegable. Se persiguió el
+último eslabón —por qué no sale música— hasta un número concreto, y se acotó qué
+NO es la causa.
+
+**A) El extractor de tramas sí tiene bucle y sí pasa su puerta de crédito.**
+`0x081e93d8`, tras el gate, ejecuta:
+
+```
+81e9428:  ldr r6, [obj+0x3c]        ; índice productor
+81e9434:  ldr r1, [obj+0x44]        ; muestras pedidas
+81e9438:  ldr r0, [reader+8]        ; espacio de salida
+81e9440:  cmp r1, r0 ; movle r0, r1 ; r0 = min(...)
+81e9448:  mov r3, r0                ; <- la CUENTA que recibe el códec
+81e9458:  bl  0x081e9e70            ; la matemática del códec
+81e945c:  sub r6, r6, #1
+81e9468:  cmp [obj+0x40], r6 ; bne  ; itera hasta alcanzar al consumidor
+```
+
+Medido (`pullpass=1`): **pasa el crédito**. Queda refutado que el crédito `+0x2b8`
+fuera el muro, que era la hipótesis de §11.18/§11.25.
+
+**B) La cuenta es CERO — medido en vivo** (gdb en `0x081e9428`, con reproducción
+lanzada):
+
+```
+reader=0x093cbbd4  obj=0x0ba90c50
+prod[+0x3c]=3  cons[+0x40]=2  depth=1     <- SÍ hay trabajo encolado
+[obj+0x44]=0   [reader+8]=0               <- pero min(...) = 0
+```
+
+Es decir: **el códec se invoca pidiéndole cero muestras**. Por eso "decodifica una
+trama" (`aacmath=1`) que no produce nada, y el anillo del mixer nunca se llena.
+
+**C) Pero forzar la cuenta NO basta.** Con un hook que escribe 1024 en ambos campos
+justo antes del bucle (`count_probe.gdb`): `aacmath` sigue en 1 y el audio sigue
+siendo sólo clics de UI (170 s capturados, 0,200 % de muestras no nulas, todas
+ráfagas de 1248/2496 con pico constante 11444). **Hay otra capa debajo**, así que la
+cuenta es un síntoma más, no la causa raíz.
+
+**D) Qué queda descartado, con datos.**
+- **No es el DSP.** Cero accesos a `0x39000000`/`0x3F000000` durante la reproducción.
+- **No es el almacenamiento.** El disco se lee activamente: **30 666 escrituras a
+  registros ATA desde 29 PCs distintos** en una corrida, repartidas por todo el
+  tiempo, no sólo al arrancar.
+- **No es el crédito** `+0x2b8` (§A).
+- **No es el anillo que se vigilaba**: en reproducción real el copy lee de
+  `0x0888a2xx-0x0888a6xx`, no del `0x08889098` del render de arranque. Re-medido
+  sobre la ventana correcta: sólo escriben los dos memset de IRAM.
+
+**E) El interruptor del motor sí cierra su ciclo.** Con `SM1_IRQ=1` (§11.29) el
+firmware arma la interrupción por su cuenta (`sm1arm=2`) y el render responde:
+`rendret 1→4`, `dpump 5→8`, `copy16 2405→4808`. El camino de salida funciona y se
+realimenta; lo que no llega es contenido.
+
+**ESTADO.** El aparato es **navegable y estable**, su **pipeline de render nativo
+funciona y se realimenta**, la biblioteca se lee (`SHA1_OFF=1`), y el
+almacenamiento sirve datos. **No hay música**: entre el fichero comprimido y el
+anillo del mixer hay un eslabón que no produce muestras, y ya no es ninguno de los
+sospechosos habituales. El siguiente paso natural es seguir la entrada del
+decodificador —qué objeto alimenta `[obj+0x3c]` y de dónde saca los bytes
+comprimidos— en vez de seguir empujando desde la salida.

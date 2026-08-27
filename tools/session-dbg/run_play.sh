@@ -70,7 +70,10 @@ PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
 # the codec. Measured live: prod=3 cons=2 depth=1 but [obj+0x44]=0 and
 # [reader+8]=0, so the codec is invoked asking for ZERO samples. Watch who writes
 # these fields -- that is the producer that should be filling the count.
-PA="$PA,memw=0x0ba90c30-0x0ba90cb0,memcap=60"
+# Does the guest READ THE AUDIO FILE during playback? If StreamCache/MeCCAIOTask
+# never pull compressed data off the disk, the decoder has no input and every
+# downstream measurement is moot. Watch the ATA register window (0x38700000).
+PA="$PA,memw=0x38700000-0x38700400,memcap=40"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
