@@ -794,10 +794,22 @@ static void ipod_classic_machine_init(MachineState *machine)
      * SHA_INSIZE 0x8c, digest at 0x20..0x34), so the same device serves the
      * S5L8702. Reused rather than re-written.
      */
-    dev = qdev_new("ipodtouch.sha1");
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    memory_region_add_subregion(sysmem, SHA1_MEM_BASE,
-                                &IPOD_TOUCH_SHA1(dev)->iomem);
+    /*
+     * SHA1_OFF=1 leaves the block as the zero window it used to be. Kept as a
+     * switch because turning the engine on changes what the firmware can
+     * verify: with it the panic-reset stops, but a disk image whose iTunesDB
+     * hash the device cannot reproduce is then rejected outright ("0 songs")
+     * instead of being accepted by a check that could never fail. Being able to
+     * A/B the two on the same image is what tells those apart.
+     */
+    if (!getenv("SHA1_OFF")) {
+        dev = qdev_new("ipodtouch.sha1");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        memory_region_add_subregion(sysmem, SHA1_MEM_BASE,
+                                    &IPOD_TOUCH_SHA1(dev)->iomem);
+    } else {
+        create_unimplemented_device("s5l8702.sha1", SHA1_MEM_BASE, 0x100000);
+    }
 
     dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
