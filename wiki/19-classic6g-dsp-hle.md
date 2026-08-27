@@ -2536,3 +2536,50 @@ tampoco es lentitud: dejando el aparato quieto, las capturas a 30, 120 y **240
 segundos** son idénticas ("Ingen musik"). Lo que el firmware hace con esos dos
 digests, y por qué el resultado le deja la biblioteca vacía, es lo que queda por
 determinar.
+
+## 11.36 El corte real: el copy del render se sale de IRAM1
+
+Con `SHA1_ZERO=1` (el motor presente, pero el digest respondiendo cero como hacía el
+stub) **la reproducción arranca**: `framepull=1`, `aacmath=1`, `pcmout=4`. O sea que
+lo que decide si la biblioteca se acepta es el **valor del digest**, no que el
+dispositivo esté o no: con un digest real el firmware ejecuta una comprobación que
+esta imagen no pasa; con ceros la salta. Eso deja un único bloqueo para que suene: el
+reinicio.
+
+**Y el reinicio tiene una sola causa, medida.** El log `-d int` de QEMU dice que en
+toda la corrida se toma **exactamente un** Data Abort:
+
+```
+Taking exception 4 [Data Abort] on CPU 0
+  ...with DFSR 0x8 DFAR 0x22040216
+```
+
+`0x22040216` está 0x216 bytes por encima del final de IRAM1 (que acaba en
+`0x22040000`). Capturado en el vector de abort, el culpable es inequívoco:
+
+```
+faulting insn at 0x08016f08
+  0x8016f08:  strhne r3, [r2], #2
+  r2=22040a16  r1=00000021  r4=0bb12d54  r5=0888ba74
+```
+
+Es **`copy16`**, el bucle de copia de media palabra del render, escribiendo PCM en el
+anillo de IRAM1 y saliéndose por arriba.
+
+**El desbordamiento está ACOTADO.** Mapeando RAM por encima de IRAM1 (`IRAMSPILL`,
+ayuda de medición, no arreglo) la corrida continúa y se cuentan **1178 escrituras**
+por encima del límite, todas desde ese mismo PC: unos 2,3 KB. No es una fuga
+descontrolada; el puntero de destino acaba una cantidad fija demasiado alta. Eso es
+la forma que tiene una copia de anillo que debería partirse en dos tramos (cola hasta
+el final del búfer y cabeza desde el principio) y se hace de una sola vez.
+
+**Por qué importa el orden.** Una nota de método: la primera vigilancia de escrituras
+sobre `0x22040000-0x22040800` dio **cero** y llevó a concluir que el abort era de
+lectura. Era la ventana, que se quedaba corta: el puntero ya iba por `0x2204221x`.
+Ampliada a `0x22060000` aparecieron las 1178.
+
+**Lo que queda.** De dónde sale ese destino: si el firmware lo calcula a partir de un
+registro que este modelo contesta mal (el candidato natural es la posición de SM1, que
+ya dio un fallo de esta misma familia en §11.24), entonces es un fallo nuestro y se
+arregla; si lo calcula solo, hay que ver qué le hace creer que el anillo es 2,3 KB más
+grande de lo que es.

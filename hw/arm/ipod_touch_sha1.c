@@ -138,6 +138,23 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
                 }
             }
 
+			/*
+			 * SHA1_ZERO=1: keep the device, but answer the digest as the
+			 * unimplemented stub used to -- all zeros.
+			 *
+			 * This is the discriminator for the one difference left between the
+			 * two configurations. With SHA1_OFF the library loads and playback
+			 * starts; with the engine wired the boot is clean but the library is
+			 * empty. Both now back the whole 1 MB window, so the only thing that
+			 * still differs is what these registers answer. If zeroing just the
+			 * digest brings the library back, the firmware is acting on the
+			 * VALUE -- it compares it against something -- and the empty library
+			 * is a verdict, not a side effect. If it does not, the difference is
+			 * in another register and the digest is a red herring.
+			 */
+			if (getenv("SHA1_ZERO")) {
+				return 0;
+			}
 			return *(uint32_t *)&s->hashout[offset - 0x20];
 	}
 

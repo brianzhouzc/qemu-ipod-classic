@@ -94,10 +94,18 @@ PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
 # Per-run additions without editing this file: PCTRACE_EXTRA="range=...,trig=..."
 PA="$PA${PCTRACE_EXTRA:+,$PCTRACE_EXTRA}"
 
+# QEMU_DEBUG="int" turns on QEMU's own logging, e.g. to see which exception the
+# guest takes before it software-resets. Goes to its own file so it cannot bury
+# the firmware's semihosting output.
+DBG=""
+if [ -n "$QEMU_DEBUG" ]; then
+  DBG="-d $QEMU_DEBUG -D $OUT/qemudbg_$TAG.log"
+fi
+
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
   -display none -serial null -monitor "tcp:127.0.0.1:4455,server,nowait" \
-  -gdb tcp::1234 \
+  -gdb tcp::1234 $DBG \
   -plugin "$PLUG,$PA" >"$OUT/qmus_$TAG.out" 2>"$OUT/qmus_$TAG.err" &
 echo "launched $TAG"
 if [ -n "$PCMPROBE" ]; then
