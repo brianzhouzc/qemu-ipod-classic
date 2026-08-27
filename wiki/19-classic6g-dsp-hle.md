@@ -3415,3 +3415,46 @@ conclusión que colgaba de esa lectura queda retirada.
 **La lección, que ya va dos veces en esta investigación:** una etiqueta puesta por
 conjetura (`aacmath`, `pullbail`) se propaga a través de docenas de medidas y las
 contamina todas. Antes de construir sobre un nombre, leer las diez instrucciones.
+
+## 11.62 CORRECCIÓN de §11.58: los búferes SÍ se rellenan, ~4 000 veces
+
+§11.58 concluyó "nadie rellena de audio los búferes de IRAM0 que el DMA drena".
+Medido con un `memw` sobre la cabeza del búfer (`0x22008c5c-0x22008cdc`), también es
+falso:
+
+```
+--- mem-write watch 0x22008c5c-0x22008cdc: 127264 stores from 8 distinct PC(s) ---
+    writer pc=0x22000294  stores=63328
+    writer pc=0x22000298  stores=63328
+    writer pc=0x080fb4ec  stores=256
+    writer pc=0x080fb50c  stores=256
+    (y cuatro más, de 16 a 32 escrituras)
+```
+
+La ventana vigilada son **128 bytes**, o sea 32 palabras, así que 127 264 escrituras
+son unos **4 000 rellenos completos** del búfer de 4 KB — el mismo orden que los
+terminal-counts del DMA. Un bucle de copia residente en IRAM (dos instrucciones de
+store, `0x22000294` y `0x22000298`, con recuentos idénticos) mantiene el búfer
+alimentado al ritmo exacto al que se vacía.
+
+**La desproporción real, en la misma corrida:**
+
+| sitio | veces |
+|---|---|
+| relleno en IRAM (`0x22000294/8`) | ~4 000 rellenos |
+| `copy16` | 4 808 |
+| `dpump` (bomba de render) | **8** |
+| `mixer` | **8** |
+| `rendret` | 4 |
+| `pcmout` | 4 |
+
+El consumidor y su rellenador van a tempo. **El render corre ocho veces en toda una
+corrida de 150 segundos.** Así que el rellenador copia una y otra vez un origen que
+nadie refresca, y por eso entrega silencio: no falta el escritor, falta que el
+render produzca.
+
+Con esto, las tres formulaciones anteriores quedan retiradas — "no arranca el lazo"
+(§11.57), "nadie rellena los búferes" (§11.58) y "al códec se le piden cero
+muestras" (§11.61). La pregunta que queda es estrecha y comprobable: **el SM1 levanta
+~2 400 interrupciones y el manejador señala su evento otras tantas; ¿por qué la bomba
+de render sólo despierta ocho veces?**
