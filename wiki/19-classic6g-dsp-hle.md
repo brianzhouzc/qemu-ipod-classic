@@ -3261,3 +3261,36 @@ respalda memoria por encima de IRAM1 para que el desbordamiento de `copy16` (§1
 aborte. **No es un arreglo** y no debe quedarse: sin ella la corrida se corta a los
 ~46 s y no se puede medir nada de esto. El desbordamiento sigue siendo un fallo abierto
 por derecho propio.
+
+## 11.57 Conclusión de la sesión: no hay un eslabón roto, no arranca el lazo
+
+`0x081fef28` resulta ser `blx r3` con `r3 = [[r4]+0xc8]`: una llamada **virtual**, la
+tercera de una secuencia (+0xd4, +0xcc, +0xc8) con forma de "procesar un búfer". Y la
+función que la contiene corre, como todo lo demás, tres o cuatro veces.
+
+Ese es el patrón que cierra el diagnóstico. Recorriendo la cadena de §11.56 de arriba
+abajo, **cada nivel se ejecuta un puñado de veces y la aritmética entre niveles cuadra
+siempre**: 3-4 envíos, 4 mensajes, 8 items, 8 vueltas de bomba, profundidad 1, una
+llamada al códec. No hay ningún sitio donde N entre y salga mucho menos que N.
+
+**Es decir: no hay un eslabón roto. Lo que no ocurre es que el lazo de reproducción
+vuelva a empezar.** Arranca, procesa unos pocos búferes y se queda quieto. Buscar el
+fallo bajando por la cadena --que es lo que ha ocupado esta sesión-- estaba condenado:
+cada nivel reflejaba fielmente al de arriba.
+
+**Lo que eso sugiere para la próxima vez.** En vez de seguir subiendo por llamadores,
+la pregunta útil es qué termina o suspende la reproducción justo después de empezar. Un
+candidato con evidencia previa: el reproductor mostró la pantalla de **batería baja**
+(§11.33) y la de "Reproduciendo" se queda en la animación de portada sin llegar a la
+vista con barra de progreso (§11.39). Un estado de "parado" explicaría a la vez el
+puñado de búferes y la UI congelada, y se comprueba mirando el estado del reproductor
+en pantalla o en su objeto, no persiguiendo mas contadores.
+
+**Estado del arbol al cierre.** Seis arreglos verificados y en `master` de la rama:
+tormenta de IRQ (§11.42), motor SHA-1 (§11.35), alias de DRAM sin caché (§11.35),
+ventana de 1 MB del bloque SHA-1, RTC del PMU (§11.33) y el data abort de `copy16`
+localizado (§11.36, sin arreglar: `IRAMSPILL` sólo lo hace sobrevivible para medir).
+Instrumentos nuevos: `SHA1TRACE`, `SHA1_ZERO`, `PMUTRACE`, `PMUBATT`, `TIMERTRACE`,
+`QEMU_DEBUG`, `IRAMSPILL`, `SM1_IRQ_EVERY`, `SM1_IRQ_PULSE`, `SM1_FRAME_BIT`, y las
+sondas `abort_probe`, `limit_probe`, `posinc_probe`, `slot_probe`, `dma_probe`,
+`dma2_probe`, mas `run_nav.sh`, `run_quiet.sh` y `run_settle.sh`.
