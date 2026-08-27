@@ -3187,3 +3187,31 @@ arranque/reinicio, no de bombeo periódico. `0x220067fc` incrementa además un c
 propio en `[r0+0x68]`. Ambos terminan señalando `0x220106d0`. Lo que hay que averiguar
 es qué debería llamarlos cuarenta veces por segundo durante la reproducción, y no lo
 hace.
+
+## 11.55 Un eslabón más: quien encola es otra tarea, y tampoco gira
+
+La función que encola es `0x22006574` (prólogo `push {r4,r5,r6,r7,r8,lr}`, epílogo en
+`0x220067cc`). No aparece como destino de `bl` en el desensamblado -- otra llamada por
+puntero -- así que capturada en vivo:
+
+```
+lr=0x2200591c  r0=0x220106dc  r1=0x093b34c0  r3=0,1,2,3,5,6,7  sp=0x093b33d0
+   8 llamadas, todas desde el mismo sitio
+```
+
+- `r0 = 0x220106dc` es **el mismo objeto de audio** que recibe la bomba de render.
+- `r1` es un mensaje, y `r3` su número de secuencia: 0, 1, 2, 3, **5**, 6, 7 -- falta
+  el 4, así que un mensaje se posteó por otra vía o se perdió.
+- `sp = 0x093b33d0` está en SDRAM: **es otra tarea**, no el despachador (que corre en
+  pila de IRAM).
+
+O sea que quien produce trabajo de audio es a su vez una tarea que sólo se ejecuta
+ocho veces. El patrón se repite un nivel más arriba y la sesión se acaba aquí.
+
+**Resumen del estado para retomarlo.** La ruta completa, con un número medido en cada
+eslabón, está en §11.54. El punto de entrada es `0x22005918` -- el sitio que llama al
+encolador -- y la pregunta sigue siendo la misma en cada nivel: **qué debería estar
+girando cuarenta veces por segundo durante la reproducción y no gira**. Todas las
+fuentes de reloj del hardware están descartadas por medida (§11.51, §11.53), así que
+lo que falta es del lado del software: una tarea, o una cadena de tareas, que no se
+está replanificando.
