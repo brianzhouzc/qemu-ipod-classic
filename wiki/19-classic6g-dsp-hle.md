@@ -2832,3 +2832,36 @@ suposición mía puesta en un nombre.
 bomba de render. Entre `creditsig` (`0x080173cc`, que señala el evento `0x22008c58`) y
 `dpump` (`0x22006118`) hay un factor 150 sin explicar. Ahí, y en qué incrementa
 realmente `[obj+0x2b4]`, está lo que falta.
+
+## 11.44 Corrección: "cuatro subidas de línea" era un recuento mal hecho
+
+Las secciones 11.41-11.43 citan "4 subidas de línea" frente a 1,2 millones de
+entradas al manejador, y de ahí sale la cifra de ~197 000 reentradas por subida. **El
+recuento estaba mal.** El `printf` del modelo está filtrado:
+
+```c
+if (s->irqs <= 4 || s->irqs % 2000 == 0)
+```
+
+así que contar líneas del log no cuenta subidas. Los números reales:
+
+| corrida | última línea impresa | subidas reales | entradas al manejador |
+|---|---|---|---|
+| `pi1` (antes) | `raised #4` | **< 2000** | 1 196 485 |
+| `bd2` (20 us) | `raised #2000` | **2000-4000** | 2 399 |
+
+**La conclusión no sólo se mantiene: mejora.** Tras el arreglo hay ~una entrada al
+manejador **por subida**, que es exactamente lo que debe ser. Y explica lo que antes
+no cuadraba: si el modelo tiquea cada 5 ms y sube cada quinto tick, en 100 s debería
+subir ~4000 veces -- pero antes del arreglo sólo llegaba a 4. **La tormenta congelaba
+el tiempo virtual**, así que el propio temporizador del motor apenas corría. Causa y
+efecto se realimentaban.
+
+La posición del I2S lo confirma por otra vía: entre la primera subida y la número
+2000, `pos` va de 3 251 200 a 5 453 824 stereo frames, o sea **50 segundos de audio
+reloj­eados** en esa parte de la corrida. El camino de salida marcha a ritmo real.
+
+**Lo que sigue sin cuadrar, y es el hilo vivo:** ~2400 interrupciones señalan su
+evento y la bomba de render (`dpump`) corre **16** veces. El render mueve 9 616
+medias palabras -- unos 19 KB -- donde 100 s de audio necesitan 17,6 MB. Está al
+0,1 % del ritmo necesario mientras el DMA drena silencio a tiempo real.
