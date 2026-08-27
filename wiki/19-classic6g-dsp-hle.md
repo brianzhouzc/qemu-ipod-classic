@@ -4680,3 +4680,37 @@ Y esto cierra también, con evidencia, por qué el reproductor se abre y aborta
 ranuras y por qué no arranca. No es un problema del camino de audio —entrada y salida
 están DEMOSTRADAS (§11.86, §11.95)— sino de que una tarea productora nunca llega a
 existir o nunca se planifica.
+
+## 11.100 Las dos regiones de PCM son DISJUNTAS
+
+Juntando dos medidas de esta sesión que no se habían puesto una al lado de la otra:
+
+```
+copy16 escribe PCM en IRAM1     0x2203cef4 .. 0x2203d65a   (medido, s11.68)
+el DMA de audio lee de IRAM0    0x22008c5c                 (medido, s11.58)
+el unico escritor de 0x22008c5c es el memset a CERO        (medido, s11.63)
+el bufer de ranuras esta en     0x22038100                 (medido, s11.65)
+```
+
+**Tres regiones distintas y ninguna conectada con la siguiente.** El render produce
+PCM en un anillo de IRAM1; el DMA reproduce desde un búfer de IRAM0 que sólo recibe
+ceros; y el mecanismo de ranuras, que es lo que la búsqueda consulta, vive en una
+tercera zona que nadie toca.
+
+Eso encaja con §11.99 y lo hace más preciso: no es sólo que "el productor no
+escriba". Es que **el eslabón que debería copiar del anillo del render al búfer que
+el DMA reproduce no existe en ninguna corrida**, y por eso el driver de salida
+encuentra el búfer vacío y hace lo único correcto que puede hacer: rellenarlo de
+silencio.
+
+Conviene decir qué NO prueba esto. Que las tres regiones estén desconectadas es un
+hecho medido; que la conexión que falta sea "una copia de IRAM1 a IRAM0" es una
+lectura razonable pero **no medida** — podría ser que el firmware deba reprogramar el
+DMA para que lea del anillo, o que el mecanismo de ranuras sea el camino bueno y el
+anillo de `copy16` pertenezca a otra cosa (el empuje de silencio del arranque, por
+ejemplo, que es cuando `copy16` acumula sus 4 808 pasadas).
+
+**La medida que lo decidiría:** comprobar si en alguna corrida el descriptor del DMA
+(`0x22010020`) llega a apuntar a IRAM1 en vez de a `0x22008c5c`. Un watch sobre esos
+16 bytes lo contesta en una corrida, y distingue "falta una copia" de "falta
+reprogramar el DMA".
