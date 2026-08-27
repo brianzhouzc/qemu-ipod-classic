@@ -136,7 +136,30 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
         if (getenv("ATALBA") &&
             !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
             static uint64_t rd_ops, rd_bytes;
-            int64_t sec = ide_get_sector(is);
+            /*
+             * Comprobar que los bytes ATERRIZAN. Saber que se lee el sector
+             * correcto no dice que el dato llegue a la memoria del invitado: si
+             * el destino esta mal, el parser ve basura y el reproductor aborta
+             * -- que es exactamente el sintoma. Leer el destino de la
+             * transferencia ANTERIOR (esta ya ha terminado cuando llega la
+             * siguiente) y publicar sus primeras palabras junto al sector del
+             * que venian. Un volcado por el monitor no sirve: los buferes se
+             * reutilizan en segundos.
+             */
+            static uint32_t prev_dst;
+            static int64_t prev_sec = -1;
+            if (prev_sec >= 0) {
+                uint8_t head[8] = { 0 };
+                address_space_read(&address_space_memory, prev_dst,
+                                   MEMTXATTRS_UNSPECIFIED, head, sizeof(head));
+                fprintf(stderr, "ATALND lba=%" PRId64 " dst=0x%08x -> "
+                        "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        prev_sec, prev_dst, head[0], head[1], head[2], head[3],
+                        head[4], head[5], head[6], head[7]);
+            }
+            prev_dst = (uint32_t)s->dma_cur;
+            prev_sec = ide_get_sector(is);
+            int64_t sec = prev_sec;
             uint64_t n = ++rd_ops;
             /*
              * ATALBA=2 logs EVERY read with a virtual timestamp. The doubling
@@ -149,10 +172,11 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
             rd_bytes += len;
             if (all || (n & (n - 1)) == 0 || n % 2000 == 0) {
                 fprintf(stderr, "ATALBA +%09" PRId64 "us rd #%" PRIu64
-                        " lba=%" PRId64 " (byte %" PRId64 ") len=%u  total=%"
-                        PRIu64 " KB\n",
+                        " lba=%" PRId64 " (byte %" PRId64 ") len=%u dst=0x%08x"
+                        "  total=%" PRIu64 " KB\n",
                         qemu_clock_get_us(QEMU_CLOCK_VIRTUAL), n, sec,
-                        sec * 512, (unsigned)len, rd_bytes / 1024);
+                        sec * 512, (unsigned)len, (uint32_t)(s->dma_cur - len),
+                        rd_bytes / 1024);
             }
         }
 

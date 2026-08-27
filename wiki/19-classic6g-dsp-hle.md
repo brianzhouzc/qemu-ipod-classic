@@ -4188,3 +4188,43 @@ ficheros que hay en disco.
 sino **"por qué el reproductor aborta al abrirse"**. Se ataca desde la UI hacia
 dentro —qué error devuelve la apertura de la pista— y no desde el DMA hacia fuera,
 que es por donde se ha entrado todas las veces y donde todo está sano.
+
+## 11.84 Descartada la geometría rancia del registro, y una comprobación de método
+
+`patch_tracks.py` sólo actualiza `size`, `tracklen`, `bitrate` y `samplerate`, así que
+cualquier otro campo del `mhit` sigue describiendo el fichero que libgpod importó la
+primera vez. Candidato natural para un reproductor que abre y aborta. Volcados todos
+los campos no nulos de la cabecera (584 bytes):
+
+```
++0x070/+0x0a8  0x1ef4fab4 17e97dfa   el dbid de 64 bits, repetido (normal)
++0x12c         0x007df303            <-- el sospechoso
++0x134/+0x138  0x80808080 / 0x8080   marcadores de "desconocido"
+```
+
+**Refutado sin gastar una corrida:** las cuatro pistas llevan **el mismo**
+`0x007df303`, y cuatro canciones de duraciones distintas no pueden compartir una
+cuenta de muestras. Es una constante que escribe libgpod, no geometría del audio. Y
+`0x80808080` son marcadores de "sin dato": ponerlos a cero habría sido inventar un
+valor, no corregir uno. Se restauró la base desde la copia previa.
+
+(Antes ya se había descartado que el registro estuviera mal de tipo: `+0x18` lleva la
+fourcc `'MP3 '` y el resto cuadra, §11.83.)
+
+## 11.85 La comprobación que faltaba: ¿ATERRIZAN los bytes?
+
+Saber que se lee el sector correcto (§11.72) **no dice que el dato llegue a la
+memoria del invitado**. Si el destino del DMA del ATA está mal, el parser ve basura y
+el reproductor aborta — que es exactamente el síntoma de §11.83, y sería un fallo
+nuestro.
+
+Un volcado por el monitor no sirve para comprobarlo: hecho 25 s después, la memoria
+en `0x0bee0720` contenía `mhdp`, un trozo de la base de carátulas. Los búferes se
+reutilizan en segundos, así que la lectura tardía no prueba nada — ni a favor ni en
+contra.
+
+La forma correcta es hacerlo dentro del modelo: guardar el destino de cada
+transferencia y, en la siguiente (cuando la anterior ya ha terminado), leer sus
+primeras palabras y publicarlas junto al sector del que venían. La canción empieza en
+el LBA 347224 y sus ficheros empiezan por `ff fb 90 64`, así que la comprobación es
+exacta: o aparece esa cabecera, o el dato no llega donde debe.
