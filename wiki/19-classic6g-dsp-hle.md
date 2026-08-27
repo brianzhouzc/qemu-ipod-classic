@@ -3458,3 +3458,45 @@ Con esto, las tres formulaciones anteriores quedan retiradas — "no arranca el 
 muestras" (§11.61). La pregunta que queda es estrecha y comprobable: **el SM1 levanta
 ~2 400 interrupciones y el manejador señala su evento otras tantas; ¿por qué la bomba
 de render sólo despierta ocho veces?**
+
+## 11.63 Lo que escribe el búfer de audio es un `memset` a CERO
+
+Las 127 264 escrituras de §11.62 vienen de `0x22000294` y `0x22000298`. En
+`assets/classic6g/iram.dis`:
+
+```
+2200027c: mov r2, #0                      <-- el valor de relleno es CERO
+22000280: subs r1, r1, #32
+22000288: mov lr, r2
+2200028c: mov r3, r2
+22000290: mov ip, r2
+22000294: stmiacs r0!, {r2, r3, ip, lr}   <-- 16 bytes de ceros
+22000298: stmiacs r0!, {r2, r3, ip, lr}
+2200029c: subscs r1, r1, #32
+220002a0: bcs 0x22000294
+```
+
+Es `memset(dst, 0, n)` residente en IRAM. **Nadie está copiando audio al búfer: el
+firmware lo está BORRANDO**, unas 4 000 veces por corrida, una por cada vuelta del
+DMA.
+
+Eso no es un fallo, es la ruta de **underrun** del driver de salida haciendo
+exactamente lo correcto: no hay datos que enviar, saca silencio. Y confirma desde
+otro ángulo que todo el lado de salida está sano. Verificado además en la máquina
+viva:
+
+```
+22008c5c: 0x00000000 0x00000000 0x00000000 0x00000000    (el bufer, reproduciendo)
+22010020: 0x22008c5c 0x3ca00010 0x22010020 0x84249800    (el descriptor del DMA)
+```
+
+El descriptor se apunta a sí mismo, así que el DMA relee el mismo búfer para
+siempre; `ctrl=0x84249800` decodifica como 2048 transferencias de 16 bits, origen
+incrementando, destino fijo en el FIFO, interrupción al terminar. Todo correcto.
+
+**El diagnóstico, ahora sí, con las tres piezas medidas:** el consumidor pide a
+tempo, el driver responde con silencio porque no tiene nada, y el productor
+(`dpump`, ocho veces) no produce. Y la bomba de render sólo se invoca desde el
+despachador de la cola de trabajos, que recibió ocho elementos — que es el número
+que viene arrastrándose desde el sitio de envío del firmware. La cadena entera es
+coherente; lo que falta es lo que debería repetir el envío.
