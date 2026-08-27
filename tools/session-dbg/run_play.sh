@@ -48,6 +48,19 @@ PA="$PA,pc=0x081c0fd4:credread,pc=0x081e93d8:framepull,pc=0x081c1508:fpull2"
 # branch target (TB head, so the register read is reliable): r0 = source pointer,
 # r4 = descriptor. If these differ from 0x08889098/0x0bb12d54, the memw watch
 # below has been aimed at the wrong region all along.
+# Who CALLS the frame pull, and what state does it see? lr identifies the caller;
+# 0x081e93d8 is a function entry so the register read is reliable there.
+PA="$PA,regpc=0x081e93d8:pullregs,regpc=0x081c0fd4:credregs,regcap=30"
+# Does the pull get PAST the credit gate? 0x081e93fc is the first instruction
+# after "beq exit"; 0x081e9470 is the early-exit landing. Exactly one of them
+# runs per pull, so this says whether the credit was zero.
+PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullbail,pc=0x081e9bc0:vslot15"
+# The audio-engine interrupt chain: 0x08017364 ARMS it (writes bit 2 to SM1+0xa8c),
+# 0x08017378 is the VIC line-18 handler, 0x080173cc is where it signals the event
+# 0x22008c58 that the render pump waits on. Before the context-build fix the arming
+# site was never reached (the render took the other path).
+PA="$PA,pc=0x08017364:sm1arm,pc=0x08017378:credithdlr,pc=0x080173cc:creditsig"
+PA="$PA,pc=0x080820e4:armcall,pc=0x08082020:rearly,pc=0x08081734:rfull"
 PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
 # CORRECTED WINDOW: the play-time copy reads from 0x0888a2xx-0x0888a6xx (measured
 # live), not from the boot-time 0x08889098. The earlier watch missed the real

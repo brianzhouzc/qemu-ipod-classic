@@ -310,6 +310,18 @@ static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
          *    or the handler would take its early exit and signal nothing.
          */
         val = (s->powered || s->irq_pending) ? S5L8702_SM1_STAT_READY : 0;
+        /*
+         * READ-TO-CLEAR. The line-18 handler's only interaction with the block is
+         * this status read (0x08017378 -> getter 0x080a7638 -> [base+0xa98]); it
+         * writes no acknowledge anywhere. So the read has to be the acknowledge,
+         * or the level stays asserted and the VIC re-dispatches the handler
+         * forever -- measured 1,673,711 entries in one run before this, versus
+         * the ~40/s the engine actually reports at.
+         */
+        if (s->irq_pending) {
+            s->irq_pending = false;
+            qemu_irq_lower(s->irq);
+        }
         break;
 
     case S5L8702_SM1_RUN:
