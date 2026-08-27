@@ -2480,3 +2480,59 @@ principio de una lista** (subir desde la primera entrada no hace nada, así que 
 reintento arrastra el cursor hacia abajo -- así se acabó en Calendarios en vez de en
 Canciones); y el submenú de Música empieza por **Cover Flow**, con Canciones en
 **sexta** posición, no en cuarta.
+
+## 11.35 El motor SHA-1 hasheaba la CADENA VACIA (y le faltaba media DRAM)
+
+§11.32 dejaba el nudo planteado como "la base no pasa la firma". **Eso era falso**,
+y la traza nueva `SHA1TRACE=1` lo enseña de un vistazo:
+
+```
+SHA1TRACE #1: buffered=64 bytes, trailer says 0, memory_mode=1 start=0x8ba718c0
+  head: 00 00 00 00 00 00 00 00
+  digest:da39a3ee5e6b4b0d3255bfef95601890afd80709
+```
+
+Ese digest es el SHA-1 **de la cadena vacía**. Dos fallos encadenados, los dos
+nuestros:
+
+**1) La longitud del mensaje.** El modelo viene portado del iPod Touch y deducía
+cuántos bytes hashear leyendo los últimos ocho del búfer, asumiendo que el firmware
+escribe el relleno SHA-1 con su trailer de longitud en bits. El retailOS del Classic
+**no rellena**: entrega 64 y luego 4096 bytes en modo memoria y espera que lo haga el
+hardware. Sin trailer, esos ocho bytes eran cero, la longitud salía cero, y el motor
+contestaba siempre lo mismo. Ahora la longitud sale de **cómo llegó** el mensaje: en
+modo memoria el invitado ya la dijo por `SHA_INSIZE`. (Un primer intento confió en el
+trailer "cuando pareciera una longitud" y leyó 34 de 64 bytes de datos como si lo
+fueran — estos mensajes parecen aleatorios, cualquier octeto pasa por uno.)
+
+**2) La DRAM sin caché no estaba mapeada.** Las direcciones son `0x8ba718c0` y
+`0x8ba7192c`, o sea `0x88000000 + 0x03a718c0`: la vista sin caché de `0x0ba718c0`.
+Con nada mapeado ahí, `cpu_physical_memory_read` devolvía **ceros**. El SoC expone la
+misma DRAM dos veces y el propio código ya lo daba por hecho — la nota de DMAC0 dice
+que el invitado programa el canal con el alias cacheado mientras la CPU corre sobre
+el otro. Ahora el alias existe, y el motor lee datos de verdad
+(`head: 67 23 fe 30 ...`).
+
+**3) La ventana de 1 MB se respalda en los dos casos**, con el motor superpuesto.
+Antes era uno u otro: con `SHA1_OFF` todo el megabyte era stub y con el motor
+cableado sólo sus `0x100` bytes de registros. El interruptor cambiaba mucho más que
+si los digests eran reales, y eso contamina cualquier comparación A/B.
+
+**Lo que esto REFUTA.** La firma del iTunesDB no pinta nada aquí: el motor hace
+**dos** hashes en toda la corrida, de 64 y 4096 bytes, y el contenido **no es la
+base** (cambia entre arranques y no lleva magia `mhbd`). Toda §11.31-11.32 apuntaba a
+una comprobación que no existe.
+
+**El estado real, medido:**
+
+| SHA-1 | arranque | biblioteca | reproducción |
+|---|---|---|---|
+| **activo** | **limpio**: ni `CPU_exception_handler` ni reinicio, `resets=0` | vacía | no arranca |
+| `SHA1_OFF=1` | panic + reinicio a los ~46 s | 4 canciones | arranca, 1 trama |
+
+Con el motor arreglado, **la configuración fiel (SHA-1 activo) es la que arranca
+limpia**. Pero la biblioteca sigue vacía ahí, y ya no por una firma. Comprobado que
+tampoco es lentitud: dejando el aparato quieto, las capturas a 30, 120 y **240
+segundos** son idénticas ("Ingen musik"). Lo que el firmware hace con esos dos
+digests, y por qué el resultado le deja la biblioteca vacía, es lo que queda por
+determinar.
