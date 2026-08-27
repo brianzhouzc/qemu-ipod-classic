@@ -4372,3 +4372,38 @@ el arranque y no al reproducir; en `pt1` corrió al reproducir, a los 142 segund
 entra en el conducto de audio en absoluto". En `pt1` sí se entra. Lo correcto es que
 **a veces se entra y a veces no**, y esa variabilidad entre corridas es en sí misma
 un hecho que hay que explicar antes de seguir.
+
+## 11.92 Un ancla de tiempo de reproducción, y la trampa del toque de despertar en espejo
+
+**El ancla.** Todos los sitios con nombre del mapa heredado disparan también en el
+arranque, así que ninguno sirve para abrir una ventana de traza en el momento de
+reproducir — y por eso cada intento se llenaba de ruido de boot (§11.90). Lo que sí
+es exclusivo de la reproducción es una lectura de disco **dentro del fichero de la
+canción**. Añadido al modelo del ATA (`ATALBA_LO`/`ATALBA_HI` acotan el rango en
+bytes) y medido:
+
+```
+ATASONG #1..#256  byte=177778688..  pc~0x0805a70c
+PCs distintos: 1
+```
+
+Un único PC del firmware pide todos los datos de la canción. Es código de tiempo de
+reproducción por construcción, y es el punto de entrada que faltaba para atacar
+"desde la UI hacia dentro".
+
+**La trampa, en espejo de la ya documentada.** El toque de despertar de `iremote.py`
+—necesario porque un SELECT en frío se ignora— es el par `e,q`, que neta cero en
+medio de una lista. Pero **al final de una lista `e` es no-op y `q` sube uno: neta
+−1**. Probando a reproducir por "Shuffle Songs" (la última entrada del menú), el
+toque movió el resaltado a "Settings" y la pulsación abrió los ajustes; la captura
+previa mostraba "Shuffle Songs / 4 Songs" correctamente resaltado, así que sin mirar
+las dos capturas el resultado habría pasado por "Shuffle Songs no reproduce".
+
+```
+principio de lista:  q es no-op  ->  usar e,q  (neta 0);  q,e neta +1
+final de lista:      e es no-op  ->  usar q,e  (neta 0);  e,q neta -1
+```
+
+Y una nota de navegación que sí es robusta: para llegar a la última entrada de un
+menú, bajar de sobra y dejar que la lista tope, en vez de contar posiciones. Contar
+seis desplazamientos cayó en "Settings"; topar la lista acierta siempre.

@@ -13,6 +13,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "hw/core/cpu.h"
 #include "qemu/module.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
@@ -164,6 +166,35 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
              * devuelve ceros, que se lee igual que "el dato no llega" -- un
              * falso positivo listo para colarse en una conclusion.
              */
+            /*
+             * ANCLA DE TIEMPO DE REPRODUCCION. Todos los sitios con nombre del
+             * mapa heredado disparan tambien en el arranque, asi que no sirven
+             * para abrir una ventana de traza en el momento de reproducir. Una
+             * lectura de un sector DENTRO del fichero de la cancion si es
+             * exclusiva de la reproduccion: ATALBA_LO/HI acotan ese rango (en
+             * bytes) y aqui se publica el PC del invitado que la pidio, que es
+             * codigo del reproductor y sirve de punto de entrada fiable.
+             */
+            {
+                const char *lo_s = getenv("ATALBA_LO");
+                const char *hi_s = getenv("ATALBA_HI");
+                if (lo_s && hi_s) {
+                    uint64_t byte = (uint64_t)ide_get_sector(is) * 512;
+                    uint64_t lo = strtoull(lo_s, NULL, 0);
+                    uint64_t hi = strtoull(hi_s, NULL, 0);
+                    if (byte >= lo && byte <= hi) {
+                        static uint64_t in_song;
+                        uint64_t k = ++in_song;
+                        if ((k & (k - 1)) == 0) {
+                            CPUState *cs = current_cpu;
+                            fprintf(stderr, "ATASONG #%" PRIu64 " byte=%" PRIu64
+                                    " pc~0x%08x\n", k, byte,
+                                    cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs)
+                                       : 0);
+                        }
+                    }
+                }
+            }
             prev_dst = (uint32_t)(s->dma_cur - len);
             prev_sec = ide_get_sector(is);
             int64_t sec = prev_sec;
