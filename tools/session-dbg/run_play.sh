@@ -65,7 +65,12 @@ PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
 # CORRECTED WINDOW: the play-time copy reads from 0x0888a2xx-0x0888a6xx (measured
 # live), not from the boot-time 0x08889098. The earlier watch missed the real
 # buffer entirely, which is why it only ever saw memset.
-PA="$PA,memw=0x0888a000-0x0888c000,memcap=40"
+# The decoder work-queue object (obj = [reader+4], measured 0x0ba90c50): +0x3c is
+# the producer index, +0x40 the consumer index, +0x44 the sample count handed to
+# the codec. Measured live: prod=3 cons=2 depth=1 but [obj+0x44]=0 and
+# [reader+8]=0, so the codec is invoked asking for ZERO samples. Watch who writes
+# these fields -- that is the producer that should be filling the count.
+PA="$PA,memw=0x0ba90c30-0x0ba90cb0,memcap=60"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \
@@ -74,7 +79,7 @@ setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -plugin "$PLUG,$PA" >"$OUT/qmus_$TAG.out" 2>"$OUT/qmus_$TAG.err" &
 echo "launched $TAG"
 if [ -n "$PCMPROBE" ]; then
-  ( timeout 200 gdb-multiarch -q -batch -x tools/session-dbg/pcmdump_probe.gdb \
+  ( timeout 200 gdb-multiarch -q -batch -x tools/session-dbg/${PROBE:-pcmdump_probe}.gdb \
       >"$OUT/gdb_$TAG.out" 2>"$OUT/gdb_$TAG.err" ) &
   sleep 3
 fi
