@@ -2865,3 +2865,34 @@ reloj­eados** en esa parte de la corrida. El camino de salida marcha a ritmo re
 evento y la bomba de render (`dpump`) corre **16** veces. El render mueve 9 616
 medias palabras -- unos 19 KB -- donde 100 s de audio necesitan 17,6 MB. Está al
 0,1 % del ritmo necesario mientras el DMA drena silencio a tiempo real.
+
+## 11.45 La cadena entera, con un número en cada eslabón
+
+Con la tormenta resuelta y los recuentos corregidos, la ruta completa queda medida de
+punta a punta en una sola corrida (`pc1`):
+
+| eslabón | medida | ¿sano? |
+|---|---|---|
+| I2S / DMA sacando muestras | 50 s de audio relojeados en la ventana medida | **sí, tiempo real** |
+| interrupción del motor SM1 | 2000-4000 subidas, ~1 entrada al manejador cada una | **sí** (§11.42) |
+| `creditsig` señalando el evento `0x22008c58` | **1 822** | **sí** |
+| **`dpump`, la bomba de render (`0x22006118`)** | **16** | **NO -- aquí está el corte** |
+| `posfn` (`0x081cc360`, avanza la posición) | 12, todas desde `0x081f6e94` | consecuencia |
+| `posadd` (`0x081cc404`, el incremento) | 6 | consecuencia |
+| profundidad de cola | 1 | consecuencia |
+| códec (`aacmath`) | 1 | consecuencia |
+| WAV | 18 720 muestras no nulas de 12,9 M -- clics | consecuencia |
+
+`posfn` tiene exactamente **dos** llamadores en toda la imagen, `0x081d7874` y
+`0x081f6e94`; el primero **no se ejecuta nunca** y el segundo corre 12 veces.
+
+**El corte es un factor ~114 entre `creditsig` y `dpump`.** El motor señala su evento
+1 822 veces y la bomba que espera en él arranca 16. Todo lo que viene después --
+posición, profundidad de cola, llamadas al códec, muestras -- sale de ahí por
+aritmética. Ya no hay que buscar en el códec, ni en la cola, ni en la salida: los tres
+están medidos y son consecuencia.
+
+**Dónde mirar:** qué hace `0x080a1a24` con el objeto `0x22008c58` (la señal), frente a
+qué espera exactamente la bomba en `0x22006118`. Si son objetos distintos, o si la
+semántica del evento RTXC es de "un solo disparo" que se pierde mientras el que espera
+no está bloqueado, ahí está la explicación.
