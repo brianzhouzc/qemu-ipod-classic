@@ -4444,3 +4444,30 @@ menú. No es un problema de cómo se elige la pista.
 son el código que gobierna la reproducción. Ahí hay que buscar la condición que
 decide abandonar, con la misma disciplina que ha hecho falta aquí: medir con marca de
 tiempo, tope alto y un control conocido al lado de cada sonda.
+
+## 11.94 REFUTADA la hipótesis de la cabecera Xing
+
+El fichero de la canción se lee **445 veces** para 4,7 MB, cuando con bloques de
+32-61 KB bastarían unas 118: se relee tres o cuatro veces entero. Eso no es cargarlo
+en memoria, es **reintentar**. Y una causa clásica de que un reproductor relea entero
+un MP3 es no encontrar la cabecera **Xing/Info** con la longitud del stream — que es
+justo lo que se quitó al reencodear con `-write_xing 0` en §11.59, creyendo que "sin
+ningún tag" era la configuración más limpia.
+
+Reencodeados los cuatro con `-write_xing 1` y etiquetas ID3v2.3 (como escribe
+iTunes), medido:
+
+```
+fetchok 0   fetchbail 8   copy16 8   dpump 8
+WAV: solo clics, 27 456 muestras no nulas de 16 799 744, pico 11444
+```
+
+**Idéntico.** La hipótesis queda refutada, y con ella la lectura de que el patrón de
+relectura venga de metadatos que falten en el fichero.
+
+**Aviso de método, otra vez el mismo.** La misma corrida reportó "0 lecturas dentro
+de la canción", que parece un hallazgo enorme. No lo es: al reescribir los ficheros
+cambiaron de tamaño (~500 bytes) y de sitio en el disco, así que el rango
+`ATALBA_LO/HI` —calculado con `filefrag` sobre los ficheros ANTERIORES— dejó de
+cubrirlos. **Cada vez que se tocan los ficheros hay que recalcular el rango**, o la
+sonda mide un sitio donde ya no hay nada.
