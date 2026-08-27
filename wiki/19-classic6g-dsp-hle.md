@@ -2583,3 +2583,51 @@ registro que este modelo contesta mal (el candidato natural es la posición de S
 ya dio un fallo de esta misma familia en §11.24), entonces es un fallo nuestro y se
 arregla; si lo calcula solo, hay que ver qué le hace creer que el anillo es 2,3 KB más
 grande de lo que es.
+
+## 11.37 Con el desbordamiento sobrevivible: se acaban los reinicios, el render dobla
+
+Respaldando la región por encima de IRAM1 (`IRAMSPILL=0x100000`) para que el
+desbordamiento de §11.36 no aborte, y con `SHA1_ZERO=1` para que la biblioteca cargue:
+
+| | antes | ahora |
+|---|---|---|
+| `resets` | 1 | **0** |
+| excepciones | 1 Data Abort | **ninguna salvo IRQ** |
+| `copy16` | 4 809 | **9 616** |
+| `copyent` | 258 | **456** |
+| `pcmout` | 4 | **8** |
+
+Es decir: **ese único abort era lo que cortaba la corrida**, y sin él el pipeline de
+render corre justo el doble. Eso confirma §11.36 de la otra dirección.
+
+**Pero sigue sin haber música.** El WAV de esa corrida: 17 472 muestras no nulas de
+10,8 M (0,161 %), pico 11444 -- la firma de los clics de rueda otra vez. Y
+`framepull` sigue en **1**.
+
+**Lo que eso descarta.** El "decodificador que saca una trama y se para" **no era el
+reinicio**. Sin reinicio, sin abort y con el render corriendo el doble, el códec
+sigue ejecutándose una sola vez. Son dos fallos independientes, y §11.32 los había
+juntado en uno.
+
+Queda por tanto el lado del decodificador: `credread=13` y `cred1=cred4=2` dicen que
+la ruta de crédito sí se recorre, `pullpass=1` que el tirón pasó su puerta una vez, y
+`fpull2` (`0x081c1508`) sigue en **0** -- ese segundo punto de tirón no se ejecuta
+nunca.
+
+**Y el crédito NO es cero.** Capturado el retorno de la lectura en `0x081e9bd0`, once
+veces seguidas, siempre lo mismo:
+
+```
+r0=0x00000004  r1=0x0ba95574  r2=0x2200ac64  r5=0x0ba90c98
+```
+
+Constante 4. Así que la teoría de "se queda sin crédito y espera" tampoco se sostiene:
+el bucle recibe un valor estable y aun así **no vuelve a llamar a `framepull`**. El
+`r2=0x2200ac64` es IRAM0, con pinta de objeto del kernel (semáforo o evento), y el
+valor 4 tiene más aspecto de código de retorno que de cuenta.
+
+**ESTADO al cierre de esta sesión.** Con `SHA1_ZERO=1` + `IRAMSPILL`: biblioteca
+cargada (4 canciones), reproducción iniciada, **cero reinicios**, render corriendo al
+doble... y sólo clics en el WAV. El códec se ejecuta **una vez** y el flujo se va a un
+bucle en `0x081e9bc0` del que no sale. Eso, y no el reinicio, es lo que queda entre
+este emulador y la música.
