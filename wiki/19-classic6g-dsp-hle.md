@@ -2807,3 +2807,28 @@ con la tormenta en vez de recortarla un tercio.
 sigue trayendo sólo clics (18 720 muestras no nulas, pico 11444). Quitado el ahogo,
 la cola de decodificación sigue con profundidad 1. La tormenta era una causa real de
 lentitud -- 500 veces -- pero no era la única que separa a este emulador de la música.
+
+## 11.43 Lo que queda, acotado: la cola sigue con profundidad 1
+
+Con la tormenta resuelta (§11.42) el sistema ya no está ahogado, y la pregunta se
+estrecha. Medido después del arreglo:
+
+- `credithdlr` = `creditsig` = **2 399**: cada interrupción del motor señala su evento.
+- `dpump` = **16**, `copy16` = **9 616**: el render responde y ha doblado.
+- `aacmath` = `framepull` = **1**, WAV con 18 720 muestras no nulas de 12,9 M -- clics.
+
+Y la cantidad que gobierna todo sigue igual: muestreando `0x081c08b4` a lo largo de
+la corrida (impactos 1, 8, 32 -- el getter sólo se llama unas decenas de veces),
+`pos[+0x2b4]` = **0** y `limit[+0x2b8]` = **4**, invariables. La posición sí avanza
+--medido en `0x81cc404`, de uno en uno-- pero **tres veces en toda la corrida**.
+
+**Corrección de una etiqueta.** `framepull` (`0x081e93d8`) **no** es la bomba de
+decodificación. Se le llama desde `blx r2` en `0x081ea384` --una llamada virtual-- y
+sólo cuando `byte[r4+0x1c]` **cambia de estado**. Que valga 1 es lo esperado: es una
+notificación de flanco. Perseguirlo como si fuera un bucle de decodificación fue otra
+suposición mía puesta en un nombre.
+
+**El siguiente hilo, concreto:** 2 399 señales de evento producen 16 vueltas de la
+bomba de render. Entre `creditsig` (`0x080173cc`, que señala el evento `0x22008c58`) y
+`dpump` (`0x22006118`) hay un factor 150 sin explicar. Ahí, y en qué incrementa
+realmente `[obj+0x2b4]`, está lo que falta.

@@ -24,11 +24,15 @@ break *0x081c08b4
 commands
   silent
   set $__l = $__l + 1
-  if $__l <= 10
-    printf "limit#%-2d  obj=0x%08x  pos[+0x2b4]=%d  limit[+0x2b8]=%d\n", \
+  # Sample SPARSELY and keep going. The first version stopped after ten hits, and
+  # every one of them landed in the first milliseconds of the run -- which is why
+  # it reported the position as a flat zero: it was reading before playback had
+  # started. Powers of two out to 4096 cover start-up and steady state both.
+  if $__l == 1 || $__l == 8 || $__l == 32 || $__l == 128 || $__l == 512 || $__l == 2048 || $__l == 4096
+    printf "limit#%-5d  obj=0x%08x  pos[+0x2b4]=%d  limit[+0x2b8]=%d\n", \
       $__l, $r1, *(int *)($r1 + 0x2b4), *(int *)($r1 + 0x2b8)
   end
-  if $__l >= 10
+  if $__l >= 4096
     detach
     quit
   end
