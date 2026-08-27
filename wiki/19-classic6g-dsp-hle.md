@@ -4754,3 +4754,25 @@ toca.
 `0x22008c5c` / `0x22009c5c` con PCM antes de que la rotación los encole. Ese es el
 productor ausente de §11.99, localizado ahora en una dirección concreta y con el
 código que lo consume a la vista.
+
+## 11.102 Intento fallido de capturar la base de `copy16`, y lo que sí dio
+
+Idea: en la cabeza del bucle (`0x08016efc`) `r3` contiene la base de destino
+`[r4+12]`, pero **sólo en la primera vuelta** — luego la pisa la muestra leída. Filtro
+propuesto: quedarse con las líneas de `r1` máximo (medias palabras que faltan), que
+deberían ser los arranques de copia.
+
+**No funcionó.** Con `regcap=3000` las capturas son una ventana CONTIGUA a mitad de
+ráfaga, no los arranques, así que el `r1` máximo observado fue 0xff y los `r3`
+correspondientes son muestras de audio (`0x00fffffe`, `0x0000003d`, `0x00ffef9e`),
+no direcciones. La base sigue sin medirse.
+
+Para conseguirla haría falta capturar en `0x08016edc` (que sí es destino de salto) y
+leer `[r4+12]` de memoria, cosa que `regpc` no hace: da registros, no memoria. La vía
+practicable es un breakpoint de gdb con `print` de esa palabra, o una sonda en el
+modelo que publique la memoria como ya hacen `ATASONG`/`ATALND`.
+
+**Lo que sí dio la corrida:** el rango de destinos de `copy16` va de `0x2203d502` a
+`0x2203fa5a`. Cubre `0x2203ff28`, lo que confirma por tercera vez el pisotón del
+descriptor con el envoltorio por defecto (§11.66), y confirma que la región que
+escribe el render es disjunta de los búferes que el DMA reproduce (§11.100).
