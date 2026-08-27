@@ -76,6 +76,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
 
 #define S5L8702_SM1_STAT        0xa98
 #define S5L8702_SM1_STAT_READY  (1u << 2)
+/*
+ * Bit 12 of the same status word. FOUND by following who waits on the render
+ * event 0x22008c58: the waiter at 0x0808af58 reads the status through the very
+ * same getter the line-18 handler uses (0x080a7638), then does
+ *
+ *     tst r0, #0x1000 ; beq (skip)
+ *
+ * and only when that bit is set does it run 0x080a35a0 and 0x0809a72c before
+ * waiting. The handler tests bit 2; this one tests bit 12. The model answered
+ * bit 2 alone, so this branch was never taken in any run.
+ *
+ * What bit 12 means on silicon is INFERIDO: it is reported by the same word as
+ * the frame-done bit and gates the per-frame work, so it is treated as part of
+ * the same frame-done report.
+ */
+#define S5L8702_SM1_STAT_FRAME  (1u << 12)
 
 /* Second status/counter word, getter 0x080a7638(idx1). Role UNKNOWN -> 0. */
 #define S5L8702_SM1_STAT2       0xb18

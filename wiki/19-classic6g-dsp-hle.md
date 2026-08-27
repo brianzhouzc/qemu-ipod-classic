@@ -2918,3 +2918,33 @@ Queda por tanto una sola pregunta abierta en toda la ruta: **quién espera en es
 evento y por qué arranca 16 veces cuando se le señala 1 822** (§11.45). El objeto se
 pasa por puntero, así que el que espera no se localiza con una búsqueda del literal
 `0x22008c58`; hay que seguir el manejador devuelto por `0x220037f8`.
+
+## 11.47 Quién espera en el evento -- y el bit 12, refutado
+
+Siguiendo el literal `0x22008c58` fuera de IRAM aparece el que espera, en
+`0x0808af58`:
+
+```
+808af6c:  bl 0x80a7638          lee el MISMO estado que el manejador de la IRQ
+808af74:  tst r0, #0x1000       comprueba el BIT 12
+808af78:  beq 0x808afa0         si no esta: se salta el bloque de proceso
+808af7c:  ... bl 0x80a35a0 ; bl 0x809a72c(1)      <- trabajo por trama
+808afb0:  ldr r0,=0x22008c58 ; mov r1,#500
+808afb8:  bl 0x80bf2b8          espera en el evento, timeout 500
+```
+
+Dos consumidores del mismo registro de estado con **bits distintos**: el manejador de
+la línea 18 mira el **bit 2**, este otro el **bit 12**. El modelo sólo contestaba el
+bit 2, así que ese bloque de trabajo por trama no se ejecutaba nunca.
+
+**Parecía la pieza que faltaba. Medido, no lo es.** Encendiendo el bit 12 mientras hay
+una trama pendiente: `dpump` 16 -> **14**, `aacmath` sigue en **1**. Ninguna mejora.
+Así que bit 12 significa otra cosa, y queda **apagado por defecto** -- inventar un
+estado que la pieza quizá nunca reporta es exactamente lo que no se debe hacer. Se
+conserva como interruptor (`SM1_FRAME_BIT=1`) porque el hallazgo -- que este esperador
+condiciona en el bit 12 mientras el manejador condiciona en el bit 2 -- es real y
+conviene poder volver a probarlo.
+
+También queda visto que la espera lleva **timeout 500**, así que no es un bloqueo
+eterno: el que espera se despierta solo aunque nadie señale. Eso descarta que el corte
+sea un deadlock en ese punto.

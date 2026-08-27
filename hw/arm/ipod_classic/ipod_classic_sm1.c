@@ -367,6 +367,22 @@ static uint64_t ipod_classic_sm1_read(void *opaque, hwaddr offset,
          */
         val = (s->powered || was_pending) ? S5L8702_SM1_STAT_READY : 0;
         /*
+         * SM1_FRAME_BIT=1 also reports bit 12 while a frame report is pending.
+         *
+         * The waiter on the render event (0x0808af58) reads this same word and
+         * does `tst r0,#0x1000` before doing its per-frame work, so with only
+         * bit 2 answered that branch is never taken -- which looked like the
+         * missing piece. MEASURED, it is not: with the bit set, dpump went 16 ->
+         * 14 and aacmath stayed at 1. So bit 12 means something else, and it is
+         * left OFF by default rather than inventing a status the part may never
+         * report. Kept as a switch because the finding -- that this waiter gates
+         * on bit 12 while the interrupt handler gates on bit 2 -- is real and
+         * worth being able to re-test.
+         */
+        if (was_pending && getenv("SM1_FRAME_BIT")) {
+            val |= S5L8702_SM1_STAT_FRAME;
+        }
+        /*
          * The acknowledge itself happens at the top of this function, for ANY
          * offset -- see the note there for why narrowing it to this register was
          * measured insufficient. `was_pending` is the pre-clear state, so a
