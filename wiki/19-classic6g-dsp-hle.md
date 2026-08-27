@@ -3875,3 +3875,32 @@ forzar nada: entrada correcta, salida correcta, estructuras de control en IRAM1
 vacías porque quien las llena no existe, y silencio perfectamente ordenado. La medida
 que lo confirma o lo tumba —cuánto tráfico recibe ese bloque, y si se le vuelca
 código— está corriendo con `-d unimp`.
+
+## 11.74 REFUTADO el DSP: el firmware no toca el ADM ni una vez
+
+Corrida con `-d unimp`, que registra cada acceso a un bloque sin implementar:
+
+```
+reparto por bloque, toda la corrida (274 accesos en total):
+    226  s5l8702.gpio
+     42  s5l8702.eic
+      2  s5l8702.miu
+      2  s5l8702.lcd-win
+      2  s5l8702.lcd
+  lineas del adm: 0
+```
+
+**Cero.** Ni `s5l8702.adm` ni `s5l8702.adm-sfr` reciben un solo acceso, ni en el
+arranque ni durante la reproducción. La hipótesis de §11.73 queda refutada, y con
+ella la idea —que venía arrastrándose desde wiki/14— de que retailOS decodifica en el
+CalmADM2E. **En estas corridas el DSP no participa en nada.**
+
+Con eso, la decodificación tiene que ser en CPU, y lo medido dice que no ocurre:
+`framepull` una vez, `pullpass` una vez. Y el resto del sistema está sano: entrada
+(el fichero entero en memoria, §11.73), salida (18 500 búferes entregados, §11.58) y
+la cadena de despertar (2 646 señales, §11.64).
+
+Van catorce hipótesis refutadas con medida en esta investigación. Las dos últimas
+—formato del fichero (§11.59) y DSP (aquí)— eran de las más plausibles, y ninguna se
+sostuvo. Lo que queda por responder es estrecho: **quién debería llamar al pull de
+tramas más de una vez, y qué se lo impide.**
