@@ -8,12 +8,13 @@
 #  - The retailOS clickwheel DROPS roughly five of every seven SELECT presses
 #    (documented in iremote.py), so every SELECT here uses the retrying form.
 #    A single press looks exactly like a dead button.
-#  - SHA1_OFF=1 USED to be needed: once the SHA-1 engine was modelled, the firmware
-#    could finally verify the iTunesDB signature -- and rejected it. That was not a
-#    fidelity bug, it was a correct rejection. The image's database carried an
-#    all-zero hash58 because iPod_Control/Device/SysInfo declared
-#    FirewireGuid: 0000000000000000. tools/ipod-library/ fixes the GUID from the
-#    device's own SysCfg and re-signs, so the accelerator should now stay ON.
+#  - THE iTunesDB SIGNATURE THEORY IS DEAD. It looked as though wiring the SHA-1
+#    engine let the firmware verify the database and reject it, and a whole round
+#    of work went into signing. Measured with SHA1TRACE=1, the engine performs only
+#    TWO hashes in a run, of 64 and 4096 bytes, and that content is not the
+#    database. What actually governs whether the library is accepted is the DIGEST
+#    VALUE: with SHA1_ZERO=1 (engine present, digest answering zero) the library
+#    loads and playback starts. Why remains UNDETERMINED.
 #
 # Measures: the native render counters plus the I2S WAV, so "did music come out"
 # is answered by RMS rather than by looking at the screen.
@@ -68,7 +69,7 @@ PA="$PA,regpc=0x081e93d8:pullregs,regpc=0x081c0fd4:credregs,regcap=30"
 # Does the pull get PAST the credit gate? 0x081e93fc is the first instruction
 # after "beq exit"; 0x081e9470 is the early-exit landing. Exactly one of them
 # runs per pull, so this says whether the credit was zero.
-PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullbail,pc=0x081e9bc0:vslot15"
+PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullret,pc=0x081e9bc0:vslot15"
 # The audio-engine interrupt chain: 0x08017364 ARMS it (writes bit 2 to SM1+0xa8c),
 # 0x08017378 is the VIC line-18 handler, 0x080173cc is where it signals the event
 # 0x22008c58 that the render pump waits on. Before the context-build fix the arming
@@ -76,8 +77,7 @@ PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullbail,pc=0x081e9bc0:vslot15"
 PA="$PA,pc=0x08017364:sm1arm,pc=0x08017378:credithdlr,pc=0x080173cc:creditsig"
 PA="$PA,pc=0x080820e4:armcall,pc=0x08082020:rearly,pc=0x08081734:rfull"
 PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
-# The output path is NOT the missing piece, and the measurements that suggested it
-# was were reading the wrong signal. Established since:
+# The output path is NOT the missing piece. Established:
 #  - The audio DMA runs continuously: DMAC0 ch1 src=0x22008c5c dst=0x3ca00010 (the
 #    I2S TX FIFO), a single self-referencing LLI at 0x22010020, 4KB per pass,
 #    16-bit, source-incrementing. It feeds the FIFO for the whole run.
@@ -87,9 +87,16 @@ PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
 #    is what contributes silence.
 #  - The "non-zero source samples" at 0x0888a678 (007fffff 006ba27e 005a827a ...)
 #    are that click's decaying envelope, not a decoded song.
-# The real blocker was upstream and is addressed by tools/ipod-library/: an unsigned
-# iTunesDB, so there was no track to decode and the codec was correctly asked for
-# zero samples.
+# What IS left, located: framepull (0x081e93d8) passes both its gates, and the loop
+# at 0x081e9460 runs the codec once per unit of queue depth -- "while [obj2+0x40] !=
+# r6", r6 starting at [obj2+0x3c] and counting down. Measured prod=3 cons=2, so depth
+# 1, so exactly one codec call, which is why aacmath=1. The count handed to the codec
+# is min([obj2+0x44], [r4+8]) and both measured ZERO. So the question is who fills
+# the producer index and that count -- not anything downstream.
+#
+# NOTE: 0x081e9470 is the function EPILOGUE (pop {..,pc}), not an early-exit branch.
+# It was labelled "pullbail" here, which made three ordinary returns look like three
+# abandonments.
 
 # Per-run additions without editing this file: PCTRACE_EXTRA="range=...,trig=..."
 PA="$PA${PCTRACE_EXTRA:+,$PCTRACE_EXTRA}"

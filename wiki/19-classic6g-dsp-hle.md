@@ -2696,3 +2696,35 @@ emparejados 3 y 3.
 
 Esa asimetría -- una ruta de navegación tira más veces que otra, y todas abandonan --
 es la pista concreta que queda: `0x081e9470` es la salida que hay que seguir.
+
+## 11.40 La cola SÍ se alimenta -- y la ventana que lo negaba estaba mal puesta
+
+§11.39 dejó `framepull` pasando sus dos puertas y el bucle de `0x081e9460`
+ejecutando el códec una vez por unidad de profundidad de cola. Y una nota de método
+que costó una medida entera.
+
+**El error.** `credread` se llamaba con `0x0ba90c98`, y lo leí como `obj+0x48` de un
+objeto en `0x0ba90c50`. Falso: `0x0ba90c98` **es** el objeto (`[r4+4]`). Vigilando
+`0x0ba90c88-0x0ba90c98` sólo aparecieron **ocho** escrituras, todas en el arranque,
+desde PCs con `bic #0xC0000003`, división de bloques y contadores de estadísticas --
+es decir, **cabeceras del asignador de memoria**, no una cola de audio. La conclusión
+"el productor no encola nunca" era un artefacto de mirar 0x40 bytes más abajo de lo
+que tocaba.
+
+**Con la ventana correcta** (`0x0ba90cd0-0x0ba90ce0`, o sea `obj+0x38..obj+0x48`) la
+cola está viva durante toda la reproducción:
+
+```
+0x081c0940 / 0x081c0944  ->  +0x38 / +0x3c   (lado productor)  -- repetidamente
+0x081e9f48 / 0x081e9f50  ->  +0x40 / +0x44   (tras el codec)
+0x081e9f68 / 0x081e9f88  ->  +0x40 / +0x44   (otra ruta, mas tarde)
+```
+
+Con marcas a 65,32 s, 65,33 s, 80,76 s, 80,84 s... El productor corre, el consumidor
+actualiza, y aun así no sale música.
+
+**Lección de método, la tercera de esta clase.** Una ventana de vigilancia mal puesta
+no da error: da CERO, y el cero parece un hallazgo. Ya pasó con
+`0x22040000-0x22040800` (§11.36), donde el silencio hizo concluir que el abort era de
+lectura cuando el puntero ya iba por `0x2204221x`. Antes de creerse un "nadie escribe
+aquí", hay que confirmar la dirección base con una lectura independiente.

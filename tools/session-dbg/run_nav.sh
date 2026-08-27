@@ -55,7 +55,7 @@ PA="nodefault=on,always=on,cap=8,window=300000,out=$LOG"
 PA="$PA,pc=0x08150d84:StartPlayback,pc=0x22006118:dpump,pc=0x22006304:rendret"
 PA="$PA,pc=0x0809a74c:mixer,pc=0x08016f08:copy16,pc=0x0816bf48:pcmout"
 PA="$PA,pc=0x081e9e70:aacmath,pc=0x081e93d8:framepull"
-PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullbail"
+PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullret"
 PA="$PA${PCTRACE_EXTRA:+,$PCTRACE_EXTRA}"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
