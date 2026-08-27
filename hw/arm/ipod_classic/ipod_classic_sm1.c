@@ -290,6 +290,25 @@ static bool sm1_trace_on(void)
     return sm1trace == 1;
 }
 
+/*
+ * SM1HI=1: report writes ABOVE the modelled 4 KB register page.
+ *
+ * Its own variable on purpose. The question -- does the firmware put anything
+ * in the other 1020 KB of this block's window? -- needs a handful of lines,
+ * while SM1TRACE prints one line per register access and produced a log big
+ * enough to take the whole WSL filesystem down with it. Cheap when unset.
+ */
+static int sm1hi = -1;
+
+static bool sm1_hi_on(void)
+{
+    if (sm1hi < 0) {
+        const char *e = getenv("SM1HI");
+        sm1hi = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return sm1hi == 1;
+}
+
 static uint32_t sm1_trace_pc(void)
 {
     CPUState *cs = current_cpu;
@@ -499,7 +518,7 @@ static void ipod_classic_sm1_write(void *opaque, hwaddr offset,
          * is off. Doubling schedule so a bulk upload is loud and a stray write
          * stays quiet.
          */
-        if (sm1_trace_on()) {
+        if (sm1_hi_on()) {
             static uint64_t hi_writes;
             static hwaddr hi_lo = (hwaddr)-1, hi_hi;
             uint64_t n = ++hi_writes;
