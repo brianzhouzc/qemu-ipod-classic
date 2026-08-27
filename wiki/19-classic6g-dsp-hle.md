@@ -3215,3 +3215,49 @@ girando cuarenta veces por segundo durante la reproducción y no gira**. Todas l
 fuentes de reloj del hardware están descartadas por medida (§11.51, §11.53), así que
 lo que falta es del lado del software: una tarea, o una cadena de tareas, que no se
 está replanificando.
+
+## 11.56 La cadena, completa desde el WAV hasta el firmware
+
+Trazada de abajo arriba, con un número medido en cada eslabón y el llamador capturado
+en vivo donde el desensamblado no bastaba (varias llamadas son por puntero):
+
+```
+0x081fef28   sitio de envio en el firmware          3 veces (+1 arranque 0x081febe4)
+     |       r0=0x0bae8ad8  r2=0x7fffffff
+0x081d0944   arma el mensaje (marco de 372 bytes)   4 veces
+     |       bl 0x8015b18 -> veneer a IRAM
+0x22005674   postea a la cola                       4 veces
+     |       bl 0x22005d04 desde 0x22005918
+0x22006574   encolador                              8 veces
+     |       count++ en 0x22008c1c, senal a 0x220106d0
+0x22008c1c   cola de trabajos                       8 items
+     |
+0x22002fe0   despachador  while(count>0){...count--}
+     |
+0x22006118   bomba de render                        8 vueltas
+     |
+0x0808af58   espera del evento 0x22008c58           8 llamadas, 8 EXITOS
+     |
+[obj+0x2b4]=0 [obj+0x2b8]=4                         profundidad de cola 1
+     |
+0x081e9e70   codec                                  1 vez
+     |
+WAV                                                 solo clics
+```
+
+**Todo eslabón por debajo del envío es correcto y consistente**: la aritmética cuadra
+en cada paso (4 envios -> 8 items -> 8 vueltas -> profundidad 1 -> 1 llamada al
+codec), y las fuentes de reloj del hardware están descartadas una por una por medida
+(§11.51 temporizador, §11.53 DMA, §11.42 motor SM1, §11.50 ritmado I2S).
+
+**El fallo está en la cima: `0x081fef28` envía tres trabajos en toda la corrida** donde
+un reproductor necesita unos cuarenta por segundo. `r2 = 0x7fffffff` en cada llamada
+tiene pinta de "sin límite/sin plazo". El siguiente paso es entender qué gobierna ese
+sitio -- qué condición o qué evento debería hacerlo repetir -- y ahí ya se está en
+código de reproductor, no de plumbing del kernel.
+
+**Nota sobre `IRAMSPILL`.** Todas estas medidas se tomaron con esa ayuda puesta, que
+respalda memoria por encima de IRAM1 para que el desbordamiento de `copy16` (§11.36) no
+aborte. **No es un arreglo** y no debe quedarse: sin ella la corrida se corta a los
+~46 s y no se puede medir nada de esto. El desbordamiento sigue siendo un fallo abierto
+por derecho propio.
