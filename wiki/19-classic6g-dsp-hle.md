@@ -2078,3 +2078,90 @@ distintos, y sobrevivieron catorce asaltos porque nadie verificó la **identidad
 los objetos: bastaba decodificar una cadena. Antes de construir sobre un clúster,
 conviene confirmar a qué hilo/clase pertenece (nombre de hilo en la creación,
 cadenas vecinas, vtable).
+
+### 11.28 Segundo fallo de fidelidad: el estado de sub-bloque de SM1 era un latch pegajoso — y el render ya construye su contexto
+
+Continuación directa de §11.26. Encontrado por **auditoría del modelo contra el
+firmware que lo consume** (la misma técnica que dio §11.26), y confirmado por medida
+antes y después del cambio.
+
+**A) El fallo.** `sub+0x14` (leído por `0x080b8470`, enmascarado `&7`) lo modelábamos
+como *"7 para siempre en cuanto se escriba cualquier comando"*. Es una **máquina de
+estados**, y dos sitios del firmware lo leen esperando valores **opuestos**:
+
+- **El power-up `0x080ba768` quiere 7.** Escribe cmd 4, sondea hasta diez veces
+  esperando 7, escribe cmd 16 (run) y **finalmente escribe cmd 96 (stop)**.
+- **El render `0x0808170c` quiere 0:**
+
+```
+80820e8:  ldrb r0,[r7,#1]
+80820f0:  bl   0x80b8470      ; estado del sub-bloque 4
+80820f4:  cmp  r0, #0
+80820f8:  bne  0x80821a8      ; distinto de 0 → SALTA el build
+```
+
+El bloque que se salta, `0x08082100`–`0x080821a0`, es la **construcción del contexto
+del motor**: copia de buffer, alta de descriptor (`0x080b67a8`), encadenado
+(`0x080bfa58`) y traducción de direcciones (`0x08075d80`).
+
+Como el último comando que escribe el power-up es 96 (stop), en silicio el estado
+vuelve a 0 y el render construye su contexto. Nuestro latch respondía 7 para siempre,
+así que **el contexto no se construía nunca**.
+
+**B) Medido, antes del cambio:** `statetest=1, ctxbuild=0, ctxskip=1` — el render lee
+el estado y se salta su propio build. Es exactamente el *"paso de construcción de
+contexto que falta"* que §11.25 predijo, y explica por qué cada capa forzada aguas
+abajo revelaba que la de abajo tampoco estaba construida.
+
+**C) El arreglo.** 7 mientras el último comando sea 4 (power up) o 16 (run); 0 tras
+el 96 (stop) o si nunca se comandó. Constantes `S5L8702_SM1_SUB_CMD_UP/RUN/STOP`.
+
+**D) Medido, después (corrida con reproducción confirmada, `StartPlayback=1`):**
+
+| contador | baseline 14 asaltos | §11.26 | + §11.28 |
+|---|---|---|---|
+| `ctxbuild` (`0x08082100`) | 0 | 0 | **2** |
+| `rendret` (`0x22006304`) | 0 | 2 | **2** |
+| `engine` (`0x0808170c`) | 1 | 3 | **3** |
+| `copyent` (`0x08016e44`) | 1 | 144 | **144** |
+| `copy16` (`0x08016f08`, PCM real) | 0 | 2405 | **2405** |
+
+**E) El destino del render, ya correcto.** Con ambos arreglos, el destino medido del
+copy es **`0x22026400`** — dentro de IRAM1 (`0x22020000`–`0x22040000`). Antes de
+§11.26 era `0x222fbc00`, 2,6 MB fuera de la RAM. El pipeline nativo escribe **donde
+debe**, con offsets que envuelven en el anillo.
+
+**F) Lo que queda, aislado con precisión.** El anillo fuente del mixer,
+`0x08889098`, recibe **sólo `memset`**: watch de memoria sobre
+`0x08889000-0x0888a000` da **2048 escrituras desde exactamente 2 PCs**, ambos rutinas
+de memset en IRAM (`0x22000198`, `0x220001a0`). **Nadie escribe PCM decodificado
+ahí.** Por eso el render nativo, que ya funciona, copia silencio: el WAV capturado
+(91 s) sólo contiene los clics de UI (ráfagas idénticas de 1248 muestras, pico
+constante 11444).
+
+**G) Pistas para el asalto siguiente.** Los nombres reales de los componentes de
+audio, extraídos de la imagen:
+
+| VA | nombre |
+|---|---|
+| `0x07ffb148` | `MeCCADecode` (hilo del motor, en el blob de IRAM) |
+| `0x0816c130` | `MeCCA_PCM_Output` |
+| `0x081840ec` | `MeCCA_MediaPlayer` |
+| `0x0818d5d4` | `MeCCA_VideoBufferMgr` |
+| `0x0818d7dc` | `MeCCAVideoDecode` |
+| `0x081c4460` | `MeCCAIOTask` |
+| `0x08388c5c` | `MeCCARecordingTask` |
+| `0x08859824` | `MeCCA_StreamCache` |
+
+Y un regalo: la función **`0x0816bf48`** contiene un **volcado de diagnóstico que el
+propio firmware trae** — escribe su PCM a `"MeCCA_PCM_Output.wav"` (`0x0816c080`
+carga el nombre; el flag y el presupuesto de bytes viven en la struct `0x08948f24`,
+byte 0 = habilitado, +4 = bytes restantes; escribe `r6` con `r4*4` bytes vía
+`0x08121a00`). Esa función **recibe el PCM producido**, así que es el punto exacto
+donde nace el audio del retailOS — y activando su flag el firmware se auto-volcaría
+el audio, sin instrumentación nuestra.
+
+**Higiene:** ambos arreglos son por defecto y sólo afectan al camino de audio del
+retailOS (Rockbox no lee SM1). Sondas nuevas en `run_pump.sh`
+(`statetest`/`ctxbuild`/`ctxskip`/`pcmout`/`copy16`) y guarda de puerto para que las
+corridas repetidas dejen de colisionar en silencio.

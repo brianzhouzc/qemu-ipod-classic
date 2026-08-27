@@ -29,6 +29,13 @@ BIN=$ROOT/build/qmus_$TAG
 pkill -9 -f "qmus_$TAG" 2>/dev/null; sleep 1
 cp "$ROOT/build/qemu-system-arm" "$BIN"
 
+# Repeated runs kept colliding on the monitor port and silently producing no
+# log, so wait for the monitor port to actually be free before launching.
+for _ in $(seq 1 30); do
+  ss -ltn 2>/dev/null | grep -q ":4455 " || break
+  sleep 2
+done
+
 # CLEAN baseline: only AUDIOPACE, exactly like run_icount.sh off.
 export AUDIOPACE=1
 for kv in "$@"; do export "$kv"; done
@@ -49,6 +56,10 @@ PA="$PA,pc=0x081e9e70:aacmath,pc=0x08016e88:gatechk,pc=0x08016e94:copygo"
 # The REACHABLE store: from the live call site the 32-bit path is structurally
 # unreachable ([r4]!=0 always diverts at 0x08016e84), so real PCM goes through
 # the halfword path 0x08016edc gated by [descr+21]==1, storing at 0x08016f08.
+# The real PCM OUTPUT path: 0x0816bf48 contains the firmware's own debug dump
+# to "MeCCA_PCM_Output.wav" (flag struct at 0x08948f24), writing r6/r4*4 bytes --
+# so this function RECEIVES the produced PCM.
+PA="$PA,pc=0x0816bf48:pcmout,pc=0x0816c05c:pcmdump,pc=0x0816bed0:pcmhelper"
 PA="$PA,pc=0x08016edc:hwpath,pc=0x08016ee8:hwgo,pc=0x08016f08:copy16,pc=0x08016f10:hwret"
 # The two sibling threads of MeCCADecode that nobody has ever studied.
 PA="$PA,pc=0x22004630:framedone,pc=0x22004754:endofstream,pc=0x08123cfc:decswitch"
