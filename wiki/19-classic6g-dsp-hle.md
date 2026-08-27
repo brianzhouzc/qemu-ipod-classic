@@ -2631,3 +2631,39 @@ cargada (4 canciones), reproducción iniciada, **cero reinicios**, render corrie
 doble... y sólo clics en el WAV. El códec se ejecuta **una vez** y el flujo se va a un
 bucle en `0x081e9bc0` del que no sale. Eso, y no el reinicio, es lo que queda entre
 este emulador y la música.
+
+## 11.38 El getter de 0x081e9bc0 NO es el atasco (refutado con la sonda)
+
+Leyendo el desensamblado, `0x081e9bc0` resultó no ser un bucle sino un **getter** con
+tres salidas distinguibles:
+
+```
+81e9bc0: bl 0x81c0fd4        credito -- mide 4, asi que NO es esta la salida
+81e9bd8: ldr r1,[[r4]+0x48]  ranura virtual
+81e9be4: blx r1              -> r5 = siguiente bufer
+81e9bfc: ldrb r0,[r4,#0x30]
+81e9c00: cmp r0,#3
+81e9c04: beq 0x81e9c34       -> DEVUELVE NULL
+81e9c08: cmp r5,#0
+81e9c0c: beq 0x81e9bf0       -> bufer NULL: bombea 0x81e96d0 y reintenta
+```
+
+Y `0x81e96d0` es un despachador sobre ese mismo byte `[obj+0x30]`: estados 0, 1 y 2
+hacen trabajo (`0x81e92cc`, `0x81e9580`, `0x81ea394`); con **3 no hace nada y vuelve**.
+De ahí la hipótesis natural: el objeto llega a estado 3 ("terminado") tras una trama y
+por eso no hay segunda.
+
+**Medido en `0x081e9bfc`, es falso.** El estado **avanza**:
+
+```
+slot#1  r5=0x0ba7564c  state=0        slot#5  r5=0x0ba7564c  state=1
+slot#2  r5=0x0ba7564c  state=0        slot#6  r5=0x0ba7564c  state=1
+slot#3  r5=0x0ba7564c  state=0        slot#7  r5=0x00000000  state=2  (reintenta)
+slot#4  r5=0x00000000  state=1  (reintenta)   slot#8  r5=0x0ba7564c  state=2
+```
+
+0 -> 1 -> 2, con búferes reales, y los NULL son justo las transiciones donde el
+bombeo hace su trabajo. Es la **secuencia de arranque funcionando**, no un atasco.
+Nunca llega a 3 en la ventana medida.
+
+Así que el "el códec corre una vez" no está aquí. Sigue sin localizarse.
