@@ -4273,3 +4273,37 @@ Con la entrada verificada y la salida verificada, no queda ningun subsistema al 
 culpar: **la decision de abortar es del propio reproductor**. La proxima sesion tiene
 que entrar por ahi, desde la UI hacia dentro, y no por el DMA hacia fuera como se ha
 hecho todas las veces.
+
+## 11.88 CORRECCIÓN a §11.78/§11.82: "cero código en DRAM" no se sigue del muestreo
+
+El muestreo por el monitor toma unas **16 muestras por segundo**. Si el trabajo que
+hace el aparato al abrir una pista dura decenas de milisegundos de tiempo de
+invitado, la esperanza matemática de capturarlo es **menos de una muestra**. Que no
+aparezca DRAM en 400 muestras no prueba que no se ejecute código de aplicación: sólo
+prueba que la CPU está ociosa **la mayor parte del tiempo**, que es lo normal en un
+aparato guiado por eventos.
+
+Lo que §11.78 y §11.82 sí sostienen: la CPU pasa el ~88-89 % del tiempo en el WFI del
+lazo ocioso, y no hay una ráfaga de trabajo sostenida donde debería haberla (un MP3 a
+128 kbps ocupa una fracción apreciable y continua de un ARM de esta clase). Lo que no
+sostienen, y queda retirado, es la frase "no se ejecuta código de aplicación en
+absoluto".
+
+Para responder eso hace falta **trazar**, no muestrear.
+
+## 11.89 `StartPlayback` es otra etiqueta equivocada
+
+```
+pbin (0x08150d84):  2 entradas, a +22us y +16,19 s      <-- nunca al pulsar reproducir
+pbfail (0x08151028): 0     pbgo (0x08150e00): 2
+```
+
+La función tiene una salida de fallo explícita —suelta el objeto con la misma rutina
+del prólogo y devuelve 0— y **no la toma**. Pero es que tampoco corre cuando se
+reproduce: sus dos entradas son a los 22 microsegundos y a los 16 segundos.
+
+Con esto van cuatro nombres del mapa heredado que no son lo que dicen: `aacmath` (que
+es un despacho de notificaciones, §11.61), `pullbail` (que es el epílogo), la cadena
+`pull`/notificador/petición (que es código de arranque, §11.77) y ahora
+`StartPlayback`. **El mapa de direcciones heredado hay que tratarlo como sospechoso
+hasta que cada nombre se vuelva a comprobar con una medida.**
