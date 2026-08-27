@@ -2667,3 +2667,32 @@ bombeo hace su trabajo. Es la **secuencia de arranque funcionando**, no un atasc
 Nunca llega a 3 en la ventana medida.
 
 Así que el "el códec corre una vez" no está aquí. Sigue sin localizarse.
+
+## 11.39 Prueba de navegación completa, con la biblioteca cargada
+
+`run_nav.sh` con `SM1_IRQ=1 SHA1_ZERO=1 IRAMSPILL=0x100000`, pulsaciones verificadas
+en cada paso (§11.34):
+
+| paso | resultado |
+|---|---|
+| selector de idioma | superado |
+| menú principal | correcto |
+| entrar en Música | correcto |
+| bajar a Canciones (6ª entrada) | correcto |
+| **lista de canciones** | **Greatest Hits / Michael Jackson: Billie Jean 4:55, Beat It 4:58, Thriller 13:41, Smooth Criminal 9:25** |
+| seleccionar canción | entra en la animación de Reproduciendo |
+| +8 s / +48 s | **se queda en la portada**, no llega a la vista con barra de progreso |
+
+Contadores: `StartPlayback=1`, `framepull=3`, `pullpass=3`, **`pullbail=3`**,
+`copy16=4808`, `resets=0`.
+
+**Dos cosas que esto establece.** La primera: la biblioteca, los títulos, el artista,
+el álbum y **las duraciones** son correctos en pantalla, así que
+`tools/ipod-library/patch_tracks.py` hace su trabajo y el iTunesDB se lee bien. La
+segunda: entrando por Canciones el tirón de trama corre **tres** veces en vez de una
+(por Aleatorio corría una), pero **las tres salen por `pullbail`** (`0x081e9470`), la
+rama de abandono. Antes `pullbail` no se distinguía de `pullpass`; aquí van
+emparejados 3 y 3.
+
+Esa asimetría -- una ruta de navegación tira más veces que otra, y todas abandonan --
+es la pista concreta que queda: `0x081e9470` es la salida que hay que seguir.
