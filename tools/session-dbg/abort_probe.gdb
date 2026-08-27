@@ -25,6 +25,22 @@ commands
   printf "  r8=%08x r9=%08x r10=%08x r11=%08x\n", $r8, $r9, $r10, $r11
   printf "  r12=%08x sp=%08x cpsr=%08x\n", $r12, $sp, $cpsr
   x/3i $lr - 8
+  # The copy is descriptor-driven: r4 held 0x0bb12d54 and r5 0x0888ba74 when it
+  # faulted. Dump both, because the destination base and the length the loop was
+  # given are in there, and the base plus that length is what has to be compared
+  # against the top of IRAM1 (0x22040000) to see who got the ring size wrong.
+  printf "  descriptor at r4=0x%08x:\n", $r4
+  set $i = 0
+  while $i < 16
+    printf "    +0x%02x = %08x\n", $i*4, *(unsigned int *)($r4 + $i*4)
+    set $i = $i + 1
+  end
+  printf "  object at r5=0x%08x:\n", $r5
+  set $i = 0
+  while $i < 12
+    printf "    +0x%02x = %08x\n", $i*4, *(unsigned int *)($r5 + $i*4)
+    set $i = $i + 1
+  end
   if $__a >= 2
     detach
     quit
