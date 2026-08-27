@@ -3684,3 +3684,40 @@ La medida que hace falta es la que está corriendo: capturar `r2` (destino) y `r
 (base) en la cabeza del bucle `0x08016efc`, que es destino de salto y por tanto da
 lecturas de registro fiables. Con eso se sabe el rango real que barre la copia y si
 el envoltorio lo gobierna, en vez de deducirlo.
+
+## 11.68 El pisotón era consecuencia, no causa: NADIE escribe la palabra de estado
+
+Con `SM1_POS=16384` (anillo de 64 KB desde 0x22020000):
+
+```
+destinos de copy16 observados   0x2203cef4 .. 0x2203d65a    (medidos, no deducidos)
+pisotones al descriptor         0                            <-- eliminados
+fetchok                         0                            <-- IGUAL que antes
+WAV                             solo clics, pico 11444
+```
+
+Quitar el pisotón **no arregla nada**. Y como `copy16` era el ÚNICO escritor de
+`0x2203ff28` (§11.66), ahora no queda ninguno: en toda la corrida, arranque incluido,
+**nadie escribe esa palabra de estado**. Estaba a cero desde el principio; `copy16`
+la pisaba *además*, pero no era la causa del cero.
+
+Queda retirada la explicación de §11.66. Lo que sobrevive de aquella sección es el
+hecho medido —`copy16` escribía allí— y una mejora real: con el anillo corregido el
+render deja de corromper la zona de control y el data abort de §11.36 desaparece.
+Eso arregla un fallo, pero no el silencio.
+
+**Lo que esto deja establecido, que es lo importante:** el bloque de control del
+audio en lo alto de IRAM1 **nunca se inicializa**. El puntero que lo registra sí está
+puesto (`[0x0896a684+4] = 0x2203ff28`), luego alguien montó la estructura y algo
+debería llenarla. Las dos posibilidades:
+
+- **(a)** código del firmware que no llega a ejecutarse, gateado por algo que el
+  modelo contesta mal — sería un fallo nuestro, indirecto;
+- **(b)** el bloque lo escribe el propio motor SM1 por DMA, y nuestro modelo no
+  escribe nada en memoria — sería un hueco nuestro, directo.
+
+(b) encaja con la forma de la estructura: una palabra de bits "hay hueco listo", un
+índice de sub-bloque y una tabla de ranuras en `0x22038000` con longitud y paso. Es
+exactamente lo que un motor de audio reporta a la CPU. Distinguirlas es la medida que
+está corriendo: vigilar quién escribe el global que registra el bloque nombra al
+código de montaje.
