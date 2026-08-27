@@ -8,9 +8,12 @@
 #  - The retailOS clickwheel DROPS roughly five of every seven SELECT presses
 #    (documented in iremote.py), so every SELECT here uses the retrying form.
 #    A single press looks exactly like a dead button.
-#  - SHA1_OFF=1 keeps the library readable (the engine, once modelled, rejects the
-#    image's iTunesDB hash) at the cost of the ~46 s panic-reset coming back, so
-#    this has to reach playback quickly.
+#  - SHA1_OFF=1 USED to be needed: once the SHA-1 engine was modelled, the firmware
+#    could finally verify the iTunesDB signature -- and rejected it. That was not a
+#    fidelity bug, it was a correct rejection. The image's database carried an
+#    all-zero hash58 because iPod_Control/Device/SysInfo declared
+#    FirewireGuid: 0000000000000000. tools/ipod-library/ fixes the GUID from the
+#    device's own SysCfg and re-signs, so the accelerator should now stay ON.
 #
 # Measures: the native render counters plus the I2S WAV, so "did music come out"
 # is answered by RMS rather than by looking at the screen.
@@ -29,6 +32,17 @@ WAV=$HOME/6g/$TAG.wav; rm -f "$WAV"
 PLUG=$ROOT/build/contrib/plugins/libpctrace.so
 BIN=$ROOT/build/qmus_$TAG
 cp "$ROOT/build/qemu-system-arm" "$BIN"
+# Kill any emulator left over from an earlier run FIRST. This matters more than
+# it looks: the binary is launched as build/qmus_$TAG, not "qemu-system-arm", so
+# the obvious "pkill -x qemu-system-arm" never matched it. Stale instances kept
+# holding :4455, which meant iremote.py drove -- and screenshotted -- the OLD
+# machine while the new one silently produced no log and no WAV.
+#
+# The pattern is "build/qmus[_]", not "qmus[_]": the bracket stops it matching
+# the pkill's own command line, and the path prefix stops it matching a CALLER's
+# command line. A caller that merely mentions ~/6g/remote/qmus_TAG.err was being
+# killed by its own launch script, which looks exactly like the emulator dying.
+pkill -9 -f 'build/qmus[_]' 2>/dev/null
 for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":4455 " || break; sleep 2; done
 
 export AUDIOPACE=1 AUDIOWAV="$WAV"
@@ -62,24 +76,23 @@ PA="$PA,pc=0x081e93fc:pullpass,pc=0x081e9470:pullbail,pc=0x081e9bc0:vslot15"
 PA="$PA,pc=0x08017364:sm1arm,pc=0x08017378:credithdlr,pc=0x080173cc:creditsig"
 PA="$PA,pc=0x080820e4:armcall,pc=0x08082020:rearly,pc=0x08081734:rfull"
 PA="$PA,regpc=0x08016edc:srcregs,regcap=30"
-# CORRECTED WINDOW: the play-time copy reads from 0x0888a2xx-0x0888a6xx (measured
-# live), not from the boot-time 0x08889098. The earlier watch missed the real
-# buffer entirely, which is why it only ever saw memset.
-# The decoder work-queue object (obj = [reader+4], measured 0x0ba90c50): +0x3c is
-# the producer index, +0x40 the consumer index, +0x44 the sample count handed to
-# the codec. Measured live: prod=3 cons=2 depth=1 but [obj+0x44]=0 and
-# [reader+8]=0, so the codec is invoked asking for ZERO samples. Watch who writes
-# these fields -- that is the producer that should be filling the count.
-# Does the guest READ THE AUDIO FILE during playback? If StreamCache/MeCCAIOTask
-# never pull compressed data off the disk, the decoder has no input and every
-# downstream measurement is moot. Watch the ATA register window (0x38700000).
-# Watch the REAL play-time mixer source ring while the codec count is forced
-# non-zero. If decoded PCM lands here, the count was the last missing piece.
-# The DECODER OUTPUT buffers, from the live reader dump at the codec entry:
-# [reader+0x0c]=0x0ba77e70 [reader+0x10]=0x0ba77e74 [reader+0x14]=0x0ba77ef0.
-# The mixer reads a different region entirely (0x0888axxx), so if PCM lands here
-# the decoder works and only the hand-off to the mixer is missing.
-PA="$PA,memw=0x0ba77e00-0x0ba78200,memcap=40"
+# The output path is NOT the missing piece, and the measurements that suggested it
+# was were reading the wrong signal. Established since:
+#  - The audio DMA runs continuously: DMAC0 ch1 src=0x22008c5c dst=0x3ca00010 (the
+#    I2S TX FIFO), a single self-referencing LLI at 0x22010020, 4KB per pass,
+#    16-bit, source-incrementing. It feeds the FIFO for the whole run.
+#  - Every WAV so far held ~15k non-zero samples out of ~9M, peak 11444, always a
+#    multiple of 1248: that is the clickwheel click, not music. So mixer -> render
+#    -> IRAM0 -> DMA -> FIFO -> WAV is proven working end to end; the music stream
+#    is what contributes silence.
+#  - The "non-zero source samples" at 0x0888a678 (007fffff 006ba27e 005a827a ...)
+#    are that click's decaying envelope, not a decoded song.
+# The real blocker was upstream and is addressed by tools/ipod-library/: an unsigned
+# iTunesDB, so there was no track to decode and the codec was correctly asked for
+# zero samples.
+
+# Per-run additions without editing this file: PCTRACE_EXTRA="range=...,trig=..."
+PA="$PA${PCTRACE_EXTRA:+,$PCTRACE_EXTRA}"
 
 setsid "$BIN" -M iPod-Classic -kernel "$OSOS" \
   -drive "if=ide,format=raw,file=$IMG,file.locking=off" -snapshot \

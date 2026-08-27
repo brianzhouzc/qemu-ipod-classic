@@ -55,11 +55,35 @@
 #include "qemu/module.h"
 #include "hw/i2c/i2c.h"
 #include "migration/vmstate.h"
+#include "sysemu/rtc.h"
 #include "hw/arm/ipod_classic/ipod_classic_pmu.h"
+
+/*
+ * PMUBATT=N overrides the raw battery reading, 0..1023.
+ *
+ * Why this needs to be reachable: on the way into a song retailOS puts up its
+ * "low battery -- connect to power" screen and refuses to play, which is a
+ * plausible reason for playback to start and immediately stop. The default 844
+ * is 3900 mV only through ROCKBOX's conversion; what Apple's power manager makes
+ * of the same number is UNDETERMINED, so the honest thing is to be able to vary
+ * it and see, rather than to assume the two firmwares scale it alike.
+ */
+static uint32_t pmu_battery_raw(void)
+{
+    const char *e = getenv("PMUBATT");
+    if (e && *e) {
+        unsigned long v = strtoul(e, NULL, 0);
+        if (v > 1023) {
+            v = 1023;
+        }
+        return (uint32_t)v;
+    }
+    return S5L8702_PMU_ADC_BATTERY_RAW;
+}
 
 static void pmu_start_adc(IPodClassicPMUState *s)
 {
-    uint32_t raw = S5L8702_PMU_ADC_BATTERY_RAW;
+    uint32_t raw = pmu_battery_raw();
 
     s->reg[PCF5063X_REG_ADCS1] = (raw >> 2) & 0xff;
     s->reg[PCF5063X_REG_ADCS2] = 0;
@@ -109,8 +133,62 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
          */
         val = PCF5063X_MBCS1_HEALTHY;
         break;
+    case PCF5063X_REG_RTCSC:
+    case PCF5063X_REG_RTCSC + 1:
+    case PCF5063X_REG_RTCSC + 2:
+    case PCF5063X_REG_RTCSC + 3:
+    case PCF5063X_REG_RTCSC + 4:
+    case PCF5063X_REG_RTCSC + 5:
+    case PCF5063X_REG_RTCSC + 6:
+        /*
+         * THE CLOCK RUNS. Measured (PMUTRACE=1): the firmware re-reads this
+         * whole block, 0x59..0x5f, over and over, and a plain register file
+         * answers zero every time -- a real part's seconds field cannot stay
+         * still. That is visible on screen too: the Clock and Calendar screens
+         * show a fixed nonsense date.
+         *
+         * PCF506xx keeps these fields in BCD, and the block is
+         * second, minute, hour, weekday, day, month, year (year is 00..99).
+         * qemu_get_timedate is the same source hw/rtc/pl031.c uses, so -rtc on
+         * the command line works here as it does everywhere else in QEMU.
+         */
+        {
+            struct tm tm;
+            unsigned v;
+
+            qemu_get_timedate(&tm, 0);
+            switch (addr - PCF5063X_REG_RTCSC) {
+            case 0: v = tm.tm_sec;          break;
+            case 1: v = tm.tm_min;          break;
+            case 2: v = tm.tm_hour;         break;
+            case 3: v = tm.tm_wday;         break;
+            case 4: v = tm.tm_mday;         break;
+            case 5: v = tm.tm_mon + 1;      break;
+            default: v = tm.tm_year % 100;  break;
+            }
+            val = (uint8_t)(((v / 10) << 4) | (v % 10));
+        }
+        break;
     default:
         break;
+    }
+
+    /*
+     * PMUTRACE=1: which registers does Apple's power manager actually consult?
+     *
+     * Needed because raising the battery ADC to full scale (PMUBATT=1023) did
+     * NOT stop retailOS putting up "low battery -- connect to power", so the
+     * verdict is not coming from the channel this model answers with. Only the
+     * PMU and the CS42L55 sit on I2C here, so it has to be some other register
+     * of this part. Counting each address, and printing the first few reads of
+     * each, says which ones without burying the firmware's own semihosting
+     * output on the same stream.
+     */
+    if (getenv("PMUTRACE")) {
+        static uint32_t seen[256];
+        if (seen[addr]++ < 3) {
+            fprintf(stderr, "PMUTRACE: read reg 0x%02x -> 0x%02x\n", addr, val);
+        }
     }
 
     return val;

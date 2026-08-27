@@ -2320,3 +2320,163 @@ anillo del mixer hay un eslabón que no produce muestras, y ya no es ninguno de 
 sospechosos habituales. El siguiente paso natural es seguir la entrada del
 decodificador —qué objeto alimenta `[obj+0x3c]` y de dónde saca los bytes
 comprimidos— en vez de seguir empujando desde la salida.
+
+
+## 11.31 La firma del iTunesDB: hipótesis levantada y REFUTADA por control
+
+Vale la pena dejarla escrita porque era plausible, encajaba con varias medidas, y el
+experimento de control la tumbó limpiamente.
+
+**La hipótesis.** `run_play.sh` arrastraba desde §11.28 la nota de que hacía falta
+`SHA1_OFF=1` "porque el motor, una vez modelado, rechaza el hash del iTunesDB de la
+imagen". Sumado a que la base del disco venía **sin firmar**:
+
+```
+hashing_scheme @0x32 = 0
+hash58        @0x58 = 0000...0000        <- 20 bytes a cero
+```
+
+y a que `iPod_Control/Device/SysInfo` declaraba `FirewireGuid: 0000000000000000`,
+la lectura natural era: el Classic 6G valida la firma hash58 derivada del FireWire
+GUID, sin GUID no hay firma, sin firma retailOS descarta la biblioteca — y eso era
+el "no hay canciones" y, aguas abajo, el `count = 0` del códec.
+
+**El GUID "real" que se dedujo.** Está en el bloque SysCfg al inicio de
+`assets/classic6g/bootflash_nor_1MB.bin`, en entradas de 20 bytes (tag de 4 + 16 de
+datos) con los tags almacenados al revés:
+
+```
+0x18 'SrNm' -> "8L745SDZYMV"
+0x2c 'FwId' -> 01000000 | 17 8b 11 13 00 27 0a 00 | 00000000
+0x40 'HwId' -> 85160282     0x58 'HwVr' -> 0x13 (19), el mismo que exige 0x0827a188
+0xa0 'Mod#' -> MB147
+```
+
+Los 8 bytes de `FwId` en little-endian dan **000A270013118B17**, y `00:0A:27` es el
+OUI de Apple para FireWire. Se escribió eso en `SysInfo` y libgpod firmó
+(`hash58 = 116dcb48...`).
+
+**El resultado: peor.** Con la base firmada, el reproductor pasó a decir **"0
+skladeb"** (0 canciones) — y también con `SHA1_OFF=1`, o sea que el SHA-1 no tenía
+nada que ver.
+
+**El control que lo zanja.** Se guardó copia intacta antes de tocar nada, y se
+arrancó con ella:
+
+| imagen | iTunesDB | GUID en SysInfo | canciones en pantalla |
+|---|---|---|---|
+| original | **sin firmar** | ceros | **4 skladeb** ✓ |
+| reconstruida | firmada, GUID de la NOR | 000A270013118B17 | 0 ✗ |
+
+La imagen original **siempre leyó su biblioteca bien**. La firma no era el problema:
+el problema lo introduje yo al reescribir la base. Y de paso queda refutado que la
+NOR ausente importe aquí — el firmware no lee SysCfg (no hay ni una cadena `SCfg` ni
+`FwId` en el osos, ni bloque SysCfg en todo el disco).
+
+**Refutado también, de camino:** que el firmware no pudiera leer la FAT por el
+tamaño de sector. La partición está en unidades de 4096 B (22696 x 4096 cae exacto
+en el superbloque FAT32) mientras el núcleo IDE de QEMU es de 512 B, lo que hacía
+sospechar que el firmware buscaría el sistema de ficheros en el sitio equivocado.
+Pero lee 4 canciones de esa FAT, así que lo encuentra.
+
+**Lo que sí queda establecido de §11.30, con la lectura corregida:**
+
+- **El camino de salida funciona de punta a punta.** DMAC0 ch1 mueve `0x22008c5c` ->
+  `0x3ca00010` (FIFO del I2S) con un LLI de un solo nodo que se apunta a sí mismo en
+  `0x22010020`, 4 KB por vuelta, 16 bits, fuente incremental, sin parar.
+- **Y ya sale audio real por él**: todas las capturas traen ~15 000 muestras no nulas
+  de ~9 M, pico 11444, siempre en múltiplos de 1248 — son los **clics de la rueda**.
+  Mixer -> render -> IRAM0 -> DMA -> FIFO -> WAV está probado.
+- **Las "muestras no nulas" del anillo del mixer** (`007fffff 006ba27e 005a827a
+  004c1bf8`) son la envolvente decreciente de ese clic, no una canción.
+
+**EL FALLO REAL, medido en la imagen que sí tiene biblioteca** (corrida `ctl1`):
+
+```
+StartPlayback=1  framepull=1  pullpass=1  pullbail=1  aacmath=1
+copyent=201  copy16=3607  mixer=7  dpump=7  rendret=3
+```
+
+La reproducción **arranca**, el tirón de trama **pasa** el gate de crédito una vez, el
+códec corre **una vez**... y ahí se acaba. **Es un decodificador que saca una sola
+trama y se detiene**, no una biblioteca ilegible ni una salida rota.
+
+## 11.32 El nudo real: la biblioteca y el SHA-1 son excluyentes
+
+Cuatro corridas con la misma imagen y una sola variable cambiada dejan el estado sin
+ambigüedad:
+
+| corrida | SHA-1 | iTunesDB | biblioteca en pantalla | reproducción | reinicios |
+|---|---|---|---|---|---|
+| `ctl1` | OFF | original | **4 skladeb** | arranca | - |
+| `mj4`  | OFF | parcheada en sitio | **4 skladeb** | `StartPlayback=2` | 1 |
+| `mj3`  | **ON** | parcheada en sitio | 0 canciones | no arranca | 0 |
+| `sig1` | **ON** | reescrita y firmada | 0 skladeb | no arranca | 0 |
+
+**Con el SHA-1 conectado el firmware rechaza la base; con el SHA-1 apagado la acepta
+pero vuelve el panic de ~46 s.** La corrida `rtc1` lo enseña de golpe: empieza a
+entrar en Música y a los pocos segundos está de vuelta en el selector de idioma.
+
+Eso reinterpreta §11.31 en un punto importante: **la nota original de `run_play.sh`
+tenía razón**. El acelerador SHA-1, una vez modelado, hace que el firmware pueda
+verificar la firma del iTunesDB -- y la de esta imagen no pasa. No es un fallo del
+acelerador: es una comprobación que antes no podía ni ejecutarse.
+
+Y reinterpreta también el "decodificador que saca una trama y se para": las corridas
+donde se veía eso llevaban `SHA1_OFF=1`, es decir, **el aparato se estaba
+reiniciando**. `framepull=1` puede ser sencillamente lo que le dio tiempo a hacer
+antes del reset, no un atasco del códec.
+
+**Lo que NO funcionó para firmar** (medido, no supuesto):
+
+- Reescribir la base con libgpod la rompe aunque el SHA-1 esté apagado: la original
+  tiene OCHO secciones `mhsd` (tipos 1, 3, 2, 4, 8, 6, 10 y 5) y libgpod 0.8.3 no
+  las conserva todas. `mj1` -> "Pas de musique", y poner el hash a ceros tampoco lo
+  arregla (`nh1` -> "Keine Musik"). Por eso `tools/ipod-library/patch_tracks.py`
+  edita en sitio y no reescribe nada.
+- Firmar con el GUID de la NOR (`000A270013118B17`) tampoco basta, y de hecho el
+  firmware **no lee SysCfg**: no hay ni una cadena `SCfg` ni `FwId` en el osos, ni
+  bloque SysCfg en todo el disco, ni región NOR mapeada en la máquina.
+
+**El camino que queda es medir la firma, no adivinarla.** El SHA-1 está modelado, así
+que el propio motor ve qué bytes le da el firmware a digerir y qué digest saca; con
+eso y el punto donde compara se puede construir una firma que pase, sin tocar el
+firmware.
+
+## 11.33 Dos fallos de fidelidad encontrados de camino
+
+**El RTC no corría.** Con `PMUTRACE=1` se ve al firmware releer en bucle el bloque
+`0x59..0x5f` del PMU -- segundos, minutos, hora, día de la semana, día, mes, año --
+y el modelo respondía **cero a todo**. Un segundero real no se queda quieto, y en
+pantalla se notaba: Reloj y Calendario mostraban una fecha fija absurda. Ahora esos
+registros se sirven en BCD desde `qemu_get_timedate()`, la misma fuente que usa
+`hw/rtc/pl031.c`, así que `-rtc` funciona aquí como en el resto de QEMU.
+
+**La pantalla de batería baja.** retailOS levanta "Batería baja -- Conecte la
+alimentación" al entrar a reproducir, y eso por sí solo bloquea el audio. Queda
+medido que **no viene del canal de ADC que este modelo contesta**: con `PMUBATT=1023`
+(fondo de escala) la pantalla sale igual. `PMUBATT` queda como variable de entorno
+justamente para poder seguir descartando; el origen del veredicto sigue SIN
+DETERMINAR, aunque tras arreglar el RTC no volvió a aparecer en `rtc1`.
+
+## 11.34 El arnés de pruebas mentía, y por qué
+
+Dos fallos del propio instrumental invalidaron medidas y conviene no repetirlos.
+
+**Instancias zombis.** El emulador se lanza como `build/qmus_$TAG`, no como
+`qemu-system-arm`, así que el `pkill -x qemu-system-arm` de rigor **nunca mataba
+nada**. Las instancias viejas seguían escuchando en `:4455`, y entonces
+`iremote.py` conducía y fotografiaba **la máquina anterior** mientras la nueva no
+producía ni log ni WAV. Corregido en `run_play.sh` y `run_nav.sh` con
+`pkill -9 -f 'build/qmus[_]'` -- con el corchete para no matarse a sí mismo y con el
+prefijo de ruta para no matar al script que lo invoca.
+
+**Capturas prematuras.** La captura del menú se tomaba mientras la base todavía
+estaba cargando, así que la misma imagen intacta daba "4 skladeb" en una corrida y
+"Zádná" en otra. Cualquier conteo en pantalla sólo vale tras dejar cargar.
+
+Y de la navegación, dos cosas medidas: el par de despertar `q,e` **no suma cero al
+principio de una lista** (subir desde la primera entrada no hace nada, así que cada
+reintento arrastra el cursor hacia abajo -- así se acabó en Calendarios en vez de en
+Canciones); y el submenú de Música empieza por **Cover Flow**, con Canciones en
+**sexta** posición, no en cuarta.
