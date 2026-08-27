@@ -3087,3 +3087,34 @@ Eso sugiere que la tarea se está despertando **cuando algo del interfaz la toca
 sobre un reloj de audio propio. Comprobarlo es la siguiente medida: una corrida que
 llegue a reproducir y luego no toque ninguna tecla, y ver si las ráfagas siguen
 apareciendo o se detienen.
+
+## 11.52 CONFIRMADO: la tarea de audio no tiene reloj propio
+
+La sospecha de §11.50 -- que las ráfagas coincidían con las pulsaciones del arnés --
+se comprueba directamente con `run_quiet.sh`: llegar a reproducir y después **no
+emitir ni un solo mensaje por el monitor** durante dos minutos (ni siquiera una
+captura, que es un viaje de ida y vuelta al monitor).
+
+```
+                        con actividad de interfaz   tras 120 s SIN TOCAR NADA
+dpump                            16                            8
+copy16                        9 616                        4 808
+aacmath                           1                            1
+```
+
+**Dos minutos de silencio no producen ni una activación más.** La bomba de render no
+se auto-reloja: cada vez que corre es porque algo del interfaz la ha despertado. En un
+reproductor de verdad esa tarea tiene que girar unas cuarenta veces por segundo con el
+aparato quieto en el bolsillo.
+
+**Lo que esto significa.** El audio no está esperando datos, ni crédito, ni una
+interrupción del motor -- todo eso está medido y sano (§11.45, §11.42). Está esperando
+**un despertar que sólo llega como efecto colateral de la actividad de interfaz**. El
+reloj propio que debería tener la reproducción no existe en esta emulación, o no llega
+a esa tarea.
+
+**Por dónde seguir, con lo que ya se sabe:** el despachador es `0x22002ff8` y le pasa
+`0x22006118` en r1 con el objeto `0x220106dc` en r0. Hay que ver qué cola o
+temporizador del RTXC alimenta a ese despachador, y por qué sólo se mueve cuando el
+invitado atiende la rueda o el LCD. El temporizador del sistema NO es (§11.51: tick de
+1 kHz exacto), así que el candidato es el propio mecanismo de encolado de tareas.
