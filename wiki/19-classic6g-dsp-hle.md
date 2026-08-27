@@ -3983,3 +3983,30 @@ muchas veces que se llame. La medida en curso cuenta las llamadas durante la
 reproducción y por cuál de las dos salidas se van; `r0` en la entrada da además la
 dirección exacta del byte, con lo que el siguiente paso —quién lo escribe— es un
 watch de una línea.
+
+## 11.77 Tres niveles seguidos corren SÓLO en el arranque: se estaba trazando el conducto equivocado
+
+```
+0x081c1794 (peticion)    3 llamadas, a los 15,0 / 16,0 / 17,6 ms
+0x081ea2c0 (notificador) 6 llamadas, todas por debajo de 17 s
+0x081e93d8 (pull)        1 llamada,  a los 16,9 ms
+durante la reproduccion (130-190 s): CERO en los tres
+```
+
+La puerta de `[objeto+0x70]` de §11.76 tampoco es la culpable: `reqgated` y `reqgo`
+salen ambos a 3, que es el paso natural por la etiqueta, no un rechazo.
+
+Tres niveles consecutivos que sólo se ejecutan en el arranque no son tres fallos: son
+la señal de que **esta cadena no es la ruta de reproducción**. Las direcciones vienen
+de sesiones anteriores que las midieron en condiciones de arranque —y buena parte de
+aquellas medidas se tomaron además sin `SM1_IRQ=1`, es decir con la cadena de
+despertar muerta (§11.64)—, así que describen el cebado inicial, no lo que ocurre al
+pulsar reproducir.
+
+Conviene decirlo sin adornos: una parte del mapa heredado apunta al sitio equivocado,
+y seguir subiendo por llamadores dentro de él sólo produce más niveles dormidos.
+
+**Cambio de método.** En vez de suponer qué código corre, medirlo: muestrear el PC
+por el monitor mientras suena la canción y hacer un histograma. Eso dice, sin
+hipótesis previas, qué está ejecutando el aparato durante los 60 segundos en los que
+debería estar decodificando, y en qué región vive ese código (IRAM0, IRAM1 o DRAM).
