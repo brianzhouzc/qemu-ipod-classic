@@ -3821,3 +3821,28 @@ decodificado que entregar— en vez de una guarda rota. En esa lectura el fallo 
 en quién escribe la palabra de estado sino en que el decodificador nunca produce, y
 `fetchbail` es síntoma, no causa. `framepull` y `pullpass` valen 1 en estas corridas,
 lo cual encaja.
+
+## 11.72 El fichero SÍ se lee del disco
+
+`ATATRACE` sólo imprimía offsets de registro, así que en toda la investigación nunca
+se pudo ver **qué sectores** se leen. Añadido `ATALBA` (=1 escala logarítmica, =2
+todas las lecturas con marca de tiempo virtual), que usa el `ide_get_sector()` que ya
+estaba a mano en `prepare_buf`.
+
+La primera canción de la lista (Billie Jean) es
+`iPod_Control/Music/F47/libgpod282598.mp3`, y `filefrag` la sitúa en un extent único,
+bloques 20707..21862 de 4 KB. Con el offset de partición (92962816) eso son los bytes
+absolutos **177 778 688 .. 182 513 664**. Y entre las lecturas medidas:
+
+```
+ATALBA rd #512  lba=348368  (byte 178 364 416)   <-- DENTRO de ese rango
+total leido en la corrida: 36 756 KB
+```
+
+**El firmware lee el fichero.** Eso descarta la lectura más simple de §11.71 —"el
+decodificador nunca produce porque nunca le dan nada"— al menos en su forma fuerte:
+los bytes del MP3 llegan del disco.
+
+Queda por separar *cuándo*: si el bloque se lee de golpe al abrir la pista o en goteo
+mientras suena. Es lo que mide `ATALBA=2`, cuyo resultado se cruza con el rango de la
+canción y con el reloj virtual.

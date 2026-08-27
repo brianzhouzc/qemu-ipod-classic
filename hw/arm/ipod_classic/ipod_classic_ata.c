@@ -122,6 +122,41 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
         s->reg[S5L8702_ATA_XFR_CNT / 4] += len;
 
         /*
+         * ATALBA=1: which disk bytes are actually read, and how many.
+         *
+         * The audio investigation reached a point where the decoder appears
+         * never to produce, and "produces nothing" and "is never given
+         * anything" look identical from downstream. This answers that
+         * directly: during playback the guest should be pulling the song off
+         * the disk in a steady trickle. If reads stop once the database is
+         * loaded, the input side is what is broken and nothing further down
+         * matters. ATATRACE only ever printed register offsets, so this could
+         * not be seen before. Doubling schedule plus a running total.
+         */
+        if (getenv("ATALBA") &&
+            !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
+            static uint64_t rd_ops, rd_bytes;
+            int64_t sec = ide_get_sector(is);
+            uint64_t n = ++rd_ops;
+            /*
+             * ATALBA=2 logs EVERY read with a virtual timestamp. The doubling
+             * schedule answers "is the disk being read at all"; it cannot
+             * answer "is the song being read WHILE it plays", which is the
+             * question that separates a starved decoder from a broken one.
+             */
+            bool all = getenv("ATALBA")[0] == '2';
+
+            rd_bytes += len;
+            if (all || (n & (n - 1)) == 0 || n % 2000 == 0) {
+                fprintf(stderr, "ATALBA +%09" PRId64 "us rd #%" PRIu64
+                        " lba=%" PRId64 " (byte %" PRId64 ") len=%u  total=%"
+                        PRIu64 " KB\n",
+                        qemu_clock_get_us(QEMU_CLOCK_VIRTUAL), n, sec,
+                        sec * 512, (unsigned)len, rd_bytes / 1024);
+            }
+        }
+
+        /*
          * DATA-PATH HLE track identification: tell the audio shim which disk
          * bytes the guest is reading, so it can tell which audio file is being
          * streamed and decode that same song host-side. Reads only; a no-op
