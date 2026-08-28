@@ -5473,3 +5473,45 @@ de DMA de IRAM0, que hace el driver de salida y que está condicionado al byte d
 valiendo 1.
 
 **Ese último salto es todo lo que queda. La música no sale del reproductor nativo.**
+
+## 11.116 Dónde queda la cadena, y el único hueco que resta
+
+Con `SM1_SLOTS` + `SM1_DECODE`, medido durante la reproducción:
+
+| eslabón | estado |
+|---|---|
+| byte de "audio disponible" (0x0bb169dc) | se pone a **1 y se queda en 1** -> el driver de salida rellena |
+| repartidor `0x081db4c8` | entrega búfer, **300/300 con éxito** |
+| bomba de render | **1699 activaciones**, ~26/s |
+| índice de ranura | rota 0..6 módulo el contador publicado |
+| copia origen -> ranura | se hace, 4096 bytes por vuelta |
+| **contenido** | **ceros, en origen y en ranura** |
+
+Es decir: **toda la cadena funciona y transporta silencio.**
+
+Y el hueco queda acotado a un punto: los dos búferes de salida del códec,
+`0x08a873c0` y `0x08a8b3c0`, los rellena el propio firmware con un `memcpy`
+(0x22000198, 284 escrituras medidas) y lo que copia son ceros. Tanto, que
+**sobrescribe incluso el PCM que `SM1_DECODE` deja ahí** -- comprobado: con la
+variable activa, el búfer sigue leyéndose a cero en las peticiones 40 y 120.
+
+Así que el descodificador real está aguas arriba de ese `memcpy`, y produce silencio.
+Localizarlo con un breakpoint es inviable: `0x22000198` es el `memcpy` del runtime, se
+ejecuta constantemente, y tres pasadas se perdieron porque congela la interfaz y la
+pulsación de reproducir no llega. Con `sendex=` del plugin (filtro por registro, sin
+parar la máquina) otras dos pasadas se perdieron por lo mismo: con `SM1_DECODE` +
+decodificación real la máquina va tan cargada que el arnés no consigue pulsar. **Eso
+es un límite del arnés, no un resultado**, y conviene anotarlo antes de que alguien
+lo lea como "no hay copia".
+
+### Balance de la sesión
+
+- **`SM1_SLOTS`** es un avance real y atribuido con control: bomba de render 8 -> 1343
+  (~20/s, la cadencia exacta de ranura a 44100 Hz) y el reproductor deja de abortar a
+  los 5-18 s -- sigue abierto a los 38, con capturas.
+- **`SM1_DECODE`** pone el PCM en el sitio correcto y medido, pero el firmware lo pisa;
+  y su aparente ganancia de audio (28.75%) la desmintió `SM1_FEED_OFF` (-> 0.18%).
+- Cinco intentos de arreglo: uno en pie, cuatro retirados o desmentidos por sus
+  propios controles.
+
+**La música no sale del reproductor nativo.**
