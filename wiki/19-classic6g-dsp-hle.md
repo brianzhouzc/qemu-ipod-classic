@@ -5515,3 +5515,54 @@ lo lea como "no hay copia".
   propios controles.
 
 **La música no sale del reproductor nativo.**
+
+## 11.117 SALE MÚSICA por el camino del propio reproductor
+
+La dirección de la copia estaba al revés en mi lectura, y eso era todo. El llamante de
+la entrega del búfer es `lr=0x220064f4` -- **la propia bomba**:
+
+```
+22006488: ldrne r0,[sp,#52]   ; destino = el bufer del codec que acaba de adquirir
+2200648c: ldrne r1,[sp,#28]   ; origen  = la ranura de IRAM1
+22006494: blne 0x22000020     ; ranura -> bufer del codec
+220064f0: bl  0x081db520      ; y lo entrega  (lr = 0x220064f4)
+```
+
+Los búferes del códec son la **salida** de la bomba, no su entrada. El audio tiene que
+estar ya en la **ranura de IRAM1** -- que es lo que "lista" significaba desde el
+principio (§11.112). Rellenar los búferes del códec (§11.115) era escribir en el
+extremo lejano de la copia, donde la bomba lo sobrescribía acto seguido con la ranura
+vacía: por eso seguían leyéndose a cero.
+
+`SM1_DECODE` ahora rellena la ranura. Y con `SM1_FEED_OFF=1`, que apaga el atajo del
+anfitrión y deja el camino del invitado como **única ruta posible** del PCM al
+altavoz:
+
+```
+relleno en el bufer del codec   0.181% no nulas   pico 11444
+relleno en la RANURA            5.676% no nulas   pico 32768   (repetido: 5.632%)
+                                                  tramos 19-20 con musica continua
+```
+
+Mismos indicadores, misma navegación, lo único que cambia es el destino del PCM.
+**La música sale por: motor -> ranura IRAM1 -> bomba de render -> búfer del códec ->
+driver de salida -> DMA -> I2S. Todo eso es el firmware de retailOS.**
+
+Es el mismo sitio al que apuntaba el primer intento, y midió peor entonces por tres
+razones desde corregidas: el ritmo de liberación estaba desviado por 2, la posición
+venía del cursor del anfitrión en vez del I2S, y se apagaba el atajo sin que la bomba
+estuviera viva para sustituirlo.
+
+### Por qué empieza tarde
+
+La música aparece en el último ~10% de la captura porque el descodificador tarda en
+tener PCM: el registro dice `decoded track 3 -> 52187136 PCM bytes (295.8 s)`, y hasta
+que eso termina `have_pcm()` es falso y la ranura se rellena con nada. No es un fallo
+del camino: es latencia de arranque del códec emulado.
+
+### El arnés, arreglado de paso
+
+`press` verifica cada intento comparando capturas, y con esta configuración la máquina
+va tan cargada que la captura falla y la pulsación se pierde -- **cinco pasadas
+perdidas así**. `seq ret:120` envía la tecla sin captura y no depende de la carga; la
+entrada se confirma con el contador `StartPlayback`, no con una imagen.

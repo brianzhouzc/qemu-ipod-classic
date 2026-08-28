@@ -318,11 +318,31 @@ static bool sm1_decode_on(void)
     return on == 1;
 }
 
-static void sm1_fill_codec_buffer(void)
+/*
+ * THE DATA FLOWS THE OTHER WAY -- corrected, and it matters.
+ *
+ * The pump ACQUIRES a codec buffer and copies INTO it:
+ *
+ *     22006488: ldrne r0,[sp,#52]   ; dst = the codec buffer it just acquired
+ *     2200648c: ldrne r1,[sp,#28]   ; src = the IRAM1 slot
+ *     22006494: blne 0x22000020     ; slot -> codec buffer
+ *     220064f0: bl  0x081db520      ; then hands the codec buffer on (lr=0x220064f4)
+ *
+ * So the codec buffers are the pump's OUTPUT, not its input, and the audio has
+ * to already be in the IRAM1 SLOT -- which is what "ready" meant all along.
+ * Filling the codec buffers (the previous cut) was writing to the far end of
+ * the copy, where the pump promptly overwrote it with the empty slot; that is
+ * why they still read as zeros with SM1_DECODE on.
+ *
+ * This is the same place the very first attempt wrote to, and it measured worse
+ * then for three reasons since fixed: the slot-freeing rate was out by 2, the
+ * position came from the host cursor instead of the I2S, and it switched the
+ * host feed off. None of those is true now.
+ */
+static void sm1_fill_slot(unsigned i)
 {
-    static unsigned which;
     static size_t cursor;
-    uint8_t buf[SM1_CODEC_BUF_BYTES];
+    uint8_t buf[SM1_SLOT_BYTES];
     size_t n;
 
     if (!sm1_decode_on() || !ipod_classic_hle_audio_have_pcm()) {
@@ -352,15 +372,11 @@ static void sm1_fill_codec_buffer(void)
         memset(buf + n, 0, sizeof(buf) - n);
     }
     /*
-     * One buffer per frame report, alternating in the same order the dispenser
-     * does, so consecutive requests get consecutive audio. If the two ever fall
-     * out of step the result is a repeated or skipped chunk -- audible as a
-     * glitch, not as silence, which is exactly the distinction this is meant to
-     * make visible.
+     * One slot per frame report, in the same ring order the firmware reads
+     * them, so consecutive requests get consecutive audio.
      */
-    cpu_physical_memory_write((which & 1) ? SM1_CODEC_BUF_B : SM1_CODEC_BUF_A,
+    cpu_physical_memory_write(SM1_SLOT_PCM + i * SM1_SLOT_BYTES,
                               buf, sizeof(buf));
-    which++;
     cursor += n;
 }
 
@@ -454,8 +470,8 @@ static int sm1_publish_slots(IPodClassicSM1State *s)
              * lacks is the transport, not the idea.
              */
 
-            /* The engine's real output: PCM into the buffer the guest reads. */
-            sm1_fill_codec_buffer();
+            /* The engine's real output: PCM into the slot the pump reads from. */
+            sm1_fill_slot(i);
 
             h = cpu_to_le16(1);
             cpu_physical_memory_write(SM1_SLOT_ARRAY + 10 + i * 4, &h, 2);
