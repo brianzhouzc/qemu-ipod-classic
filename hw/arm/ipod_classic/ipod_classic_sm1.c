@@ -239,8 +239,11 @@ static void sm1_irq_off(void *opaque)
  */
 #define SM1_SLOT_DESC        0x2203ff28   /* [table+4]  engine descriptor  */
 #define SM1_SLOT_ARRAY       0x22038000   /* [table+12] per-slot state     */
+#define SM1_SLOT_PCM         0x22038100   /* [table+16] the PCM ring       */
 #define SM1_SLOT_FRAMES      2048         /* frames per slot (DMA burst)   */
 #define SM1_SLOT_COUNT       7            /* 7 * 4096 = 28 KiB below 0x…ff00 */
+#define SM1_SLOT_BYTES       (SM1_SLOT_FRAMES * 2)   /* = the firmware's own
+                                          * derivation: size = samples * 2 */
 
 static bool sm1_slots_on(void)
 {
@@ -257,12 +260,13 @@ static bool sm1_slots_on(void)
     return on == 1;
 }
 
-static void sm1_publish_slots(IPodClassicSM1State *s)
+static int sm1_publish_slots(IPodClassicSM1State *s)
 {
     uint16_t h;
+    int freed_now = 0;
 
     if (!sm1_slots_on()) {
-        return;
+        return -1;              /* not modelling: caller keeps its own cadence */
     }
 
     /*
@@ -282,18 +286,82 @@ static void sm1_publish_slots(IPodClassicSM1State *s)
     cpu_physical_memory_write(SM1_SLOT_ARRAY + 2, &h, 2);
 
     /*
-     * Mark every slot free again. The engine frees a slot once it has played
-     * it out; re-arming all of them once per frame report bounds the rate to
-     * the report cadence while guaranteeing the firmware always finds the one
-     * its own index points at. Flow control is therefore COARSER than the real
-     * part's -- a deliberate simplification, flagged rather than hidden.
+     * FREEING SLOTS AT THE RATE PLAYBACK ACTUALLY CONSUMES THEM.
+     *
+     * The first cut re-armed all seven slots on every frame report. It broke
+     * the wall -- rendret 8 -> 2505 -- but it also destroys flow control: the
+     * firmware believes it has seven free buffers forever, never waits, and
+     * MEASURED, its producer ran LESS (the submit gate 0x081fee60 went 8 -> 1,
+     * "audio available" 7 -> 0). A ring the consumer never has to wait on is
+     * not a ring.
+     *
+     * The right cadence is not invented either: the engine frees a slot when
+     * it has PLAYED it, and how much has been played is something we already
+     * know exactly -- it is the same I2S transmit count the position register
+     * is derived from, just expressed in slots. So the credit ahead of the
+     * play point is SM1_SLOT_COUNT slots, and each slot boundary the stream
+     * crosses frees exactly one more, in ring order.
      */
-    for (int i = 0; i < SM1_SLOT_COUNT; i++) {
-        h = cpu_to_le16(1);
-        cpu_physical_memory_write(SM1_SLOT_ARRAY + 10 + i * 4, &h, 2);
-        h = cpu_to_le16(SM1_SLOT_FRAMES);
-        cpu_physical_memory_write(SM1_SLOT_ARRAY + 12 + i * 4, &h, 2);
+    {
+        static uint64_t freed;      /* one SM1 in the machine */
+        static uint64_t base_pos;
+        static size_t   pcm_cursor;
+        uint64_t pos = sm1_stream_pos(s);
+
+        if (freed == 0) {
+            /* Nothing played yet: the whole ring is the firmware's to fill. */
+            base_pos = pos;
+            if (ipod_classic_hle_audio_have_pcm()) {
+                ipod_classic_hle_audio_set_np_feed(true);
+            }
+        }
+        uint64_t played = (pos - base_pos) / SM1_SLOT_FRAMES;
+        while (freed < played + SM1_SLOT_COUNT) {
+            unsigned i = (unsigned)(freed % SM1_SLOT_COUNT);
+
+            /*
+             * WHAT "READY" MEANS, and why the slot gets FILLED here.
+             *
+             * The guard hands its caller the slot's address AND its size, and
+             * 0x22006364 then transports that buffer onward. So a ready slot is
+             * not an empty one the firmware still has to fill -- it is a slot
+             * that already CONTAINS decoded audio. Which makes the engine the
+             * codec: the chain it is handed at sub-block 4 +0x00 carries raw
+             * MP3 frames (measured: ff fb 90 64 at 0x08ad004c).
+             *
+             * Decoding MP3 the way an undocumented on-chip codec does is not
+             * something to reverse-engineer bit by bit; it is something to
+             * EMULATE, which is what ipod_classic_hle_audio.c already does with
+             * verified-correct output (Pearson ~1.0 against the same file
+             * decoded independently). So the engine's output is that PCM, and
+             * the retailOS player keeps doing everything else -- choosing the
+             * track, the transport, the render pump, the DMA, the I2S.
+             *
+             * hle_np_owns_feed is set so the host shim does NOT also push the
+             * same PCM into the DMA: the guest moves its own data, which is the
+             * whole point of doing it here instead of there.
+             */
+            if (ipod_classic_hle_audio_have_pcm()) {
+                uint8_t buf[SM1_SLOT_BYTES];
+                size_t n = ipod_classic_hle_audio_copy_pcm(pcm_cursor, buf,
+                                                           sizeof(buf));
+                if (n < sizeof(buf)) {
+                    memset(buf + n, 0, sizeof(buf) - n);   /* tail of track */
+                }
+                cpu_physical_memory_write(SM1_SLOT_PCM + i * SM1_SLOT_BYTES,
+                                          buf, sizeof(buf));
+                pcm_cursor += n;
+            }
+
+            h = cpu_to_le16(1);
+            cpu_physical_memory_write(SM1_SLOT_ARRAY + 10 + i * 4, &h, 2);
+            h = cpu_to_le16(SM1_SLOT_FRAMES);
+            cpu_physical_memory_write(SM1_SLOT_ARRAY + 12 + i * 4, &h, 2);
+            freed++;
+            freed_now++;
+        }
     }
+    return freed_now;
 }
 
 static void sm1_irq_tick(void *opaque)
@@ -337,15 +405,29 @@ static void sm1_irq_tick(void *opaque)
         }
     }
     if (!s->irq_pending && (s->irq_armed || s->irq_always) && (s->ticks % every == 0)) {
-        s->irq_pending = true;
-        s->last_pos = pos;
-        s->irqs++;
         /*
          * Publish the memory-side state BEFORE signalling: the frame report is
          * what makes the firmware come and read it, so it has to already be
          * there when the handler runs.
+         *
+         * And when we ARE modelling it, the report has to MEAN what its name
+         * says. MEASURED: waking the pump on the bare 25 ms timer, whether or
+         * not a slot had actually come free, let it run 16 times and then give
+         * up -- it asks, misses, and 0x22006358 abandons after two retries
+         * rather than waiting. So with SM1_SLOTS on, a frame report is raised
+         * only when a frame really completed. Returns -1 when not modelling,
+         * which keeps the default build's cadence byte-for-byte.
          */
-        sm1_publish_slots(s);
+        int freed = sm1_publish_slots(s);
+        if (freed == 0) {
+            timer_mod(s->irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (int64_t)SM1_IRQ_TICK_MS * 1000000);
+            s->irq_pending = false;
+            return;
+        }
+        s->irq_pending = true;
+        s->last_pos = pos;
+        s->irqs++;
         qemu_irq_raise(s->irq);
         /*
          * The line is a LEVEL, but a short one.
