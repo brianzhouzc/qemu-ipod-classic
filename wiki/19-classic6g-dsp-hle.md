@@ -5367,3 +5367,56 @@ el descodificador del propio firmware, que **corre una sola vez**. Ese es el mis
 muro que el proyecto ya tenía, ahora aislado: ya no está tapado por el de la bomba.
 
 **La música no sale del reproductor nativo.**
+
+## 11.114 Con la bomba viva: el conducto entero funciona y el productor entrega ceros
+
+Con `SM1_SLOTS=1` la bomba recorre por fin su rama de éxito (`0x22006370`), que nunca
+se había ejecutado. Ahí está el punto donde pide el audio:
+
+```
+22006464: bl 0x22003808          ; -> 0x081db410
+22006474: bl 0x22003810          ; -> 0x081db4c8   PIDE audio, salida en [sp+52]
+22006478: cmp r0, #0
+22006480: bne 0x22006500         ; si falla, la bomba sale
+22006494: blne 0x22000020        ; si no, COPIA origen -> ranura, r5*4 bytes
+```
+
+Medido durante la reproducción:
+
+```
+de 300 peticiones: 300 con datos, 0 fallidas
+[ 1] r0=0  muestras=1024  origen=0x08a873c0  destino=0x22038100
+[ 2] r0=0  muestras=1024  origen=0x08a8b3c0  destino=0x22038100
+     ... alternando dos buferes de origen, doble bufer en SDRAM
+```
+
+Y el índice de ranura rota como debe, módulo el contador que publica el modelo:
+
+```
+[1] modulo->1  [2] ->2  [3] ->3  [4] ->4  [5] ->5  [6] ->6  [7] ->0   contador=7
+```
+
+Es decir: **el conducto entero funciona**. La guarda entrega búferes, el índice rota
+por las siete ranuras, la petición de audio nunca falla, la copia se hace.
+
+### Y sin embargo
+
+```
+[  3] origen=0x08a873c0  muestras=1024
+0x8a873c0:  0x00000000 0x00000000 0x00000000 0x00000000 ...
+[ 60] origen=0x08a8b3c0  ... todo ceros
+[150] origen=0x08a8b3c0  ... todo ceros
+```
+
+**El productor entrega 1024 muestras de silencio, cada vez.** No falla, no se rinde,
+no se queda sin crédito: devuelve éxito y devuelve ceros.
+
+Esto reemplaza a "el descodificador corre una sola vez", que se apoyaba en sondas mal
+nombradas (`framepull` 0x081e93d8 resultó ser un drenaje de anillo de notificaciones,
+no el códec). La formulación correcta y medida es: **todo lo que hay por debajo del
+productor funciona; el productor, `0x081db4c8`, entrega silencio.**
+
+Los búferes de salida del códec son `0x08a873c0` y `0x08a8b3c0` en SDRAM, en doble
+búfer. Ese es el siguiente objetivo, y es concreto: quién debería escribir en ellos.
+
+**La música no sale del reproductor nativo.**
