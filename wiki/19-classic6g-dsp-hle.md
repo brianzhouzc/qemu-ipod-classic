@@ -5328,3 +5328,42 @@ a 0 con el cambio. No está explicado. Por eso `SM1_SLOTS` queda **apagado por
 defecto**: es un avance medido, no todavía una ganancia neta.
 
 **La música sigue sin sonar**, pero el reproductor ya no se rinde.
+
+## 11.113 RETRACTACIÓN: el pico de 32768 no era del camino del invitado
+
+En §11.112 di por bueno que, con el motor rellenando el anillo desde el
+descodificador del anfitrión, **el pico del WAV pasaba de 11444 a 32768** y que eso
+probaba que por el camino del propio invitado circulaba PCM auténtico.
+
+**Es falso.** El control lo desmiente sin ambigüedad — misma decodificación, única
+diferencia mi cambio:
+
+```
+HLE_AUDIO_DATAPATH solo            21.058% no nulas   pico 32768   (tramos 16..20 llenos)
++ SM1_SLOTS rellenando el anillo    0.20-0.47%        pico 11444
+```
+
+El 32768 era del **atajo del anfitrión**, que sigue alimentando el DMA hasta que mi
+primera publicación de ranuras lo apaga con `hle_np_owns_feed`. Es decir: no solo no
+lo aportaba mi camino, sino que mi cambio **quitaba** el audio que sí funcionaba.
+
+El relleno de PCM queda retirado. Y con él retirado, la combinación sigue dando
+0.258%: con la bomba de render viva, el render del invitado **escribe silencio
+encima** del PCM que el atajo deja preparado en el mismo búfer del DMA. Los dos
+mecanismos se disputan el mismo destino, y el que tiene datos reales solo gana
+mientras la bomba está muerta.
+
+### Lo que sí queda en pie
+
+`SM1_SLOTS` publica el estado del motor en IRAM1 y eso **sí** revive la bomba de
+render, con control y de forma repetida: `rendret` 8 → 1343 (~20/s, la cadencia
+exacta de ranura a 44100 Hz) y el reproductor deja de abortar a los 5-18 s, sigue
+abierto a los 38. Eso es real y está medido.
+
+### El muro que queda, sin adornos
+
+Reanimar la bomba solo sirve si la bomba tiene audio que mover, y el suyo lo produce
+el descodificador del propio firmware, que **corre una sola vez**. Ese es el mismo
+muro que el proyecto ya tenía, ahora aislado: ya no está tapado por el de la bomba.
+
+**La música no sale del reproductor nativo.**

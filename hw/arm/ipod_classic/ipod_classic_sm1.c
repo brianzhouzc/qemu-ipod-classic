@@ -305,53 +305,43 @@ static int sm1_publish_slots(IPodClassicSM1State *s)
     {
         static uint64_t freed;      /* one SM1 in the machine */
         static uint64_t base_pos;
-        static size_t   pcm_cursor;
         uint64_t pos = sm1_stream_pos(s);
 
         if (freed == 0) {
             /* Nothing played yet: the whole ring is the firmware's to fill. */
             base_pos = pos;
-            if (ipod_classic_hle_audio_have_pcm()) {
-                ipod_classic_hle_audio_set_np_feed(true);
-            }
         }
         uint64_t played = (pos - base_pos) / SM1_SLOT_FRAMES;
         while (freed < played + SM1_SLOT_COUNT) {
             unsigned i = (unsigned)(freed % SM1_SLOT_COUNT);
 
             /*
-             * WHAT "READY" MEANS, and why the slot gets FILLED here.
+             * TRIED AND BACKED OUT: filling the slot with host-decoded PCM.
              *
-             * The guard hands its caller the slot's address AND its size, and
-             * 0x22006364 then transports that buffer onward. So a ready slot is
-             * not an empty one the firmware still has to fill -- it is a slot
-             * that already CONTAINS decoded audio. Which makes the engine the
-             * codec: the chain it is handed at sub-block 4 +0x00 carries raw
-             * MP3 frames (measured: ff fb 90 64 at 0x08ad004c).
+             * The reasoning was that a "ready" slot already CONTAINS decoded
+             * audio (the guard hands its caller the address AND the size, and
+             * 0x22006364 transports that buffer), which would make the engine
+             * the codec -- consistent with the chain it is handed carrying raw
+             * MP3 frames. So the slot was filled from ipod_classic_hle_audio's
+             * verified PCM and hle_np_owns_feed was set so the host shim would
+             * not double-feed the DMA.
              *
-             * Decoding MP3 the way an undocumented on-chip codec does is not
-             * something to reverse-engineer bit by bit; it is something to
-             * EMULATE, which is what ipod_classic_hle_audio.c already does with
-             * verified-correct output (Pearson ~1.0 against the same file
-             * decoded independently). So the engine's output is that PCM, and
-             * the retailOS player keeps doing everything else -- choosing the
-             * track, the transport, the render pump, the DMA, the I2S.
+             * MEASURED, it makes things WORSE, and the control is unambiguous:
              *
-             * hle_np_owns_feed is set so the host shim does NOT also push the
-             * same PCM into the DMA: the guest moves its own data, which is the
-             * whole point of doing it here instead of there.
+             *   HLE_AUDIO_DATAPATH alone        21.06% non-zero, peak 32768
+             *   + this fill (np_feed disabled)   0.20-0.47%,     peak 11444
+             *
+             * The 32768 peak that looked like the guest's own path carrying
+             * real audio was the host shim's, still running before the first
+             * slot publish switched it off. Writing PCM into the IRAM1 ring
+             * does NOT get it to the I2S: the pump only ran 21-39 times in
+             * those runs, so nothing transported it. Suppressing the shim
+             * therefore just removed the audio that did work.
+             *
+             * Left as a comment rather than deleted because the reasoning is
+             * still the most likely account of what the engine does -- what it
+             * lacks is the transport, not the idea.
              */
-            if (ipod_classic_hle_audio_have_pcm()) {
-                uint8_t buf[SM1_SLOT_BYTES];
-                size_t n = ipod_classic_hle_audio_copy_pcm(pcm_cursor, buf,
-                                                           sizeof(buf));
-                if (n < sizeof(buf)) {
-                    memset(buf + n, 0, sizeof(buf) - n);   /* tail of track */
-                }
-                cpu_physical_memory_write(SM1_SLOT_PCM + i * SM1_SLOT_BYTES,
-                                          buf, sizeof(buf));
-                pcm_cursor += n;
-            }
 
             h = cpu_to_le16(1);
             cpu_physical_memory_write(SM1_SLOT_ARRAY + 10 + i * 4, &h, 2);
