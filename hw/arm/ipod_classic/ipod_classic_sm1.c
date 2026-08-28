@@ -59,6 +59,7 @@
 #include "qemu/module.h"
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
+#include "exec/cpu-common.h"   /* cpu_physical_memory_write: el estado en IRAM1 */
 #include "hw/irq.h"
 #include "qemu/timer.h"
 #include "hw/arm/ipod_classic/ipod_classic_sm1.h"
@@ -193,6 +194,108 @@ static void sm1_irq_off(void *opaque)
     }
 }
 
+/*
+ * THE ENGINE'S MEMORY-SIDE STATE (SM1_SLOTS=1).
+ *
+ * The render pump stops after eight invocations because 0x080a3c00 -- the
+ * "give me the next render buffer" call -- returns 0 where 0x22006358 requires
+ * 2. MEASURED, it returns 0 at its FIRST guard:
+ *
+ *     80a3c2c: tst r2, r0    ; r2 = enable mask, halfword at [table+4]
+ *     80a3c30: beq salir     ; mask = 0x0000 -> give up
+ *
+ * where `table` is 0x0896a684 = { _, 0x2203ff28, 0x2203ff00, 0x22038000,
+ * 0x22038100, idx, ... }. With `memw=` over a whole run (~180 s, boot
+ * included), NO PC of the CPU ever writes 0x2203ff28, and the slot array at
+ * 0x22038000 is written only once at boot. Forcing the mask by hand reaches
+ * the second guard -- the per-slot "ready" halfword -- which is zero for the
+ * same reason. So this is not a missing bit: it is state the ENGINE publishes
+ * and our register-only model never produced.
+ *
+ * THE GEOMETRY IS OURS TO CHOOSE, and that is what makes this implementable
+ * rather than a guess. The firmware does not carry these numbers; it reads
+ * them back from what the engine published and derives everything:
+ *
+ *     80a3c54: ldrh r1,[desc,#4]      ; frames per slot  <- we publish
+ *     80a3c58: ldrh r0,[slot,#12]     ; samples in slot  <- we publish
+ *     80a3c68: add r1, pcm, r1,lsl#1  ; buffer = PCM + idx*frames*2
+ *     80a3c64: lsl r0, r0, #1         ; size   = samples*2
+ *
+ * So any self-consistent geometry that fits below the descriptors works. We
+ * take 2048 frames/slot (the audio DMA's own burst: 2048 x 16-bit, measured
+ * from the self-linking LLI) and 7 slots: 7 * 4096 = 28 KiB, which ends at
+ * 0x2203f100, clear of 0x2203ff00.
+ *
+ * What stays UNDETERMINED and is NOT modelled here: the descriptor chain the
+ * firmware hands the engine at sub-block 4 +0x00 (measured 0x08ad003d = chain
+ * | go, chain entry { next, ctrl, buf }, buf holding real MP3 frames). Where
+ * the engine would put ITS output is programmed in no register on the whole
+ * 4 KiB page -- swept, only +0x100/+0x110/+0x9xx/+0xaxx are non-zero -- so it
+ * cannot be derived from anything measured. This routine deliberately models
+ * only the half that CAN be grounded: the buffer-return handshake, whose
+ * cadence follows the I2S the same way the position register already does.
+ *
+ * Gated by SM1_SLOTS so the default build stays byte-for-byte as measured.
+ */
+#define SM1_SLOT_DESC        0x2203ff28   /* [table+4]  engine descriptor  */
+#define SM1_SLOT_ARRAY       0x22038000   /* [table+12] per-slot state     */
+#define SM1_SLOT_FRAMES      2048         /* frames per slot (DMA burst)   */
+#define SM1_SLOT_COUNT       7            /* 7 * 4096 = 28 KiB below 0x…ff00 */
+
+static bool sm1_slots_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SM1_SLOTS");
+        on = (e && *e && *e != '0') ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "SM1_SLOTS: publicando el estado del motor en IRAM1 "
+                    "(%d ranuras de %d marcos)\n",
+                    SM1_SLOT_COUNT, SM1_SLOT_FRAMES);
+        }
+    }
+    return on == 1;
+}
+
+static void sm1_publish_slots(IPodClassicSM1State *s)
+{
+    uint16_t h;
+
+    if (!sm1_slots_on()) {
+        return;
+    }
+
+    /*
+     * The descriptor: enable mask bit 0 (guard 1 asks for bit 1 instead only
+     * when the stream state byte is 6, so publish both), the halfword the
+     * guard requires to be zero, and the slot geometry.
+     */
+    h = cpu_to_le16(0x0003);
+    cpu_physical_memory_write(SM1_SLOT_DESC + 0, &h, 2);
+    h = cpu_to_le16(0);
+    cpu_physical_memory_write(SM1_SLOT_DESC + 2, &h, 2);
+    h = cpu_to_le16(SM1_SLOT_FRAMES);
+    cpu_physical_memory_write(SM1_SLOT_DESC + 4, &h, 2);
+
+    /* The slot count the firmware wraps its index against. */
+    h = cpu_to_le16(SM1_SLOT_COUNT);
+    cpu_physical_memory_write(SM1_SLOT_ARRAY + 2, &h, 2);
+
+    /*
+     * Mark every slot free again. The engine frees a slot once it has played
+     * it out; re-arming all of them once per frame report bounds the rate to
+     * the report cadence while guaranteeing the firmware always finds the one
+     * its own index points at. Flow control is therefore COARSER than the real
+     * part's -- a deliberate simplification, flagged rather than hidden.
+     */
+    for (int i = 0; i < SM1_SLOT_COUNT; i++) {
+        h = cpu_to_le16(1);
+        cpu_physical_memory_write(SM1_SLOT_ARRAY + 10 + i * 4, &h, 2);
+        h = cpu_to_le16(SM1_SLOT_FRAMES);
+        cpu_physical_memory_write(SM1_SLOT_ARRAY + 12 + i * 4, &h, 2);
+    }
+}
+
 static void sm1_irq_tick(void *opaque)
 {
     IPodClassicSM1State *s = opaque;
@@ -237,6 +340,12 @@ static void sm1_irq_tick(void *opaque)
         s->irq_pending = true;
         s->last_pos = pos;
         s->irqs++;
+        /*
+         * Publish the memory-side state BEFORE signalling: the frame report is
+         * what makes the firmware come and read it, so it has to already be
+         * there when the handler runs.
+         */
+        sm1_publish_slots(s);
         qemu_irq_raise(s->irq);
         /*
          * The line is a LEVEL, but a short one.

@@ -5256,3 +5256,75 @@ así que el anillo no era la causa (aunque siga siendo cierto que el puntero de
 escritura se sale de IRAM1 y que `IRAMSPILL` lo tapa).
 
 **La música sigue sin sonar.**
+
+## 11.112 EL SM1 PUBLICA SU ESTADO EN IRAM1 — muro de la bomba de render roto
+
+El descriptor de trabajo que el firmware entrega al motor, leído en caliente en
+`0x08082194`:
+
+```
+descriptor @0x08ade494:  +0=0x08ad003c  +4=0x08ad003c  +8=1  +12=1  +16=0x38500100
+cadena     @0x08ad003c:  +0=0 (fin)  +4=0x01a10f80  +8=0x88ad004c
+bufer      @0x08ad004c:  ff fb 90 64 ...        <-- cabecera de trama MP3
+```
+
+y el registro correspondiente:
+
+```
+0x38500100 = 0x08ad003d      la direccion de la cadena | bit 0 = marcha
+0x38500110 = 0x00000060      sub-bloque 4 = STOP (96)
+```
+
+Es decir: **el SM1 recibe una cadena de descriptores en SDRAM con tramas MP3**, por
+el offset `+0x00` del sub-bloque 4, que nuestro modelo no atiende (solo trata `+0x10`
+orden y `+0x14` estado).
+
+### Lo que SÍ se puede fundamentar, y por qué
+
+Barrida la página de 4 KiB entera, **ningún registro contiene `0x22038100` ni
+`0x22038000`**: el destino de la salida del motor no se le programa por registro y no
+se deduce de nada medido. Modelar la descodificación sería inventar.
+
+Pero la **geometría de los búferes no es una constante oculta: la publica el motor**.
+El firmware no la lleva encima, la lee de vuelta:
+
+```
+80a3c54: ldrh r1,[desc,#4]        ; marcos por ranura   <- lo publica el motor
+80a3c58: ldrh r0,[ranura,#12]     ; muestras en ranura  <- lo publica el motor
+80a3c68: add r1, pcm, r1,lsl#1    ; bufer = PCM + idx*marcos*2
+80a3c64: lsl r0, r0, #1           ; tamano = muestras*2
+```
+
+Así que cualquier geometría coherente que quepa por debajo de los descriptores vale.
+`SM1_SLOTS=1` publica 2048 marcos por ranura (la ráfaga del propio DMA de audio,
+medida en el LLI autoenlazado) y 7 ranuras: 7 × 4096 = 28 KiB, que acaban en
+`0x2203f100`, libres de `0x2203ff00`.
+
+### Medido, con control
+
+Misma navegación, mismo binario, única diferencia la variable:
+
+| | sin `SM1_SLOTS` | con `SM1_SLOTS` |
+|---|---|---|
+| `rendret` | 8 | **2505** |
+| `bufok` (búferes entregados) | **0** | **2504** |
+| `dpump` | 16 | **2505** |
+| `framepull` (tramas al códec) | 1 | 1 |
+
+La bomba de render pasa de rendirse a las 8 invocaciones —el número invariante de
+todo el proyecto— a **correr a ~38/s**, con 43/s como cadencia real. Y visualmente:
+sin el cambio, a los 18 s el aparato ya ha vuelto a la lista *Songs*; con él, sigue
+en el reproductor a los 18 **y a los 38**.
+
+### El muro siguiente, y que no es mío
+
+`framepull = 1` en AMBAS columnas: al descodificador se le pide **una sola trama**,
+igual con el cambio que sin él. Es preexistente (ya estaba anotado como
+"decoder single-frame one-shot") y ahora queda aislado: la bomba corre y rellena
+silencio porque nadie le entrega tramas.
+
+**Regresión honesta:** `decide` (la puerta de envío) baja de 8 a 1 y `setavail` de 7
+a 0 con el cambio. No está explicado. Por eso `SM1_SLOTS` queda **apagado por
+defecto**: es un avance medido, no todavía una ganancia neta.
+
+**La música sigue sin sonar**, pero el reproductor ya no se rinde.
