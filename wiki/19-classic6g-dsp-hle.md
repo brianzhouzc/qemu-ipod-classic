@@ -5022,3 +5022,58 @@ tiene datos, y el planificador funciona. Lo que no se ha encontrado es el camino
 el que ese aviso debería llegar de vuelta al reproductor para que asigne el siguiente
 búfer. Los dos asignadores conocidos (§11.107) son de inicialización, así que el
 camino recurrente existe en el firmware pero no se ha localizado todavía.
+
+## 11.109 LOS CUATRO SITIOS QUE NO SE ALCANZAN, y la función que los gatea
+
+Búsqueda estática: **seis** sitios del firmware llaman a `0x08183d74`, que acaba
+asignando un búfer y levantando la bandera de envío:
+
+```
+0x0814f1a8   0x0814ff4c   0x08150ff4   0x081516c8   0x081529bc   0x08152ca0
+```
+
+Sondeados los seis con gdb, armado ANTES de pulsar reproducir:
+
+```
+LLAMA 0x0814ff4c (init)      x4
+LLAMA 0x08150ff4 (arranque)  x2
+los otros cuatro: NINGUNA vez
+```
+
+**Sólo se ejecutan los dos de inicialización.** El camino recurrente existe en el
+firmware y no se entra en él.
+
+**Un fallo de herramienta que costó dos corridas, y que conviene no repetir:**
+`commands 1-6` no es sintaxis válida en este gdb. Los breakpoints quedan armados SIN
+bloque de comandos, así que al saltar gdb **detiene la máquina y espera**: la interfaz
+se congela y la pulsación de reproducir nunca entra (`press ret x20: diff=0`). Eso se
+lee como "ningún sitio se ejecuta" cuando en realidad el emulador estaba parado en el
+primero. Hay que poner **un bloque `commands N` por breakpoint**, cada uno con su
+`continue`.
+
+**La estructura de los tres sitios hermanos** (`0x081516c8`, `0x081529bc`,
+`0x08152ca0`) es idéntica:
+
+```
+ldrb r0, [sp,#0x38]      un booleano local
+cmp  r0, #0
+beq  <salta>             <-- si es 0, NO asigna
+bl   0x81afbe0 ; bl 0x81b0030
+ldr  r0, [r4,#0x948]
+bl   0x8183d74           ASIGNA
+```
+
+Y ese booleano lo decide `0x08150ad0`, al que se le pasa su dirección
+(`add r3, sp, #0x38 ; bl 0x8150ad0`):
+
+```
+8150ad4: sub  sp, sp, #1024      un bufer de 1 KB en pila
+8150af4: strbne r9, [r8]         *flag = 0 al entrar
+8150af8: bl   0x82685a0          primera comprobacion
+8150b00: beq  0x8150b6c          si falla -> sale con flag = 0
+```
+
+**Ahí está el siguiente paso, ya sin ambigüedad:** `0x08150ad0` pone el booleano a
+cero al entrar y sólo lo levanta si pasa una cadena de comprobaciones. Saber cuál
+falla —empezando por `0x082685a0`— nombra la condición que impide que el reproductor
+vuelva a pedir búferes, que es el único eslabón que queda.
