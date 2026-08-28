@@ -5120,3 +5120,139 @@ fuera prueba por sí misma.
 **Lo que queda:** por qué el contenedor de `[obj+0x60]` está vacío mientras se
 reproduce. Ahí se une con §11.99 —las estructuras de audio que nadie llena— pero
 ahora con el objeto concreto y el campo concreto identificados.
+
+## 11.111 RETRACTACIÓN de §11.110, y la cadena real hasta el silencio
+
+§11.110 dijo que el contenedor del reproductor estaba vacío. **Es falso**, y la
+reserva que la propia sección dejaba anotada era el motivo: aquella lectura se tomó
+con el reproductor ya cerrado. Parando en `0x0814fe70` —el `cmp` que sigue a la
+validación, que es donde se decide la rama— durante la reproducción:
+
+```
+[ 1..14] validacion PASA -> referencia viva; campo [0x0ba6d5d8+0x12c] = 0x00000000
+```
+
+La referencia débil está **viva** las catorce veces. Y el objeto al que apunta lleva
+`vtable = 0` y la etiqueta `'plst'` en `+4`: es un objeto de **lista de
+reproducción**. Esa rama era la lógica de cambio de pista, no la del relleno de
+búferes. Vía muerta, y anotada como tal.
+
+### El sitio donde se decide el silencio
+
+El byte que el driver consulta antes de rellenar (§11.63) vive en `0x0bb169dc`,
+dentro de un descriptor con `0x0000ac44` = 44100 y 2 canales. Vigilándolo:
+
+```
+ESCRIBE byte -> 1   pc=0x0816bdd4  lr=0x081fec00
+ESCRIBE byte -> 0   pc=0x0816bdd4  lr=0x220055b4
+```
+
+**Corrección de método, y va la tercera vez que este error cuesta una conclusión:**
+de ahí deduje "se activa una sola vez". Falso. Un watchpoint de gdb solo avisa cuando
+el valor *cambia*, y la rama de envío inmediato escribe −1 sobre −1 y 1 sobre 1.
+Contando EJECUCIONES con sondas del plugin:
+
+```
+decide 4   defer 4   submitnow 3   setavail 3   setavail2 1   gateraise 3
+```
+
+Cuatro vueltas, no una. La regla de §11.66 —instrumentar las ramas, no la
+condición— tiene ahora una hermana: **contar ejecuciones, no cambios de valor.**
+
+### Por qué se para en cuatro
+
+El bucle de audio en IRAM:
+
+```
+22006324: bl 0x22003850     ; espera de credito de render -> 0x0808af58
+22006328: cmp r0, #0
+2200632c: beq 0x22006310    ; 0 -> duerme y reintenta
+2200631c: cmp r7, #1
+22006320: bgt 0x220061fc    ; a la segunda, abandona
+```
+
+El comentario del propio modelo (`ipod_classic_sm1.c`, `SM1_IRQ_EVERY`) sostenía que
+el tope de 8 venía de que esa espera **agotaba su plazo**. **Medido, es falso:**
+
+```
+[1..8] la espera devolvio 0x00000001 -> EXITO
+```
+
+Se satisface las ocho veces. La bomba sale después, en `0x22006358`, que exige tres
+cosas a la vez. Leídas las tres:
+
+```
+[sp+24]=0x00000000  OK      [r4+0x58]=1  OK      r0=0x00000000  <-- hace falta 2
+```
+
+`r0` es lo que devuelve `0x22003850`+8 → **`0x080a3c00`**, el obtenedor del siguiente
+búfer de render. Devuelve 0 en vez de 2 las ocho veces.
+
+### La guarda, y el estado que nadie mantiene
+
+`0x080a3c00` cuelga de una tabla global en `0x0896a684`:
+
+```
+0x896a684:  0x00000000  0x2203ff28  0x2203ff00  0x22038000  0x22038100
+              descriptor ^          bootinfo ^   ranuras ^    PCM ^
+```
+
+y tiene dos guardas:
+
+```
+80a3c2c: tst r2, r0     ; r2 = mascara de habilitacion, halfword en 0x2203ff28
+80a3c30: beq salir      ; guarda 1
+80a3c4c: cmpeq r3, #1   ; r3 = estado de ranura, halfword en 0x22038000+idx*4+10
+80a3c50: bne salir      ; guarda 2
+```
+
+Medido: **corta la guarda 1**, `mascara=0x0000` con `bit=1`, las cuatro veces.
+
+Y con `memw=` del plugin sobre TODA la ejecución (≈180 s, arranque incluido), los
+únicos PCs que escriben en `0x2203ff00..0x2203ff60` son:
+
+```
+32 x pc=0x0800f54c -> 0x2203ff00..07     8 x pc=0x08081da0 -> 0x2203ff00 (halfword)
+ 2 x pc=0x0800f52c -> 0x2203ff08, 0x0c
+```
+
+**Nadie escribe `0x2203ff28` jamás.** El array de ranuras (`0x22038000`) sí se
+escribe, pero solo una vez en el arranque (64 palabras desde `0x08085ebc`) y nunca
+durante la reproducción.
+
+### Prueba por intervención
+
+Forzando la máscara en el punto de la guarda —sin tocar el firmware— la guarda 1 pasa
+y se alcanza **por primera vez** la guarda 2, que revela la segunda pared:
+
+```
+[1..8] mascara forzada a 1  ->  guarda 2: estado de ranura = 0 (hace falta 1) -> CORTA
+```
+
+Forzando las dos, `0x080a3c00` entrega el búfer. La máquina se queda luego en negro,
+que es lo esperable al entregar un búfer con estado inventado.
+
+### Lo que esto nombra
+
+Los dos campos que cortan —la máscara en `0x2203ff28` y el estado de ranura en
+`0x22038000`— son estado que vive **en IRAM1** y que **ningún código de la CPU
+escribe durante la reproducción**. Nuestro modelo del SM1 es un banco de registros:
+no escribe memoria nunca. El firmware le manda 519 COMMIT y 518 RUN (§11.x) y luego
+lee el resultado en esas estructuras.
+
+Es decir: **el SM1 no es solo un periférico de registros, es un motor que mantiene su
+estado en IRAM1**, y esa mitad del modelo no existe. Eso explica por qué cada guarda
+que se forzaba revelaba otra debajo: no faltaba un bit, falta el productor de todo
+ese estado.
+
+### Lo que NO se ha probado
+
+Cuál es exactamente el contrato de memoria del motor. Inventarlo campo a campo es
+justo lo que la cabecera de `ipod_classic.h` advierte —"rellenarlos a partir de una
+suposición verosímil es inventar con apariencia de rigor"— y las dos guardas ya
+forzadas muestran que detrás hay más. No se ha reducido `SM1_POS_RING_FRAMES`: la
+prueba con `SM1_POS=24576` dejó la máscara igual a cero y los contadores idénticos,
+así que el anillo no era la causa (aunque siga siendo cierto que el puntero de
+escritura se sale de IRAM1 y que `IRAMSPILL` lo tapa).
+
+**La música sigue sin sonar.**
