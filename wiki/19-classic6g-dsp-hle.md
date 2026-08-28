@@ -5077,3 +5077,46 @@ Y ese booleano lo decide `0x08150ad0`, al que se le pasa su dirección
 cero al entrar y sólo lo levanta si pasa una cadena de comprobaciones. Saber cuál
 falla —empezando por `0x082685a0`— nombra la condición que impide que el reproductor
 vuelva a pedir búferes, que es el único eslabón que queda.
+
+## 11.110 LA CONDICIÓN EXACTA: el contenedor del reproductor está vacío
+
+Bajando la última bifurcación de `0x08150ad0` (§11.109) con gdb sobre una instancia
+viva:
+
+```
+8150c10: blx r1            llamada virtual [[obj]+0x1b8]
+8150c14: cmp r0, sl        r0 = 0  y  sl = 0  -> IGUALES
+8150c24: beq 0x8150c3c     <-- salta: "no ha avanzado nada", no pide bufer
+```
+
+El método resuelto en caliente es **`0x0814fe60`**:
+
+```
+814fe68: add  r0, r0, #0x60      el contenedor en [obj+0x60]
+814fe6c: bl   0x82685a0          tiene elementos?
+814fe74: ldrne r0, [r4,#0x64]    si SI  -> r0 = [obj+0x64]
+814fe78: ldrne r0, [r0,#0x12c]   -> devuelve ese campo
+814fe7c: moveq r0, #0            si NO  -> devuelve 0
+```
+
+Y leido en la maquina (obj = `0x0ba954b4`):
+
+```
+[obj+0x60].. = 0x088ef3e4 0x00000000 0x00000000    el contenedor
+[obj+0x64]   = 0x00000000                          NULO
+```
+
+**El contenedor está vacío y no hay elemento actual.** Por eso el método devuelve
+cero, la comparación da igualdad, y el reproductor concluye que no ha habido progreso
+y no vuelve a pedir búferes.
+
+**Reserva de método, explícita:** esta lectura se tomó con el reproductor YA cerrado,
+así que por sí sola podría estar describiendo el estado posterior al aborto y no el
+de la reproducción. Lo que la sostiene es la medida de §11.109, tomada **durante** la
+reproducción, donde esa misma llamada devolvía 0 en las seis ejecuciones observadas.
+Ambas apuntan al mismo sitio, pero conviene no presentar la lectura tardía como si
+fuera prueba por sí misma.
+
+**Lo que queda:** por qué el contenedor de `[obj+0x60]` está vacío mientras se
+reproduce. Ahí se une con §11.99 —las estructuras de audio que nadie llena— pero
+ahora con el objeto concreto y el campo concreto identificados.
