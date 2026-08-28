@@ -4901,3 +4901,45 @@ el DMA entrega lo que haya                      18 500 buferes
 
 Y con eso la pregunta de toda la investigación queda reducida a su forma mínima, en
 el mismo sitio donde empezó: **qué debería hacer que `0x081fef28` se repita.**
+
+## 11.106 LA CADENA COMPLETA, medida nivel a nivel
+
+Bajando desde el silencio del WAV hasta el origen, con breakpoints condicionales de
+gdb (la única herramienta que filtra al capturar; toda sonda con tope se llenaba en
+el arranque):
+
+```
+0x081d05dc  setter: str [obj+0x18]; strb 1,[obj+0x67]   4 veces, solo al arrancar
+     |      (asigna un bufer nuevo y levanta la bandera "hay trabajo")
+     v
+0x081feec8  puerta: ldrb [r4+0x67]; cmp #1; bne         EVALUADA MUCHAS VECES,
+     |      (consume la bandera si esta a 1)             byte=0 siempre salvo 4
+     v
+0x081fef28  envio (blx a 0x081d0944)                     4 veces
+0x081fef3c  pone el flag "hay audio disponible" = 1      4 veces
+     v
+0x220077c0  el driver consulta ese flag (0x0816c150,     ~43 veces/segundo
+     |      que es "ldrb r0,[r0]; bx lr")
+     v
+0x22006ac0  llena el bufer con audio   SOLO si el flag era 1
+0x220002d4  borra el bufer (4096 B)    SIEMPRE, antes de consultar
+     v
+DMA -> I2S -> WAV                                        18 500 buferes
+```
+
+**El dato que lo cierra:** la puerta `0x081feec8` **se evalúa repetidamente** —desde
+`0x22003fc4` y `0x220072e8`, dos sitios de IRAM— y el byte está a **cero todas las
+veces**. Así que el planificador funciona, la tarea corre y el código llega hasta la
+puerta. Lo que no ocurre es que alguien vuelva a asignar un búfer.
+
+**La frase final:** el reproductor no suena porque la asignación de búfer
+(`0x081d05dc`) sucede **cuatro veces al arrancar la reproducción y nunca se repite**,
+mientras el driver la necesita unas 43 veces por segundo. No falta código, no falta
+estructura, no hay interbloqueo: falta el evento que reengancha el ciclo.
+
+**Lo que queda por saber, y es lo único:** quién debería llamar a `0x081d05dc` de
+forma recurrente. En hardware real ese llamador se dispara con cada búfer consumido;
+aquí sólo lo hace al principio. Ahí estará el evento que el modelo no produce — y es
+exactamente el mismo sitio al que apuntaba la primera medida de esta sesión
+(`0x081fef28`, "tres trabajos donde harían falta cuarenta por segundo"), ahora con
+todo el mecanismo intermedio explicado.
