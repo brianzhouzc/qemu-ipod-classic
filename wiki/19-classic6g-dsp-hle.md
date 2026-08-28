@@ -4979,3 +4979,46 @@ productor**. Por eso el productor sólo trabaja las seis veces del arranque.
 retailOS es reactivo —consumir un búfer debe pedir el siguiente— y en esta emulación
 **el lazo se abre justo en el retorno del driver al reproductor**. Todo lo demás
 —disco, memoria, decodificación, anillo, DMA, I2S— está medido y funciona.
+
+## 11.108 El aviso del driver, y quién lo lee
+
+La función que entrega búferes al DMA (`0x22007780`, cuyos literales son
+`0x22008c5c` y `0x22009c5c`) publica su estado en las dos ramas:
+
+```
+hay datos -> bl 0x220043fc con 1     no hay -> bl 0x220043fc con 0
+```
+
+`0x220043fc` es un set/clear de bits sobre una **máscara de estado en `0x2200ae2c`**,
+bajo sección crítica (`0x22001e58` / `0x22001e6c`). Así que el driver **sí publica**
+que se ha quedado sin datos, en cada vuelta.
+
+Con un watchpoint de LECTURA (`rwatch`, no de escritura: las escrituras ya se
+conocían, lo que faltaba era saber si alguien escucha):
+
+```
+0x22004418   dentro del propio 0x220043fc
+0x220029a0   el despachador del kernel
+0x220029e4   idem
+valor leido = 32  (bit 5)
+```
+
+Y el despachador hace:
+
+```
+2200299c: ldr r0, [r4]        la mascara
+220029a4: and r0, r0, #70     0x46 = bits 1, 2 y 6
+220029a8: orrs r0, r0, [r4+12]
+220029b8: bne  -> despacha
+```
+
+**El planificador sólo considera los bits 1, 2 y 6; el driver de audio usa el bit 5,
+que queda fuera de esa máscara.** Anotado como hecho medido, con la reserva de que
+probablemente sea por diseño —un bit de estado, no de despertar—, ya que el mismo
+código corre en hardware real. No conviene tratarlo como fallo sin más evidencia.
+
+**Estado del cerco al cierre de esta línea:** el driver publica correctamente que no
+tiene datos, y el planificador funciona. Lo que no se ha encontrado es el camino por
+el que ese aviso debería llegar de vuelta al reproductor para que asigne el siguiente
+búfer. Los dos asignadores conocidos (§11.107) son de inicialización, así que el
+camino recurrente existe en el firmware pero no se ha localizado todavía.
