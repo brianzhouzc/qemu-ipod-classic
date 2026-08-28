@@ -81,6 +81,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
  * presence and this is the state it already expects).
  */
 #define PCF5063X_OOCSTAT_HEALTHY  0xe1   /* ONKEY|SYSOK|BATOK|TMPOK */
+#define PCF5063X_MBCS1_ADAPTPRES  0x04
+#define PCF5063X_MBCS1_ADAPTOK    0x08
 #define PCF5063X_MBCS1_HEALTHY    0x00   /* TBAT_OK, no charger, no WDT expiry */
 
 /*

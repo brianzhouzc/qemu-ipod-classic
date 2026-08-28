@@ -132,6 +132,25 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
          * state instead. See the header.
          */
         val = PCF5063X_MBCS1_HEALTHY;
+        /*
+         * PMUCHARGER=1: report external power present and OK.
+         *
+         * MEASURED: with the default "on battery, no charger" report the
+         * retailOS eventually puts up "Low Battery -- Connect to Power" and
+         * stops playing, and raising the battery ADC to full scale does NOT
+         * prevent it (see the note above pmu_battery_raw). That is coherent --
+         * it is asking to be plugged in, and nothing here ever says it is.
+         *
+         * An emulated iPod has no cell to discharge, so "sitting in a dock"
+         * is at least as honest a description of it as "running on a battery
+         * that never moves", and it is the one the firmware can act on. Kept
+         * behind a variable because it IS a model choice, not a measurement:
+         * which of USB or adapter a real device would report depends on what
+         * it is plugged into, and we are plugged into nothing.
+         */
+        if (getenv("PMUCHARGER")) {
+            val |= PCF5063X_MBCS1_ADAPTPRES | PCF5063X_MBCS1_ADAPTOK;
+        }
         break;
     case PCF5063X_REG_RTCSC:
     case PCF5063X_REG_RTCSC + 1:

@@ -5566,3 +5566,54 @@ del camino: es latencia de arranque del códec emulado.
 va tan cargada que la captura falla y la pulsación se pierde -- **cinco pasadas
 perdidas así**. `seq ret:120` envía la tecla sin captura y no depende de la carga; la
 entrada se confirma con el contador `StartPlayback`, no con una imagen.
+
+## 11.118 La pantalla de "Low Battery", y el reproductor que se congela
+
+### El aviso de batería (RESUELTO)
+
+El usuario informó de que el aparato mostraba una pantalla de batería y se apagaba.
+Reproducido y capturado: es **"Low Battery -- Connect to Power"**, exactamente el
+síntoma que `ipod_classic_pmu.c` daba por no resuelto ("subir el ADC de batería a
+fondo NO evita que retailOS lo ponga, así que el veredicto no sale del canal que este
+modelo contesta").
+
+Con `PMUTRACE=1` se ve que el ADC **sí se lee bien**: `0x55 = 0xd3` = 211, que son los
+844 de 1023 que el modelo publica. O sea, la tensión no es el problema. Lo que ocurre
+es que `MBCS1_HEALTHY = 0x00` describe "a batería, sin cargador", y el firmware está
+pidiendo justamente que lo enchufen -- y nada le dice nunca que lo esté.
+
+`PMUCHARGER=1` reporta adaptador presente y correcto. **Medido:** desaparece la
+pantalla, el icono de batería pasa a verde con el rayo de carga, y el aparato deja de
+apagarse. Es una elección de modelo, no una medida, y va tras variable por eso: un
+iPod emulado no tiene celda que descargar, así que "en la base" lo describe al menos
+tan honestamente como "con una batería que nunca se mueve".
+
+### El aviso de fin de fotograma (PARCIAL)
+
+El bloque LCD tiene línea de interrupción conectada a `S5L8702_LCD_IRQ` y un `INTCON`
+en +0x18 que el modelo guardaba y no usaba: **la línea no se había levantado nunca**.
+`LCD_FRAME_IRQ=1` la pulsa al arrancar cada fotograma.
+
+Medido: **la animación de entrada al reproductor pasa de congelarse a completarse.**
+Sin la variable, la capa 1 se queda clavada a 320x240 en (0,0); con ella llega a
+`width=-80, x=400`, que es el final del barrido documentado en el compositor. Pero no
+basta para que aparezca la pantalla del reproductor, y en algunas pasadas deja la
+bomba de audio en 3 activaciones en vez de 1451, así que **no está resuelto**.
+
+### Lo que queda, acotado
+
+Con `PMUCHARGER=1` el audio suena bien (21% de muestras no nulas, pico 32768,
+`rendret` 1577) mientras **la interfaz se queda congelada en la carátula genérica**:
+
+- SELECT, MENU y la rueda no cambian un solo píxel -- comprobado con hash de las
+  capturas, cinco pulsaciones seguidas, imagen idéntica.
+- La CPU está dormida en el WFI del bucle ocioso, no girando.
+- El disco sigue leyendo la canción y el audio sigue saliendo.
+
+O sea: **no es un fallo de dibujo, es la tarea de interfaz bloqueada**, esperando algo
+que no llega, mientras el resto del sistema sigue vivo. Volcadas las cinco superficies
+del compositor, ninguna contiene una pantalla de reproducción con barra de progreso:
+capa 0 el reloj, capa 1 la carátula, capa 2 la lista con el icono de altavoz. El
+firmware nunca la dibuja.
+
+**No se ha conseguido ver el reproductor completo.**
