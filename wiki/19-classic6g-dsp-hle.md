@@ -4814,3 +4814,40 @@ registros, no memoria. Para leer `[registro+desplazamiento]` hay que usar un
 breakpoint de gdb con `printf`, o publicar la memoria desde el modelo como hacen
 `ATASONG`/`ATALND`. Intentar deducirlo filtrando capturas de registros dio muestras
 de audio disfrazadas de direcciones (§11.102).
+
+## 11.104 El anillo del render está SANO, y el hueco queda caracterizado
+
+Descompuesta la suma del destino con un breakpoint justo después del getter
+(`0x08016e64`, donde `[sp]` ya contiene base_del_firmware + posición_del_SM1):
+
+```
+GET sp0=0x22025800   r4=0x0bb12d54
+GET sp0=0x22025c00   r4=0x0bb12d54     <- avanza en pasos de 0x400
+```
+
+El getter devuelve direcciones de **IRAM1 alrededor de `0x22025800`**, y **avanzan
+ordenadamente** de 1 KB en 1 KB. Eso no es un puntero desbocado: es un anillo que
+progresa como debe. Sumado el desplazamiento `[r4+12]` (§11.103), el render escribe
+sus trozos de 4 a 520 bytes dentro de esa zona.
+
+**Con esto el cuadro queda cerrado y cada pieza medida:**
+
+```
+el render escribe PCM en el anillo de IRAM1   ~0x22025800, avanzando  <- SANO
+el DMA reproduce desde IRAM0                   0x22008c5c/0x22009c5c  <- SANO
+el driver rota los dos buferes de IRAM0        0x22004b10..0x22004b64 <- SANO
+lo unico que toca esos buferes es el memset a CERO                    <- underrun correcto
+FALTA: quien mueva el PCM del anillo de IRAM1 a los buferes de IRAM0
+```
+
+Y eso descarta, con medida, la sospecha de §11.103 de que el envoltorio del anillo
+(`SM1_POS_RING_FRAMES`) estuviera desviando la escritura: la posición que el firmware
+acaba usando es pequeña y ordenada, así que **el desvío no está ahí**. El anillo mal
+dimensionado sí corrompe la zona de control (§11.66) y conviene arreglarlo, pero no
+es la causa del silencio.
+
+**La frase final del diagnostico, con todo medido:** la reproduccion no suena porque
+**nadie copia el audio decodificado desde el anillo del render hasta el bufer que el
+DMA reproduce**. Todo lo demas de la cadena —lectura de disco, aterrizaje en memoria,
+decodificacion en el anillo, rotacion de buferes, DMA, I2S, WAV— esta verificado y
+funciona.
