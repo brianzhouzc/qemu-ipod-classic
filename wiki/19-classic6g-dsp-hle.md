@@ -5420,3 +5420,56 @@ Los búferes de salida del códec son `0x08a873c0` y `0x08a8b3c0` en SDRAM, en d
 búfer. Ese es el siguiente objetivo, y es concreto: quién debería escribir en ellos.
 
 **La música no sale del reproductor nativo.**
+
+## 11.115 SM1_DECODE: el sitio correcto, y un control que lo desmiente igual
+
+El productor `0x081db4c8` **no es un descodificador**: es un repartidor de dos búferes
+fijos, que devuelve éxito siempre.
+
+```
+81db4f0: ldrne r1, =0x08a873c0     ; dos direcciones, literales
+81db4f4: ldreq r3, =0x08a8b3c0
+81db504: str r1,[r2]               ; entrega una
+81db510: mov r0,#0                 ; y siempre reporta exito
+```
+
+El firmware copia de ahí 1024 marcos estéreo (`r5*4` = 4096 bytes, medido). O sea que
+esos dos búferes son el destino REAL donde el motor debe dejar su PCM — no el anillo
+de IRAM1 que §11.113 probó y falló. `SM1_DECODE=1` los rellena.
+
+Además, dos errores propios corregidos con medida:
+
+- **Factor 2 en el ritmo.** Una ranura son `SM1_SLOT_FRAMES` *muestras* de 16 bits =
+  4096 bytes, que en estéreo son 1024 **marcos**, y `pos` cuenta marcos. Dividir por
+  2048 liberaba ranuras a la mitad del ritmo al que se consumen.
+- **La posición venía del sitio equivocado.** Con decodificación, `sm1_stream_pos`
+  tomaba el cursor del anfitrión en vez del I2S que mueve el invitado. Medido: la
+  bomba se congelaba en ~44 activaciones incluso con ventana de 150 s.
+
+Corregidas las dos, la medida es espectacular... y engañosa:
+
+```
+sin SM1_DECODE   0.258% no nulas   pico 11444   rendret   44
+con SM1_DECODE  28.754% no nulas   pico 32768   rendret 1699   (tramos 15-20 continuos)
+```
+
+### El control que lo desmiente
+
+`SM1_FEED_OFF=1` apaga el atajo del anfitrión, dejando el camino del invitado como
+única ruta posible del PCM al altavoz:
+
+```
+28.754%  ->  0.181%      pico 32768 -> 11444
+```
+
+**La música era del atajo, no del camino del invitado.** El 28.75% frente al 21.06%
+del atajo solo se explica porque `SM1_SLOTS` mantiene vivo al reproductor más tiempo,
+así que el atajo alimenta durante más rato -- no porque el invitado aporte nada.
+
+`SM1_DECODE` sí pone el PCM donde el invitado lo lee, y la bomba sí lo copia a las
+ranuras. Lo que no ocurre es el **último salto**: de la ranura de IRAM1 a los búferes
+de DMA de IRAM0, que hace el driver de salida y que está condicionado al byte de
+"audio disponible" (§11.111). Ese byte lo levanta la ruta de envío, y `decide` sigue
+valiendo 1.
+
+**Ese último salto es todo lo que queda. La música no sale del reproductor nativo.**

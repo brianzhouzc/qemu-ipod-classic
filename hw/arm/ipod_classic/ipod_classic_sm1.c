@@ -175,9 +175,19 @@ void ipod_classic_sm1_set_i2s(IPodClassicSM1State *s,
  */
 #define SM1_IRQ_TICK_MS 5
 
+static bool sm1_decode_on(void);
+
 static uint64_t sm1_stream_pos(IPodClassicSM1State *s)
 {
-    if (ipod_classic_hle_audio_have_pcm()) {
+    /*
+     * With SM1_DECODE the guest's own DMA is what plays the audio, so the
+     * position has to come from the I2S it actually drives. Taking the host
+     * shim's cursor instead stalls us: MEASURED, the render pump froze at ~44
+     * activations even over a 150 s window, because that cursor stops
+     * advancing and so the slot-freeing loop never crosses another boundary.
+     * Without SM1_DECODE the old preference stands, untouched.
+     */
+    if (!sm1_decode_on() && ipod_classic_hle_audio_have_pcm()) {
         return ipod_classic_hle_audio_position_frames();
     }
     return s->i2s ? s->i2s->tx_samples / 2 : 0;
@@ -260,6 +270,100 @@ static bool sm1_slots_on(void)
     return on == 1;
 }
 
+/*
+ * THE CODEC OUTPUT BUFFERS (SM1_DECODE=1).
+ *
+ * Where the guest actually reads its audio from is MEASURED, not assumed --
+ * which is what the first attempt got wrong (it filled the IRAM1 slot ring,
+ * which nothing transports). The pump asks 0x22003810 -> 0x081db4c8 for a
+ * buffer, and that function is not a decoder at all: it is a two-entry
+ * dispenser handing out one of two FIXED addresses carried as literals,
+ *
+ *     81db4f0: ldrne r1, =0x08a873c0
+ *     81db4f4: ldreq r3, =0x08a8b3c0
+ *     81db504: str r1,[r2]        ; hands it over
+ *     81db510: mov r0,#0          ; and always reports success
+ *
+ * then copies 1024 stereo frames out of it (r5*4 = 4096 bytes, measured). So
+ * something else is supposed to have FILLED those two buffers, and measured,
+ * their contents are all zeros at request 3, 60 and 150 alike. That is the
+ * whole silence: every stage below this one works.
+ *
+ * What should fill them is the MP3 decode the firmware delegates to this
+ * engine -- it hands us a descriptor chain at sub-block 4 +0x00 whose buffer
+ * carries real MP3 frames. Decoding those the way the undocumented on-chip
+ * codec does is not something to reverse-engineer; it is something to EMULATE,
+ * and ipod_classic_hle_audio.c already does it with verified output.
+ *
+ * Deliberately NOT touching hle_np_owns_feed this time: measured, switching
+ * the host shim off removed the only audio that did come out (21% non-zero ->
+ * 0.2%). If this path works the two should agree, not compete.
+ */
+#define SM1_CODEC_BUF_A      0x08a873c0
+#define SM1_CODEC_BUF_B      0x08a8b3c0
+#define SM1_CODEC_BUF_BYTES  4096      /* 1024 stereo frames, measured */
+
+static bool sm1_decode_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SM1_DECODE");
+        on = (e && *e && *e != '0') ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "SM1_DECODE: el motor entrega PCM en los buferes del "
+                    "codec (0x%08x / 0x%08x)\n",
+                    SM1_CODEC_BUF_A, SM1_CODEC_BUF_B);
+        }
+    }
+    return on == 1;
+}
+
+static void sm1_fill_codec_buffer(void)
+{
+    static unsigned which;
+    static size_t cursor;
+    uint8_t buf[SM1_CODEC_BUF_BYTES];
+    size_t n;
+
+    if (!sm1_decode_on() || !ipod_classic_hle_audio_have_pcm()) {
+        return;
+    }
+    /*
+     * SM1_FEED_OFF: switch the host shim's own DMA feed off, so the ONLY route
+     * from decoded PCM to the speaker is this one -- engine buffer, guest render
+     * pump, guest DMA, guest I2S. Purely an attribution control: if the music
+     * survives with it set, the guest's own path is carrying it.
+     */
+    if (getenv("SM1_FEED_OFF")) {
+        static bool told;
+        if (!told) {
+            told = true;
+            ipod_classic_hle_audio_set_np_feed(true);
+            fprintf(stderr, "SM1_FEED_OFF: el atajo del anfitrion queda apagado; "
+                    "el audio solo puede salir por el camino del invitado\n");
+        }
+    }
+
+    n = ipod_classic_hle_audio_copy_pcm(cursor, buf, sizeof(buf));
+    if (n == 0) {
+        return;                         /* nothing decoded yet, or track ended */
+    }
+    if (n < sizeof(buf)) {
+        memset(buf + n, 0, sizeof(buf) - n);
+    }
+    /*
+     * One buffer per frame report, alternating in the same order the dispenser
+     * does, so consecutive requests get consecutive audio. If the two ever fall
+     * out of step the result is a repeated or skipped chunk -- audible as a
+     * glitch, not as silence, which is exactly the distinction this is meant to
+     * make visible.
+     */
+    cpu_physical_memory_write((which & 1) ? SM1_CODEC_BUF_B : SM1_CODEC_BUF_A,
+                              buf, sizeof(buf));
+    which++;
+    cursor += n;
+}
+
 static int sm1_publish_slots(IPodClassicSM1State *s)
 {
     uint16_t h;
@@ -311,7 +415,14 @@ static int sm1_publish_slots(IPodClassicSM1State *s)
             /* Nothing played yet: the whole ring is the firmware's to fill. */
             base_pos = pos;
         }
-        uint64_t played = (pos - base_pos) / SM1_SLOT_FRAMES;
+        /*
+         * A slot is SM1_SLOT_FRAMES *16-bit samples* = 4096 bytes, which at
+         * stereo is 1024 FRAMES -- and `pos` counts frames, not samples. The
+         * first cut divided by SM1_SLOT_FRAMES and so freed slots at half the
+         * rate playback consumes them. Confirmed by the pump itself: it copies
+         * r5*4 = 4096 bytes per request with r5 = 1024 (measured).
+         */
+        uint64_t played = (pos - base_pos) / (SM1_SLOT_FRAMES / 2);
         while (freed < played + SM1_SLOT_COUNT) {
             unsigned i = (unsigned)(freed % SM1_SLOT_COUNT);
 
@@ -342,6 +453,9 @@ static int sm1_publish_slots(IPodClassicSM1State *s)
              * still the most likely account of what the engine does -- what it
              * lacks is the transport, not the idea.
              */
+
+            /* The engine's real output: PCM into the buffer the guest reads. */
+            sm1_fill_codec_buffer();
 
             h = cpu_to_le16(1);
             cpu_physical_memory_write(SM1_SLOT_ARRAY + 10 + i * 4, &h, 2);
