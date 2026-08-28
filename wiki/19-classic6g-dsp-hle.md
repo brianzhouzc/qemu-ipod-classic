@@ -4943,3 +4943,39 @@ aquí sólo lo hace al principio. Ahí estará el evento que el modelo no produc
 exactamente el mismo sitio al que apuntaba la primera medida de esta sesión
 (`0x081fef28`, "tres trabajos donde harían falta cuarenta por segundo"), ahora con
 todo el mecanismo intermedio explicado.
+
+## 11.107 LOS DOS ASIGNADORES SON DE ARRANQUE: no existe el camino recurrente
+
+Armando el breakpoint **antes** de pulsar reproducir (engancharlo 25 s después no ve
+nada, porque las asignaciones ocurren AL pulsar — mismo error de cronometraje que
+§11.81):
+
+```
+ASIGNA obj=0x0bae8ad8 valor=0x0ba77cf4 desde lr=0x0814ff50
+ASIGNA obj=0x0bae8ad8 valor=0x09555db0 desde lr=0x08150ff8
+ASIGNA obj=0x0bae8ad8 valor=0x0ba6f9f0 desde lr=0x0814ff50
+ASIGNA obj=0x0bae8ad8 valor=0x09555db0 desde lr=0x0814ff50
+ASIGNA obj=0x0bae8ad8 valor=0x0ba6f9f0 desde lr=0x08150ff8
+ASIGNA obj=0x0bae8ad8 valor=0x093afe58 desde lr=0x0814ff50
+```
+
+**Dos llamadores, los dos de inicialización:**
+
+- `0x08150ff8` está dentro de `0x08150d84`, la función de arranque de reproducción.
+- `0x0814ff50` es el retorno de `bl 0x8183d74` en `0x0814ff4c`, precedido de una
+  ristra de `strb` a `[r4+0x93d..0x941]` y llamadas de construcción — inicialización
+  sin ambigüedad.
+
+**No existe un camino recurrente de asignación.** En hardware real, quien vuelve a
+asignar es el retorno del ciclo: el DMA consume un búfer, su interrupción llega al
+driver, y el driver pide el siguiente al reproductor. Aquí ese último tramo —del
+driver de vuelta al reproductor— es el que no ocurre.
+
+Y encaja con todo: la interrupción del DMA llega (18 500 terminal-counts), el driver
+corre (borra y consulta el flag ~43 veces por segundo), pero **no reengancha con el
+productor**. Por eso el productor sólo trabaja las seis veces del arranque.
+
+**El diagnóstico final de esta investigación, en una frase:** el ciclo de audio de
+retailOS es reactivo —consumir un búfer debe pedir el siguiente— y en esta emulación
+**el lazo se abre justo en el retorno del driver al reproductor**. Todo lo demás
+—disco, memoria, decodificación, anillo, DMA, I2S— está medido y funciona.
