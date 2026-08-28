@@ -4851,3 +4851,53 @@ es la causa del silencio.
 DMA reproduce**. Todo lo demas de la cadena —lectura de disco, aterrizaje en memoria,
 decodificacion en el anillo, rotacion de buferes, DMA, I2S, WAV— esta verificado y
 funciona.
+
+## 11.105 EL MECANISMO COMPLETO: un byte de handshake, y quién lo pone
+
+Siguiendo el llamador del relleno de silencio hasta el fondo, con breakpoints
+condicionales de gdb (la única herramienta que filtra en el momento de capturar; las
+sondas con tope se llenaban siempre en el arranque):
+
+```
+220077b8: bl 0x220002d4     borra el bufer elegido, 4096 bytes
+220077bc: bl 0x220073c8     getter -> objeto 0x22010318
+220077c0: bl 0x22007440     ldr r0,[obj+0x20] -> firmware 0x0816c150
+0816c150: ldrb r0,[r0]      <-- UNA instruccion: devuelve *(byte*)
+220077c4: cmp r0, #0
+220077cc: beq 0x220077f4    CERO  -> no llena; queda el silencio del borrado
+220077ec: bl 0x22006ac0     NO CERO -> LLENA el bufer con audio
+```
+
+**Todo depende de un byte.** Y ese byte, medido con watchpoint, **sí se activa**:
+
+```
+flag en 0x0bb169dc
+SET flag=1  desde lr=0x081fef40   x4
+SET flag=0  desde lr=0x220055b4   x1
+```
+
+`lr=0x081fef40` sitúa la llamada en `0x081fef3c` (`bl 0x8015b28`), dentro de la misma
+función que **`0x081fef28`** — el sitio de envío del firmware que fue la PRIMERA
+medida de esta sesión. Y lo pone a 1 **cuatro veces**, que es exactamente el "3
+trabajos + 1 arranque" medido entonces.
+
+**Dos correcciones que esto obliga:**
+
+1. §11.63 decía que el borrado del búfer es la ruta de underrun. **No lo es:** es un
+   "limpiar antes de llenar" incondicional. El fallo no es que alguien rellene de
+   silencio, es que el paso de llenar con audio no se ejecuta.
+2. §11.99 decía "el productor no existe". **Existe y funciona** — pone el flag cuatro
+   veces. Lo que no hace es repetirlo al ritmo que el consumidor necesita (~43/s).
+
+**El mecanismo, ya completo y sin huecos:**
+
+```
+el productor (0x081fef3c) marca "hay audio"     4 veces
+el driver borra el bufer y consulta el flag     ~43 veces por segundo
+   lo encuentra a 1 -> llena con audio          4 veces
+   lo encuentra a 0 -> deja el silencio         el resto
+el DMA entrega lo que haya                      18 500 buferes
+```
+
+Y con eso la pregunta de toda la investigación queda reducida a su forma mínima, en
+el mismo sitio donde empezó: **qué debería hacer que `0x081fef28` se repita.**
