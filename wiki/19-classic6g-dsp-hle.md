@@ -5617,3 +5617,53 @@ capa 0 el reloj, capa 1 la carátula, capa 2 la lista con el icono de altavoz. E
 firmware nunca la dibuja.
 
 **No se ha conseguido ver el reproductor completo.**
+
+## 11.119 EL REPRODUCTOR COMPLETO: el compositor tenía las capas al revés
+
+La pantalla de Now Playing **siempre se estuvo dibujando**. La tapábamos.
+
+Volcadas las superficies con el reproductor abierto, la capa 0 contiene el reproductor
+entero -- barra "Now Playing", artista, álbum, "4 of 4" y la barra de progreso -- y la
+capa 1 la carátula, opaca y a pantalla completa. El compositor dibujaba de atrás a
+adelante empezando por la ranura 0, así que la carátula borraba el reproductor y
+dejaba justo el lado derecho en blanco que hacía pensar en una pantalla a medio
+dibujar.
+
+Y hay una segunda mitad del mismo error: **el modelo descartaba el canal alfa**. La
+capa de 32 bits lo lleva de verdad -- volcada mientras el reproductor está en
+pantalla, su byte de alfa toma **243 valores distintos**, que ninguna lectura de
+"ignóralo" sobrevive.
+
+`DISP_ALPHA=1` compone de delante a atrás con *source-over*. Eso explica **las dos**
+cosas a la vez: el reproductor queda encima de la carátula, y el barrido del menú de
+idioma -- que fue de donde se dedujo el orden Z original, suponiendo capas opacas --
+sigue funcionando porque el panel entrante es transparente allí donde debe verse el
+saliente. Comprobado: el menú de idioma y las listas se dibujan igual que antes.
+
+```
+Now Playing                    [>] [bateria cargando]
++-----------+   Billie Jean
+|  caratula |   Michael Jackson
+|           |   Greatest Hits
++-----------+   1 of 4
+ 0:00  [============================]  -4:55
+```
+
+### El anillo era demasiado grande
+
+Con `SM1_DECODE` la interfaz se congelaba a medio entrar mientras el audio seguía
+sonando. Causa: publicamos 7 ranuras, o sea 28 KiB desde `0x22038100`, y **escribir
+PCM en todo ese rango pisa memoria que no es nuestra**. Publicar el estado es
+inofensivo; escribir 28 KiB no lo es. `SM1_NSLOTS` permite barrerlo, y con **2
+ranuras** la interfaz aguanta y el audio sigue saliendo.
+
+**Resultado, todo a la vez y medido:** pantalla completa del reproductor con nombre de
+canción, artista, álbum, pista N de M y barra de progreso; audio 12.89% de muestras no
+nulas con pico 32768 y el atajo del anfitrión APAGADO; y el reproductor no se cierra.
+
+### Lo que falta
+
+El tiempo transcurrido se queda en **0:00**. Hacer que el registro de posición del SM1
+siga al I2S (como ya hace `sm1_stream_pos`) **no** lo mueve, así que ese contador no
+sale de ahí: lo lleva la contabilidad interna del reproductor. Es lo único que queda
+para que la barra avance.

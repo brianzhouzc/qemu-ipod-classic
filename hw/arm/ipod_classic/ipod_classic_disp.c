@@ -218,6 +218,19 @@ static unsigned disp_bpp(unsigned fmt)
     }
 }
 
+static bool disp_alpha_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DISP_ALPHA");
+        on = (e && *e && *e != '0') ? 1 : 0;
+        if (on) {
+            fprintf(stderr, "DISP_ALPHA: capas compuestas de delante a atras con alfa\n");
+        }
+    }
+    return on == 1;
+}
+
 static inline uint16_t disp_rgb565(unsigned r, unsigned g, unsigned b)
 {
     return ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3);
@@ -327,6 +340,28 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
         if (bpp == 4) {
             for (int i = 0; i < w; i++) {
                 const uint8_t *p = s->rowbuf + i * 4;
+                /*
+                 * ALPHA (DISP_ALPHA=1). The 32-bit layer really does carry one:
+                 * dumped while Now Playing is up, its alpha byte takes 243
+                 * distinct values across the surface, which no "ignore it"
+                 * reading survives. Straight source-over onto what is already
+                 * in the framebuffer.
+                 */
+                if (disp_alpha_on()) {
+                    unsigned a = p[3];
+                    if (a == 0) {
+                        continue;
+                    }
+                    if (a != 0xff) {
+                        uint16_t d = dst[i];
+                        unsigned dr = (d >> 8) & 0xf8, dg = (d >> 3) & 0xfc;
+                        unsigned db = (d << 3) & 0xf8;
+                        dst[i] = disp_rgb565((p[2] * a + dr * (255 - a)) / 255,
+                                             (p[1] * a + dg * (255 - a)) / 255,
+                                             (p[0] * a + db * (255 - a)) / 255);
+                        continue;
+                    }
+                }
                 dst[i] = disp_rgb565(p[2], p[1], p[0]);
             }
         } else {
@@ -369,6 +404,28 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
      * bits 4..6, they move all the time, and ignoring them left every finished
      * transition's surface on the panel for ever. See the header.
      */
+    /*
+     * Z ORDER, and DISP_ALPHA=1 turns it over.
+     *
+     * The order below (slot 0 at the back) was inferred from the language
+     * screen's wipe, on the assumption that every layer is opaque. MEASURED,
+     * that assumption is false: the 32-bit layer carries a real alpha channel,
+     * and while Now Playing is on screen slot 0 holds the ENTIRE player UI --
+     * title bar, artist, album, "4 of 4", progress bar -- while slot 1 holds
+     * the album art, opaque and full-screen. Drawn back-to-front the art wipes
+     * the player out completely, which is exactly the blank right-hand side
+     * that made the screen look half-drawn.
+     *
+     * Front-to-back with source-over alpha explains BOTH: the player UI sits on
+     * top of the art, and the language wipe still works because the incoming
+     * pane is transparent where the outgoing one must show through.
+     */
+    if (disp_alpha_on()) {
+        for (int k = S5L8702_DISP_NSLOTS - 1; k >= 0; k--) {
+            drew |= disp_draw_layer(s, k, fb, width, height);
+        }
+        return drew;
+    }
     for (int k = 0; k < S5L8702_DISP_NSLOTS; k++) {
         drew |= disp_draw_layer(s, k, fb, width, height);
     }

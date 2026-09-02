@@ -81,6 +81,8 @@
  * It is modelled anyway because it is a real register and a faked constant here
  * would be exactly the kind of thing that stalls a path we have not yet walked.
  */
+static bool sm1_decode_on(void);
+
 static bool sm1_pos_reg(IPodClassicSM1State *s, hwaddr offset, uint32_t *out)
 {
     for (int idx = 0; idx < S5L8702_SM1_POS_CHANS; idx++) {
@@ -94,7 +96,14 @@ static bool sm1_pos_reg(IPodClassicSM1State *s, hwaddr offset, uint32_t *out)
          * reflect in the position register; otherwise fall back to the I2S
          * transmit-sample count. */
         uint64_t pos;
-        if (ipod_classic_hle_audio_have_pcm()) {
+        /*
+         * Same rule as sm1_stream_pos: with SM1_DECODE the guest's own DMA is
+         * what plays, so the position it reads back has to come from the I2S it
+         * drives. Left on the host cursor the Now Playing screen renders but
+         * its elapsed time sits at 0:00 for ever, because that cursor is not
+         * the one moving.
+         */
+        if (!sm1_decode_on() && ipod_classic_hle_audio_have_pcm()) {
             pos = ipod_classic_hle_audio_position_frames();
         } else {
             pos = s->i2s ? s->i2s->tx_samples / 2 : 0;
@@ -175,8 +184,6 @@ void ipod_classic_sm1_set_i2s(IPodClassicSM1State *s,
  */
 #define SM1_IRQ_TICK_MS 5
 
-static bool sm1_decode_on(void);
-
 static uint64_t sm1_stream_pos(IPodClassicSM1State *s)
 {
     /*
@@ -251,7 +258,37 @@ static void sm1_irq_off(void *opaque)
 #define SM1_SLOT_ARRAY       0x22038000   /* [table+12] per-slot state     */
 #define SM1_SLOT_PCM         0x22038100   /* [table+16] the PCM ring       */
 #define SM1_SLOT_FRAMES      2048         /* frames per slot (DMA burst)   */
-#define SM1_SLOT_COUNT       7            /* 7 * 4096 = 28 KiB below 0x…ff00 */
+#define SM1_SLOT_COUNT_MAX   7            /* 7 * 4096 = 28 KiB below 0x…ff00 */
+
+/*
+ * HOW MUCH OF IRAM1 IS ACTUALLY OURS is not something the firmware tells us --
+ * we publish the geometry, so we also choose how much memory it implies. Seven
+ * slots claims 28 KiB from 0x22038100, and MEASURED, filling all of it freezes
+ * the user interface mid-transition into Now Playing while the audio keeps
+ * playing: the screen renders fully with SM1_SLOTS alone, and with SM1_DECODE
+ * added it stops half-drawn. Publishing the state is harmless; WRITING 28 KiB
+ * of PCM through it is not, which says the ring is smaller than we claimed and
+ * the tail lands on something else's memory.
+ *
+ * SM1_NSLOTS sweeps it so the real size can be found by bisection instead of
+ * guessed.
+ */
+static unsigned sm1_slot_count(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("SM1_NSLOTS");
+        n = (e && *e) ? atoi(e) : SM1_SLOT_COUNT_MAX;
+        if (n < 1) {
+            n = 1;
+        }
+        if (n > SM1_SLOT_COUNT_MAX) {
+            n = SM1_SLOT_COUNT_MAX;
+        }
+    }
+    return (unsigned)n;
+}
+#define SM1_SLOT_COUNT       sm1_slot_count()
 #define SM1_SLOT_BYTES       (SM1_SLOT_FRAMES * 2)   /* = the firmware's own
                                           * derivation: size = samples * 2 */
 
