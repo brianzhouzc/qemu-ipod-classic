@@ -148,8 +148,24 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
          * which of USB or adapter a real device would report depends on what
          * it is plugged into, and we are plugged into nothing.
          */
-        if (getenv("PMUCHARGER")) {
-            val |= PCF5063X_MBCS1_ADAPTPRES | PCF5063X_MBCS1_ADAPTOK;
+        {
+            const char *e = getenv("PMUCHARGER");
+            if (e && *e) {
+                /*
+                 * WHICH KIND of external power matters, and getting it wrong
+                 * was MEASURED: reporting the wall ADAPTER puts the device
+                 * into its full-screen "Charging" mode and it stops playing --
+                 * which is what a real iPod does on a charger, so the model was
+                 * right and the choice was wrong. USB power is the one that
+                 * leaves it usable. Default is USB; PMUCHARGER=adapter keeps
+                 * the other one reachable for testing that screen on purpose.
+                 */
+                if (!strcmp(e, "adapter")) {
+                    val |= PCF5063X_MBCS1_ADAPTPRES | PCF5063X_MBCS1_ADAPTOK;
+                } else {
+                    val |= PCF5063X_MBCS1_USBPRES | PCF5063X_MBCS1_USBOK;
+                }
+            }
         }
         break;
     case PCF5063X_REG_RTCSC:
