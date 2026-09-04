@@ -26,3 +26,4 @@ GTAGS
 # iPod classic 6G work: firmware images, extracted blobs, Rockbox reference
 # sources and test binaries. Big and not ours to redistribute.
 /assets/
+hilo-x/
