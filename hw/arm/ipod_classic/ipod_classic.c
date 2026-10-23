@@ -78,7 +78,7 @@ static void ipod_classic_cpu_setup(MachineState *machine, MemoryRegion **sysmem,
 static void ipod_classic_write_bootinfo(IPodClassicMachineState *nms)
 {
     uint32_t sysinfo[S5L8702_SYSINFO_SIZE / 4] = {
-        [S5L8702_SYSINFO_HW_ID_OFF / 4]     = cpu_to_le32(S5L8702_HW_ID),
+        [S5L8702_SYSINFO_HW_ID_OFF / 4]     = cpu_to_le32(nms->hw_id),
         [S5L8702_SYSINFO_DRAM_SIZE_OFF / 4] = cpu_to_le32(SDRAM_MEM_SIZE),
         [S5L8702_SYSINFO_DRAM_BASE_OFF / 4] = cpu_to_le32(SDRAM_MEM_BASE),
     };
@@ -370,6 +370,14 @@ static void ipod_classic_instance_init(Object *obj)
         "Answer ARM semihosting calls (SVC 0x123456). Apple's retailOS prints "
         "its diagnostics through them. Turn it off to see the firmware take "
         "the SVC vector instead.");
+
+    IPOD_CLASSIC_MACHINE(obj)->hw_id = S5L8702_HW_ID;
+    object_property_add_uint32_ptr(obj, "hw-id",
+                                   &IPOD_CLASSIC_MACHINE(obj)->hw_id,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "hw-id",
+        "SysInfo hardware id at +0x84. 0x00130000 is the 6G the 1.1.2 work "
+        "used; Apple 2.0.5 needs 0x00130300 or above.");
 }
 
 static inline qemu_irq s5l8702_get_irq(IPodClassicMachineState *s, int n)

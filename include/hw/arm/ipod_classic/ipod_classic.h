@@ -241,6 +241,13 @@ typedef struct {
      */
     hwaddr reset_pc;
     char bootrom_path[1024];
+    /*
+     * SysInfo +0x84, the "hw-id" property. Defaults to S5L8702_HW_ID. Apple
+     * 2.0.5 (Firmware-38) demands (id >> 16) == 0x13 && (id & 0xffff) >= 0x300
+     * at 0x082b32e4 and reboots into "softupdt" otherwise, so it needs
+     * 0x00130300 -- the value osos-lab's companion writes for that runtime.
+     */
+    uint32_t hw_id;
 } IPodClassicMachineState;
 
 #endif
