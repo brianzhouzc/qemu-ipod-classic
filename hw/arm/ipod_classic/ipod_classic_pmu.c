@@ -53,6 +53,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/i2c/i2c.h"
 #include "migration/vmstate.h"
 #include "sysemu/rtc.h"
@@ -315,11 +316,36 @@ static int ipod_classic_pmu_event(I2CSlave *i2c, enum i2c_event event)
  * regardless of interleaving. The pointer still auto-advances within a
  * transaction, so multi-byte reads and writes are unchanged.
  */
+/*
+ * PMUPTR=1: log every pointer set, read and write with the host wall time (so
+ * it lines up with when a key was sent) and the virtual time, to see whether a
+ * hold-switch read (pointer set to 0x87) comes back with some other register
+ * because a second set-pointer landed in between.
+ */
+static void pmu_ptr_trace(const char *what, uint8_t addr, int val)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PMUPTR") != NULL;
+    }
+    if (on) {
+        fprintf(stderr, "PMUPTR %" PRId64 " %" PRId64 " %s %02x",
+                g_get_real_time(), qemu_clock_get_us(QEMU_CLOCK_VIRTUAL),
+                what, addr);
+        if (val >= 0) {
+            fprintf(stderr, "=%02x", val);
+        }
+        fputc('\n', stderr);
+    }
+}
+
 static uint8_t ipod_classic_pmu_recv(I2CSlave *i2c)
 {
     IPodClassicPMUState *s = IPOD_CLASSIC_PMU(i2c);
     uint8_t val = pmu_reg_read(s, s->addr);
 
+    pmu_ptr_trace("R", s->addr, val);
     s->addr++;
     return val;
 }
@@ -331,7 +357,9 @@ static int ipod_classic_pmu_send(I2CSlave *i2c, uint8_t data)
     if (s->addr_pending) {
         s->addr = data;
         s->addr_pending = false;
+        pmu_ptr_trace("P", data, -1);
     } else {
+        pmu_ptr_trace("W", s->addr, data);
         pmu_reg_write(s, s->addr, data);
         s->addr++;
         s->wrote_data = true;

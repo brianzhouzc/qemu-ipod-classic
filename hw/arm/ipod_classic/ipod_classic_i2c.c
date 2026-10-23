@@ -32,6 +32,9 @@ static void ipod_classic_i2c_byte_done(void *opaque)
 {
     IPodClassicI2CState *s = opaque;
 
+    if (getenv("I2CTRACE")) {
+        fprintf(stderr, "I2C %" PRId64 " byte-done\n", g_get_real_time());
+    }
     s->byte_done = true;
     s->iicstat2 |= S5L8702_IICSTAT2_BYTE;
     if (s->in_address) {
@@ -85,11 +88,35 @@ static void ipod_classic_i2c_go(IPodClassicI2CState *s)
     }
 }
 
+/* I2CTRACE=1: every register access, with host wall time, for the PMU race. */
+static void i2c_trace(const char *what, hwaddr offset, uint64_t value)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("I2CTRACE") != NULL;
+    }
+    if (on && offset != S5L8702_IICUNK10) {
+        fprintf(stderr, "I2C %" PRId64 " %s %02" HWADDR_PRIx "=%" PRIx64 "\n",
+                g_get_real_time(), what, offset, value);
+    }
+}
+
+static uint64_t ipod_classic_i2c_read_reg(IPodClassicI2CState *s,
+                                          hwaddr offset);
+
 static uint64_t ipod_classic_i2c_read(void *opaque, hwaddr offset,
                                       unsigned size)
 {
-    IPodClassicI2CState *s = opaque;
+    uint64_t value = ipod_classic_i2c_read_reg(opaque, offset);
 
+    i2c_trace("r", offset, value);
+    return value;
+}
+
+static uint64_t ipod_classic_i2c_read_reg(IPodClassicI2CState *s,
+                                          hwaddr offset)
+{
     switch (offset) {
     case S5L8702_IICCON:
         return s->iiccon | (s->byte_done ? S5L8702_IICCON_GO : 0);
@@ -126,6 +153,7 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
 {
     IPodClassicI2CState *s = opaque;
 
+    i2c_trace("w", offset, value);
     switch (offset) {
     case S5L8702_IICCON:
         s->iiccon = value & ~S5L8702_IICCON_GO;
