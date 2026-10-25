@@ -23,6 +23,7 @@
 
 #include "qemu/osdep.h"
 #include "exec/cpu_ldst.h"
+#include "sysemu/cpu-timers.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-ldst.h"
 #include <string.h>
@@ -270,6 +271,21 @@ void init_wasm32()
         ctx.tci_tb_ptr = (uint32_t*)&tci_tb_ptr;
         init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx, (int)&instance_garbage_collected_local);
         initdone = true;
+
+        /*
+         * The Wasm JIT and -icount do not mix yet.
+         *
+         * With -icount and the JIT on, the emulated iPod Classic sometimes
+         * branches into kernel data a few million instructions into the
+         * boot (a prefetch abort that our CFW turns into its panic screen),
+         * while the same guest under the TCI interpreter keeps running.
+         * The JIT is only exercised without icount until that is fixed;
+         * icount is what makes the click wheel and the timers usable, so
+         * correctness wins over speed here.
+         */
+        if (icount_enabled()) {
+            instantiate_num = INT32_MAX;
+        }
     }
 }
 
