@@ -37,6 +37,18 @@ int get_core_nums();
 
 void init_wasm32();
 
+/*
+ * A block is interpreted until it has run this many times, then translated
+ * into a Wasm module. ktock's default is 1500; the machine's wasm-instantiate
+ * property overrides it at run time so a boot can be measured at another
+ * threshold.
+ */
 #define INSTANTIATE_NUM 1500
+
+/* How many translation blocks have been compiled into Wasm modules so far. */
+extern unsigned long wasm_tb_compiled_count;
+
+/* Override the run count at which a block is compiled (machine property). */
+void wasm_set_instantiate_num(int n);
 
 #endif

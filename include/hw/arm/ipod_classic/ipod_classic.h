@@ -248,6 +248,14 @@ typedef struct {
      * 0x00130300 -- the value osos-lab's companion writes for that runtime.
      */
     uint32_t hw_id;
+    /*
+     * Both are measurement knobs, default 0 (off).
+     *   heartbeat         print clocks/instructions every N ms (real time)
+     *   wasm-instantiate  Wasm build: translate a hot block after N runs
+     *                     instead of the built-in 1500, for boot timings
+     */
+    uint32_t heartbeat_ms;
+    uint32_t wasm_instantiate;
 } IPodClassicMachineState;
 
 #endif

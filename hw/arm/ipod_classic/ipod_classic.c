@@ -39,6 +39,11 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "semihosting/semihost.h"
+#include "sysemu/cpu-timers.h"
+
+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+#include "tcg/wasm32.h"
+#endif
 
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
@@ -378,6 +383,22 @@ static void ipod_classic_instance_init(Object *obj)
     object_property_set_description(obj, "hw-id",
         "SysInfo hardware id at +0x84. 0x00130000 is the 6G the 1.1.2 work "
         "used; Apple 2.0.5 needs 0x00130300 or above.");
+
+    IPOD_CLASSIC_MACHINE(obj)->heartbeat_ms = 0;
+    object_property_add_uint32_ptr(obj, "heartbeat",
+                                   &IPOD_CLASSIC_MACHINE(obj)->heartbeat_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "heartbeat",
+        "Print the guest clocks and instruction count every N milliseconds of "
+        "real time, for measuring a slow (browser) boot. 0, the default, is off.");
+
+    IPOD_CLASSIC_MACHINE(obj)->wasm_instantiate = 0;
+    object_property_add_uint32_ptr(obj, "wasm-instantiate",
+                                   &IPOD_CLASSIC_MACHINE(obj)->wasm_instantiate,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "wasm-instantiate",
+        "Wasm build only: translate a translation block into a Wasm module "
+        "after it has run N times, instead of the built-in 1500. 0 keeps 1500.");
 }
 
 static inline qemu_irq s5l8702_get_irq(IPodClassicMachineState *s, int n)
@@ -568,6 +589,43 @@ static const MemoryRegionOps ipod_classic_rng_ops = {
     .valid.max_access_size = 4,
 };
 
+static QEMUTimer *ipod_heartbeat_timer;
+static int ipod_heartbeat_ms;
+
+/*
+ * IPOD_HEARTBEAT_MS=5000: say where the boot is, on the real-time clock.
+ * The browser build can take minutes before the first display write, and
+ * without this there is no way to tell a slow emulator from a stuck one.
+ * It also gives the Wasm build's JIT count, the number of translation blocks
+ * that have been compiled into Wasm modules.
+ */
+static void ipod_heartbeat(void *opaque)
+{
+    unsigned long compiled = 0;
+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+    compiled = wasm_tb_compiled_count;
+#endif
+    fprintf(stderr,
+            "s5l8702.machine: heartbeat rt_ns=%" PRId64 " vclock_ns=%" PRId64
+            " icount=%" PRId64 " wasm_tb=%lu\n",
+            qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+            icount_enabled() ? icount_get_raw() : -1, compiled);
+    timer_mod(ipod_heartbeat_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ipod_heartbeat_ms);
+}
+
+static void ipod_heartbeat_start(int ms)
+{
+    if (ms <= 0) {
+        return;
+    }
+    ipod_heartbeat_ms = ms;
+    ipod_heartbeat_timer = timer_new_ms(QEMU_CLOCK_REALTIME, ipod_heartbeat, NULL);
+    timer_mod(ipod_heartbeat_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ipod_heartbeat_ms);
+}
+
 static void ipod_classic_machine_init(MachineState *machine)
 {
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(machine);
@@ -585,6 +643,12 @@ static void ipod_classic_machine_init(MachineState *machine)
     fprintf(stderr, "s5l8702.machine: start rt_ns=%" PRId64 " vclock_ns=%" PRId64 "\n",
             qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    ipod_heartbeat_start(nms->heartbeat_ms);
+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+    if (nms->wasm_instantiate > 0) {
+        wasm_set_instantiate_num(nms->wasm_instantiate);
+    }
+#endif
 
     if (nms->semihosting) {
         qemu_semihosting_enable();

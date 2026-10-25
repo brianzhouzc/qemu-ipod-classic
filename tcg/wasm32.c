@@ -30,6 +30,17 @@
 #include <emscripten/threading.h>
 #include "wasm32.h"
 
+unsigned long wasm_tb_compiled_count;
+
+static int instantiate_num = INSTANTIATE_NUM;
+
+void wasm_set_instantiate_num(int n)
+{
+    if (n > 0) {
+        instantiate_num = n;
+    }
+}
+
 __thread uintptr_t tci_tb_ptr;
 
 /* Disassemble TCI bytecode. */
@@ -185,7 +196,7 @@ static int get_instance_running_local(void *tb_ptr)
     if (elm->tb != tb_ptr) {
         *(uint32_t*)tb_export_ptr = 0;
         int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
-        *(uint32_t*)tb_counter_ptr = INSTANTIATE_NUM; // will be instanciated immediately
+        *(uint32_t*)tb_counter_ptr = instantiate_num; // will be instanciated immediately
         return 0;
     }
     return elm->fidx;
@@ -1225,7 +1236,7 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
                 tb_ptr = *(uint32_t **)ptr;
                 ctx.tb_ptr = tb_ptr;
                 int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
-                if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < INSTANTIATE_NUM)) {
+                if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < instantiate_num)) {
                     *(int32_t*)tb_counter_ptr += 1;
                 } else {
                     // enter to wasm TB
@@ -1246,7 +1257,7 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
 
             ctx.tb_ptr = tb_ptr;
             int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
-            if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < INSTANTIATE_NUM)) {
+            if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < instantiate_num)) {
                 *(int32_t*)tb_counter_ptr += 1;
             } else {
                 // enter to wasm TB
@@ -1330,7 +1341,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
         int fidx = get_instance_running_local(ctx.tb_ptr);
         if (fidx > 0) {
             res = ((wasm_func_ptr)(fidx))(&ctx);
-        } else if (*(int32_t*)tb_counter_ptr < INSTANTIATE_NUM) {
+        } else if (*(int32_t*)tb_counter_ptr < instantiate_num) {
             *(int32_t*)tb_counter_ptr += 1;
             res = tcg_qemu_tb_exec_tci(env);
         } else if (!can_add_instance()) {
@@ -1339,6 +1350,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
             res = tcg_qemu_tb_exec_tci(env);
         } else {
             int fidx = instantiate_wasm();
+            wasm_tb_compiled_count++;
             add_instance_running_local(fidx, ctx.tb_ptr);
             res = ((wasm_func_ptr)(fidx))(&ctx);
         }
