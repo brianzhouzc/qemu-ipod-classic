@@ -32,6 +32,22 @@ SRST
 ERST
 
     {
+        .name       = "vclock",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show the guest virtual clock and instruction count",
+        .cmd        = hmp_info_vclock,
+    },
+
+SRST
+  ``info vclock``
+    Show the guest's virtual clock in nanoseconds, and with ``-icount`` the
+    number of guest instructions executed so far.  The emulator's timing
+    measurements read this from the monitor; it is cheap and does not disturb
+    the guest.
+ERST
+
+    {
         .name       = "network",
         .args_type  = "",
         .params     = "",

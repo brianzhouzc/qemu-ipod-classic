@@ -27,6 +27,7 @@
 #include "qemu/cutils.h"
 #include "hw/intc/intc.h"
 #include "qemu/log.h"
+#include "sysemu/cpu-timers.h"
 #include "sysemu/sysemu.h"
 
 bool hmp_handle_error(Monitor *mon, Error *err)
@@ -79,6 +80,21 @@ void hmp_info_version(Monitor *mon, const QDict *qdict)
                    info->package);
 
     qapi_free_VersionInfo(info);
+}
+
+/*
+ * Timing measurements for the emulator (the browser port and the native
+ * baseline): the virtual clock is what the guest's timers run on, and with
+ * -icount the instruction count times the 4 ns shift is that same clock.
+ * Keeping both in one cheap, parseable line lets a driver sample them at the
+ * moment it sees a steady picture, instead of inferring a boot's cost from
+ * wall time.
+ */
+void hmp_info_vclock(Monitor *mon, const QDict *qdict)
+{
+    monitor_printf(mon, "vclock_ns=%" PRId64 " icount=%" PRId64 "\n",
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                   icount_enabled() ? icount_get_raw() : -1);
 }
 
 static int hmp_info_pic_foreach(Object *obj, void *opaque)
