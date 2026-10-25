@@ -37,6 +37,10 @@
 #include "qemu/main-loop.h"
 #include "qemu/plugin.h"
 #include "sysemu/cpus.h"
+
+#ifdef EMSCRIPTEN
+#include <emscripten/threading.h>
+#endif
 #include "qemu/guest-random.h"
 #include "hw/nmi.h"
 #include "sysemu/replay.h"
@@ -428,7 +432,20 @@ void qemu_wait_io_event(CPUState *cpu)
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
+#ifdef EMSCRIPTEN
+        /*
+         * A pthread condition variable does not reliably wake the vCPU from
+         * the main loop in this build: the guest was seen halted with
+         * exit_request already set, with the wakeup lost, so it never
+         * resumed. Poll with a short sleep instead; the cost only falls on
+         * an idle vCPU.
+         */
+        qemu_mutex_unlock(&qemu_global_mutex);
+        emscripten_thread_sleep(1.0);
+        qemu_mutex_lock(&qemu_global_mutex);
+#else
         qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
+#endif
     }
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);

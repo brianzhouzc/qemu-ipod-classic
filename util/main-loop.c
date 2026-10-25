@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
@@ -34,6 +35,42 @@
 #include "qemu/error-report.h"
 #include "qemu/queue.h"
 #include "qom/object.h"
+
+#ifdef EMSCRIPTEN
+#include <emscripten.h>
+#include <emscripten/threading.h>
+
+/*
+ * QEMU's main loop is a pthread here (PROXY_TO_PTHREAD) and qemu_notify_event
+ * is called from the vCPU thread, in particular when the vCPU goes idle so
+ * that the icount warp timer can be armed. Emscripten's poll() does not wake
+ * from another thread for QEMU's notify eventfd and does not honour the
+ * timeout the way QEMU expects, so the main loop can sleep through wakeups
+ * and the guest stalls on its first halt. Wait on a futex that
+ * qemu_notify_event() bumps instead, and only poll the descriptors without
+ * blocking.
+ */
+static int qemu_em_notify;
+
+static void qemu_em_notify_wait(int64_t timeout_ns)
+{
+    int expected = qatomic_read(&qemu_em_notify);
+    double ms;
+
+    if (timeout_ns < 0) {
+        ms = 10;
+    } else {
+        ms = (timeout_ns + 999999) / 1000000.0;
+        if (ms < 1) {
+            ms = 1;
+        }
+        if (ms > 10) {
+            ms = 10;    /* bound the cost of a missed notification */
+        }
+    }
+    emscripten_futex_wait(&qemu_em_notify, expected, ms);
+}
+#endif
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -149,6 +186,10 @@ void qemu_notify_event(void)
         return;
     }
     qemu_bh_schedule(qemu_notify_bh);
+#ifdef EMSCRIPTEN
+    qatomic_fetch_add(&qemu_em_notify, 1);
+    emscripten_futex_wake(&qemu_em_notify, INT32_MAX);
+#endif
 }
 
 static GArray *gpollfds;
@@ -305,7 +346,14 @@ static int os_host_main_loop_wait(int64_t timeout)
     qemu_mutex_unlock_iothread();
     replay_mutex_unlock();
 
+#ifdef EMSCRIPTEN
+    ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, 0);
+    if (ret == 0 && timeout != 0) {
+        qemu_em_notify_wait(timeout);
+    }
+#else
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
+#endif
 
     replay_mutex_lock();
     qemu_mutex_lock_iothread();
