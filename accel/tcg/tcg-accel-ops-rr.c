@@ -37,6 +37,16 @@
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
 
+/*
+ * The Wasm backend keeps per-thread state in Module.__wasm32_tb, set up by
+ * init_wasm32() from the vCPU thread. The ktock tree only did that in the
+ * MTTCG thread function, and MTTCG refuses -icount, so the single-thread path
+ * (the one the iPod machine needs) hit a null __wasm32_tb on its first TB.
+ */
+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+#include "../../tcg/wasm32.h"
+#endif
+
 /* Kick all RR vCPUs */
 void rr_kick_vcpu_thread(CPUState *unused)
 {
@@ -182,6 +192,9 @@ static void *rr_cpu_thread_fn(void *arg)
     Notifier force_rcu;
     CPUState *cpu = arg;
 
+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+    init_wasm32();
+#endif
     assert(tcg_enabled());
     rcu_register_thread();
     force_rcu.notify = rr_force_rcu;
