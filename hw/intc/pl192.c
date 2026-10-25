@@ -11,6 +11,7 @@
 #include "hw/hw.h"
 #include "qapi/error.h"
 #include "hw/intc/pl192.h"
+#include "migration/vmstate.h"
 
 extern CPUState *getMainCpuEnv(void);
 
@@ -346,6 +347,10 @@ static void pl192_irq_handler(void *opaque, int irq, int level)
 {
     PL192State *s = (PL192State *) opaque;
 
+    if (getenv("VICTRACE")) {
+        fprintf(stderr, "VICTRACE %s src %d -> %d\n",
+                s->iomem.name, irq, level);
+    }
     if (level) {
         s->rawintr |= 1 << irq;
     } else {
@@ -358,7 +363,6 @@ static void pl192_reset(DeviceState *d)
 {
     PL192State *s = PL192(d);
     int i;
-
     for (i = 0; i < PL192_INT_SOURCES; i++) {
         s->vect_priority[i] = 0xf;
     }
@@ -371,6 +375,55 @@ static void pl192_reset(DeviceState *d)
     s->irq_stack[0] = PL192_NO_IRQ;
     s->priority = 0x10;
 }
+
+static int pl192_post_load(void *opaque, int version_id)
+{
+    PL192State *s = opaque;
+
+    /*
+     * The interrupt lines to the CPU are level-driven. Re-evaluate them from
+     * the restored state so a pending interrupt is asserted again after a
+     * restore; the daisy pointers are machine wiring and are not part of the
+     * migrated state.
+     */
+    pl192_update(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_pl192 = {
+    .name = "pl192",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = pl192_post_load,
+    .fields = (VMStateField[]) {
+        /*
+         * rawintr, irq_status and fiq_status are derived from the input line
+         * levels and the registers below; they are not state. Restoring
+         * rawintr keeps a bit whose device no longer asserts (a UART whose
+         * line is not re-driven, for example) and the guest then takes an
+         * interrupt it can never clear. Devices re-assert their lines from
+         * their own post_load and pl192_post_load recomputes the rest.
+         */
+        VMSTATE_UINT32(intselect, PL192State),
+        VMSTATE_UINT32(intenable, PL192State),
+        VMSTATE_UINT32(softint, PL192State),
+        VMSTATE_UINT32(protection, PL192State),
+        VMSTATE_UINT32(sw_priority_mask, PL192State),
+        VMSTATE_UINT32_ARRAY(vect_addr, PL192State, PL192_INT_SOURCES),
+        VMSTATE_UINT32_ARRAY(vect_priority, PL192State, PL192_INT_SOURCES),
+        VMSTATE_UINT32(address, PL192State),
+        VMSTATE_UINT32(current, PL192State),
+        VMSTATE_UINT32(current_highest, PL192State),
+        VMSTATE_INT32(stack_i, PL192State),
+        VMSTATE_UINT32_ARRAY(priority_stack, PL192State, PL192_PRIO_LEVELS + 1),
+        VMSTATE_UINT8_ARRAY(irq_stack, PL192State, PL192_PRIO_LEVELS + 1),
+        VMSTATE_UINT32(priority, PL192State),
+        VMSTATE_UINT32(daisy_vectaddr, PL192State),
+        VMSTATE_UINT32(daisy_priority, PL192State),
+        VMSTATE_UINT8(daisy_input, PL192State),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const MemoryRegionOps pl192_ops = {
     .read = pl192_read,
@@ -430,8 +483,7 @@ static void pl192_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->reset = pl192_reset;
-    //dc->vmsd = &vmstate_pl192;
-    // TODO save VM
+    dc->vmsd = &vmstate_pl192;
 }
 
 static const TypeInfo pl192_info = {

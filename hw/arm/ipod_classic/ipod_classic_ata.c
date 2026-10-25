@@ -16,6 +16,7 @@
 #include "qemu/timer.h"
 #include "hw/core/cpu.h"
 #include "target/arm/cpu.h"
+#include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
@@ -516,6 +517,38 @@ void ipod_classic_ata_init_drive(DeviceState *dev, DriveInfo *hd)
     }
 }
 
+static int ipod_classic_ata_post_load(void *opaque, int version_id)
+{
+    IPodClassicATAState *s = opaque;
+
+    /*
+     * The DMA callback is a pointer into the IDE core invocation that set the
+     * transfer up and cannot outlive a restore. Snapshots are taken with the
+     * disk idle, so drop a half-finished transfer instead of calling through
+     * stale state.
+     */
+    s->dma_cb = NULL;
+    return 0;
+}
+
+static const VMStateDescription vmstate_ipod_classic_ata = {
+    .name = "ipod_classic.ata",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = ipod_classic_ata_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_IDE_BUS(bus, IPodClassicATAState),
+        VMSTATE_UINT32_ARRAY(reg, IPodClassicATAState,
+                             S5L8702_ATA_MEM_SIZE / 4),
+        VMSTATE_UINT32(rdata, IPodClassicATAState),
+        VMSTATE_BOOL(rdata_valid, IPodClassicATAState),
+        VMSTATE_BOOL(intrq, IPodClassicATAState),
+        VMSTATE_UINT32(dma_cur, IPodClassicATAState),
+        VMSTATE_UINT32(dma_left, IPodClassicATAState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void ipod_classic_ata_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -523,7 +556,7 @@ static void ipod_classic_ata_class_init(ObjectClass *klass, void *data)
     dc->desc = "S5L8702 ATA controller";
     dc->realize = ipod_classic_ata_realize;
     dc->reset = ipod_classic_ata_reset;
-    /* Not migratable: the latched read result is not saved. */
+    dc->vmsd = &vmstate_ipod_classic_ata;
     dc->user_creatable = false;
 }
 

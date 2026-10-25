@@ -98,11 +98,11 @@ static void wheel_update_irq(IPodClassicWheelState *s)
 {
     bool level = (wheel_pend_value(s) & s->mask & S5L8702_WHEEL_PEND_ALL) != 0;
 
+    if (level != s->irq_level && wheel_trace_on()) {
+        fprintf(stderr, "WHEELTRACE irq 23 -> %d (pend 0x%x, mask 0x%x)\n",
+                level, wheel_pend_value(s), s->mask);
+    }
     if (level && !s->irq_level) {
-        if (wheel_irq_raises == 0 && wheel_trace_on()) {
-            fprintf(stderr, "WHEELTRACE irq 23 raised for the first time "
-                    "(pend 0x%x, mask 0x%x)\n", wheel_pend_value(s), s->mask);
-        }
         wheel_irq_raises++;
     }
     s->irq_level = level;
@@ -341,6 +341,10 @@ static void wheel_key_event(void *opaque, int keycode)
     IPodClassicWheelState *s = opaque;
     bool released = (keycode & 0x80) != 0;
     uint32_t bit;
+
+    if (wheel_trace_on()) {
+        fprintf(stderr, "WHEELTRACE key 0x%02x\n", keycode);
+    }
 
     /*
      * Tee every keycode to the HLE Now Playing overlay's control handler first
