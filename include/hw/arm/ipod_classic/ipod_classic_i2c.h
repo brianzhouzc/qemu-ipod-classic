@@ -130,6 +130,8 @@ struct IPodClassicI2CState {
 
     /* IICCON bit 4 as the hardware sees it: a byte has finished, go is armed. */
     bool byte_done;
+    /* IICDS written since the last go; see the write-back workaround. */
+    bool iicds_new;
     /* Set between IICSTAT = 0xf0/0xb0 and the address byte completing. */
     bool in_address;
 };

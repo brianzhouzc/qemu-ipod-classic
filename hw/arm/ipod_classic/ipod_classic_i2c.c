@@ -59,6 +59,7 @@ static void ipod_classic_i2c_go(IPodClassicI2CState *s)
     uint32_t mode = s->iicstat & S5L8702_IICSTAT_MODE_MASK;
 
     s->byte_done = false;
+    s->iicds_new = false;
 
     switch (mode) {
     case S5L8702_IICSTAT_START_TX:
@@ -158,7 +159,23 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
     case S5L8702_IICCON:
         s->iiccon = value & ~S5L8702_IICCON_GO;
         if ((value & S5L8702_IICCON_GO) && s->byte_done) {
-            ipod_classic_i2c_go(s);
+            uint32_t mode = s->iicstat & S5L8702_IICSTAT_MODE_MASK;
+
+            /*
+             * In a transmit the driver writes IICDS and then IICCON with the
+             * go bit. It also writes IICCON back to itself in the interrupt
+             * epilogue ("IICCON = IICCON", the same resume idiom Rockbox
+             * uses), with the go bit still set. If the byte timer happens to
+             * expire between the two writes -- possible when the main loop
+             * and the vCPU share the host, more so in the browser -- that
+             * epilogue write looked like a command and re-sent the previous
+             * byte, corrupting the PMU transaction. A transmit go only means
+             * something when IICDS was written since the last one; in a
+             * receive the go is a clock and needs no new data.
+             */
+            if (mode != S5L8702_IICSTAT_START_TX || s->iicds_new) {
+                ipod_classic_i2c_go(s);
+            }
         }
         ipod_classic_i2c_update_irq(s);
         break;
@@ -217,6 +234,7 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
         break;
     case S5L8702_IICDS:
         s->iicds = value;
+        s->iicds_new = true;
         break;
     case S5L8702_IICUNK10:
         /* Written as 0 by Apple's block init; nothing reads it back. */
@@ -259,6 +277,7 @@ static void ipod_classic_i2c_reset(DeviceState *dev)
     s->iicunk18 = 0;
     s->iicstat2 = 0;
     s->byte_done = false;
+    s->iicds_new = false;
     s->in_address = false;
     ipod_classic_i2c_update_irq(s);
 }
