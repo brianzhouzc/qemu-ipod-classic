@@ -65,6 +65,26 @@ arm_ss.add(when: 'CONFIG_ARM_SMMUV3', if_true: files('smmuv3.c'))
 arm_ss.add(when: 'CONFIG_FSL_IMX6UL', if_true: files('fsl-imx6ul.c', 'mcimx6ul-evk.c'))
 arm_ss.add(when: 'CONFIG_NRF51_SOC', if_true: files('nrf51_soc.c'))
 arm_ss.add(when: 'CONFIG_XEN', if_true: files('xen_arm.c'))
+arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true: files(
+  'ipod_classic/ipod_classic.c',
+  'ipod_classic/ipod_classic_timer.c',
+  'ipod_classic/ipod_classic_clk.c',
+  'ipod_classic/ipod_classic_i2c.c',
+  'ipod_classic/ipod_classic_pmu.c',
+  'ipod_classic/ipod_classic_ata.c',
+  'ipod_classic/ipod_classic_lcd.c',
+  'ipod_classic/ipod_classic_gpio.c',
+  'ipod_classic/ipod_classic_disp.c',
+  'ipod_classic/ipod_classic_wheel.c',
+  'ipod_classic/ipod_classic_i2s.c',
+  'ipod_classic/ipod_classic_cs42l55.c',
+  'ipod_classic/ipod_classic_sm1.c',
+  'ipod_classic/ipod_classic_hle_audio.c',
+  'ipod_classic/ipod_classic_hle_np.c',
+  'ipod_classic/ipod_classic_np_overlay.c'))
+# Only the SHA-1 block is shared with the iPod Touch 2G sources; the rest of
+# that machine is unused here and needs OpenSSL's bignum code.
+arm_ss.add(when: 'CONFIG_IPOD_TOUCH_SHA1', if_true: files('ipod_touch_sha1.c'))
 
 system_ss.add(when: 'CONFIG_ARM_SMMUV3', if_true: files('smmu-common.c'))
 system_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4_boards.c'))

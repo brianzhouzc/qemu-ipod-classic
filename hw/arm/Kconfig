@@ -679,3 +679,18 @@ config ARMSSE
     select UNIMP
     select SSE_COUNTER
     select SSE_TIMER
+
+config IPOD_CLASSIC_6G
+    bool
+    select PL192
+    select PL080
+    select UNIMP
+    select PTIMER
+    select I2C
+    select IDE_QDEV
+    select IPOD_TOUCH_SHA1
+
+# The S5L8702 shares its SHA-1 block with the S5L8720. Only this one source
+# file of the Touch machine is needed here; the rest of it needs OpenSSL.
+config IPOD_TOUCH_SHA1
+    bool

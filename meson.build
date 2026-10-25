@@ -317,7 +317,13 @@ ucontext_probe = '''
 # On Windows the only valid backend is the Windows specific one.
 # For POSIX prefer ucontext, but it's not always possible. The fallback
 # is sigcontext.
-supported_backends = ['fiber']
+# Fiber is Emscripten's backend and exists nowhere else, so keep it out of the
+# native build: it used to come first for every host, which made an ordinary
+# `configure` on Linux pick coroutine-fiber.c and fail on <emscripten/fiber.h>.
+supported_backends = []
+if host_machine.system() == 'emscripten'
+  supported_backends += ['fiber']
+endif
 if targetos == 'windows'
   supported_backends += ['windows']
 else

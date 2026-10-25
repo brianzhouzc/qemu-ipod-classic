@@ -78,6 +78,44 @@ static const unsigned char pl080_id[] =
 static const unsigned char pl081_id[] =
 { 0x81, 0x10, 0x04, 0x0a, 0x0d, 0xf0, 0x05, 0xb1 };
 
+/*
+ * DMATRACE=1: report what the guest programs into each DMA channel, and how
+ * many terminal-count interrupts each channel raises.
+ *
+ * This exists to settle one question for the iPod classic 6G audio work. The
+ * DMA interrupt handler was measured running 7 185 times, which was taken as
+ * evidence that the DMA was healthy -- but a global handler count does not say
+ * WHICH channel those interrupts came from. If they are all display or ATA
+ * traffic and nothing ever points a channel at the I2S TX FIFO (request line
+ * 0xA), then the audio DMA never runs at all and the conclusion was wrong.
+ * Observational only, and silent unless the variable is set.
+ */
+static int dmatrace = -1;
+
+static bool pl080_trace_on(void)
+{
+    if (dmatrace < 0) {
+        const char *e = getenv("DMATRACE");
+        dmatrace = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return dmatrace == 1;
+}
+
+/*
+ * Both DMACs share this model, so the trace has to say which one it is. The
+ * machine creates DMAC0 before DMAC1, so labelling by first-seen instance is
+ * enough here and costs no plumbing through the device tree.
+ */
+static const void *pl080_trace_first;
+
+static const char *pl080_trace_tag(PL080State *s)
+{
+    if (!pl080_trace_first) {
+        pl080_trace_first = s;
+    }
+    return (pl080_trace_first == s) ? "dmac0" : "dmac1";
+}
+
 static void pl080_update(PL080State *s)
 {
     bool tclevel = (s->tc_int & s->tc_mask);
@@ -86,6 +124,24 @@ static void pl080_update(PL080State *s)
     qemu_set_irq(s->interr, errlevel);
     qemu_set_irq(s->inttc, tclevel);
     qemu_set_irq(s->irq, errlevel || tclevel);
+}
+
+/*
+ * Load a channel's working registers from the linked-list descriptor at `lli`
+ * (src @ +0, dest @ +4, next-link @ +8, control @ +12). This is exactly the
+ * fetch the controller does at an LLI boundary; factored out so the terminal
+ * relink path (pl080_write) and the mid-run boundary (pl080_run) stay identical.
+ */
+static void pl080_ch_load_lli(PL080State *s, pl080_channel *ch, uint32_t lli)
+{
+    ch->src  = address_space_ldl_le(&s->downstream_as, lli,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    ch->dest = address_space_ldl_le(&s->downstream_as, lli + 4,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    ch->ctrl = address_space_ldl_le(&s->downstream_as, lli + 12,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    ch->lli  = address_space_ldl_le(&s->downstream_as, lli + 8,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
 static void pl080_run(PL080State *s)
@@ -129,6 +185,18 @@ again:
             if ((ch->conf & (PL080_CCONF_H | PL080_CCONF_E))
                     != PL080_CCONF_E)
                 continue;
+            /*
+             * Resume a completed-pending paced channel that the guest has since
+             * relinked: it wrote the next task's descriptor pointer to the LINK
+             * register while we were holding the enable bit high (see the
+             * terminal handling below). Load that descriptor now -- this is the
+             * point at which real hardware consumes the LINK register -- and drop
+             * the pending flag so the channel runs the new task normally.
+             */
+            if ((s->paced_pending & (1u << c)) && ch->lli != 0) {
+                pl080_ch_load_lli(s, ch, ch->lli);
+                s->paced_pending &= ~(1u << c);
+            }
             flow = (ch->conf >> 11) & 7;
             if (flow >= 4) {
                 hw_error(
@@ -142,12 +210,25 @@ again:
             case 0:
                 break;
             case 1:
-                if ((req & (1u << dest_id)) == 0)
+                /*
+                 * mem -> peripheral, DMAC is the flow controller. The stock
+                 * model transferred unconditionally (the request check was
+                 * commented out), which drains the whole buffer at once. We now
+                 * honour the request, but ONLY for lines a peripheral has marked
+                 * paced -- every other line keeps the old full-speed behaviour,
+                 * so this cannot change any DMA that worked before. See
+                 * paced_lines in the header.
+                 */
+                if ((s->paced_lines & (1u << dest_id))
+                        && (req & (1u << dest_id)) == 0) {
                     size = 0;
+                }
                 break;
             case 2:
-                if ((req & (1u << src_id)) == 0)
+                if ((s->paced_lines & (1u << src_id))
+                        && (req & (1u << src_id)) == 0) {
                     size = 0;
+                }
                 break;
             case 3:
                 if ((req & (1u << src_id)) == 0
@@ -155,8 +236,9 @@ again:
                     size = 0;
                 break;
             }
-            if (!size)
+            if (!size) {
                 continue;
+            }
 
             /* Transfer one element.  */
             /* ??? Should transfer multiple elements for a burst request.  */
@@ -179,32 +261,67 @@ again:
                     ch->dest += swidth;
             }
 
+            //printf("Transfer size: %d, destination: 0x%08x\n", size, ch->dest);
             size--;
             ch->ctrl = (ch->ctrl & 0xfffff000) | size;
             if (size == 0) {
                 /* Transfer complete.  */
                 if (ch->lli) {
-                    ch->src = address_space_ldl_le(&s->downstream_as,
-                                                   ch->lli,
-                                                   MEMTXATTRS_UNSPECIFIED,
-                                                   NULL);
-                    ch->dest = address_space_ldl_le(&s->downstream_as,
-                                                    ch->lli + 4,
-                                                    MEMTXATTRS_UNSPECIFIED,
-                                                    NULL);
-                    ch->ctrl = address_space_ldl_le(&s->downstream_as,
-                                                    ch->lli + 12,
-                                                    MEMTXATTRS_UNSPECIFIED,
-                                                    NULL);
-                    ch->lli = address_space_ldl_le(&s->downstream_as,
-                                                   ch->lli + 8,
-                                                   MEMTXATTRS_UNSPECIFIED,
-                                                   NULL);
+                    pl080_ch_load_lli(s, ch, ch->lli);
+                } else if (s->paced_lines & ((1u << dest_id) | (1u << src_id))) {
+                    /*
+                     * Terminal LLI (no link) on a PACED channel. Do NOT clear
+                     * the enable bit here. Rockbox's audio driver keeps a single
+                     * continuous DMA alive by extending the LLI chain from its
+                     * terminal-count IRQ handler (dmac_ch_queue_2d, QUEUE_LINK):
+                     * when it sees DMACCxLINK==0 it writes the next task's link
+                     * and then re-reads DMACCxCONFIG, and it panics
+                     * "DMA ch%d: link error" if the enable bit is already clear.
+                     * Our paced drain runs from a host QEMUTimer that the guest's
+                     * IRQ masking cannot hold off, so auto-disabling the channel
+                     * the instant the terminal element drains races that check
+                     * and makes playback panic under some timings (graphical
+                     * window, loaded host). Instead we keep the channel enabled
+                     * and idle (completed-pending); it resumes when the guest
+                     * writes a new LINK (pl080_write case 2) and is disabled only
+                     * when the guest explicitly aborts (writes CONFIG.E=0). This
+                     * removes the race for ANY relative timing: a late relink now
+                     * costs at most a brief underrun, never a panic. Non-paced
+                     * channels (all retailOS/5G DMA, and everything when AUDIOPACE
+                     * is off) keep the exact stock auto-disable below.
+                     */
+                    s->paced_pending |= (1u << c);
                 } else {
                     ch->conf &= ~PL080_CCONF_E;
                 }
                 if (ch->ctrl & PL080_CCTRL_I) {
+                    //printf("Setting interrupt status of channel %d\n", c);
                     s->tc_int |= 1 << c;
+                    if (pl080_trace_on()) {
+                        s->tc_count[c]++;
+                        if (s->tc_count[c] <= 3
+                                || s->tc_count[c] % 500 == 0) {
+                            fprintf(stderr,
+                                    "DMATRACE %s ch%d TC #%u srcid=%d dstid=%d "
+                                    "srcend=0x%08x dst=0x%08x lli=0x%08x\n",
+                                    pl080_trace_tag(s), c, s->tc_count[c],
+                                    src_id, dest_id, ch->src, ch->dest,
+                                    ch->lli);
+                        }
+                    }
+                    /*
+                     * A paced peripheral gets exactly one chunk per request
+                     * pulse: consume the request so the next iteration stalls
+                     * until the peripheral asks again. Only touches paced lines.
+                     */
+                    if (s->paced_lines & (1u << dest_id)) {
+                        s->req_burst &= ~(1u << dest_id);
+                        s->req_single &= ~(1u << dest_id);
+                    }
+                    if (s->paced_lines & (1u << src_id)) {
+                        s->req_burst &= ~(1u << src_id);
+                        s->req_single &= ~(1u << src_id);
+                    }
                 }
             }
             goto again;
@@ -212,9 +329,44 @@ again:
         if (--s->running)
             s->running = 1;
     }
+    pl080_update(s);
 }
 
-static uint64_t pl080_read(void *opaque, hwaddr offset,
+void pl080_set_paced_line(PL080State *s, int line, bool on)
+{
+    if (on) {
+        s->paced_lines |= (1u << line);
+    } else {
+        s->paced_lines &= ~(1u << line);
+    }
+}
+
+void pl080_pace_request(PL080State *s, int line)
+{
+    /*
+     * Assert a burst request and let the controller run. pl080_run transfers
+     * until the next terminal-count on this line, then the consume logic above
+     * clears the bit and the channel stalls until the next call.
+     */
+    s->req_burst |= (1u << line);
+    pl080_run(s);
+    /*
+     * One-shot request. pl080_run's consume logic clears the request bit at a
+     * terminal-count, but if this pulse moved nothing -- the channel was not
+     * enabled yet, or was stalled between tasks -- the bit would LINGER. A
+     * lingering request then drains a whole task the instant the guest enables
+     * the channel (measured: Rockbox's dmac_ch_run for the first audio task,
+     * followed at once by a terminal-count that clears the channel E-bit, so
+     * the guest's very next dmac_ch_queue_2d link check sees E=0 and panics
+     * "DMA ch link error"). Dropping the pulse here keeps pacing honest: the
+     * channel only advances on a live request, so it stays enabled between
+     * ticks and the guest can extend the LLI chain in time. Paced lines only.
+     */
+    s->req_burst &= ~(1u << line);
+    s->req_single &= ~(1u << line);
+}
+
+static uint64_t pl080_read_inner(void *opaque, hwaddr offset,
                            unsigned size)
 {
     PL080State *s = (PL080State *)opaque;
@@ -283,11 +435,40 @@ static uint64_t pl080_read(void *opaque, hwaddr offset,
     }
 }
 
+/*
+ * Trace wrapper. The channel-register cases above return directly, so the tally
+ * cannot live inside them without restructuring the switch. This asks the one
+ * question that matters for the audio work: which DMAC register does the
+ * firmware POLL to decide how much room the output has, and what value does the
+ * model hand back? The codec is being called with a sample count of zero, and
+ * that count is derived from the guest's own book-keeping of DMA progress.
+ */
+static uint64_t pl080_read(void *opaque, hwaddr offset, unsigned size)
+{
+    uint64_t val = pl080_read_inner(opaque, offset, size);
+
+    if (pl080_trace_on() && offset < 0x200) {
+        static uint64_t n[128];
+        unsigned slot = (unsigned)(offset >> 2) & 127;
+        uint64_t c = ++n[slot];
+
+        if ((c & (c - 1)) == 0 || c % 100000 == 0) {
+            fprintf(stderr, "DMATRACE %s RD +0x%03" HWADDR_PRIx
+                    " -> 0x%08x  n=%llu\n",
+                    pl080_trace_tag((PL080State *)opaque),
+                    offset, (uint32_t)val, (unsigned long long)c);
+        }
+    }
+    return val;
+}
+
 static void pl080_write(void *opaque, hwaddr offset,
                         uint64_t value, unsigned size)
 {
     PL080State *s = (PL080State *)opaque;
     int i;
+
+    //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, value, offset);
 
     if (offset >= 0x100 && offset < 0x200) {
         i = (offset & 0xe0) >> 5;
@@ -295,19 +476,55 @@ static void pl080_write(void *opaque, hwaddr offset,
             goto bad_offset;
         switch ((offset >> 2) & 7) {
         case 0: /* SrcAddr */
+            //printf("%s: setting source address of channel %d to 0x%08x\n", __func__, i, value);
             s->chan[i].src = value;
             break;
         case 1: /* DestAddr */
+            //printf("%s: setting destination address of channel %d to 0x%08x\n", __func__, i, value);
             s->chan[i].dest = value;
             break;
         case 2: /* LLI */
             s->chan[i].lli = value;
+            /*
+             * If this channel is a completed-pending paced channel (see the
+             * terminal handling in pl080_run), the guest is extending the chain:
+             * we only RECORD the new link here. The channel is reloaded from it
+             * in pl080_run on the next drain, mirroring the hardware, which
+             * consumes the LINK register only when it reaches the end of the
+             * terminal LLI. Reloading synchronously here would change what the
+             * guest's own read-back of DMACCxLINK returns a few instructions
+             * later and corrupt its book-keeping. Because the enable bit was
+             * never dropped, the guest's follow-up CONFIG.E read passes instead
+             * of panicking "DMA ch link error".
+             */
             break;
         case 3: /* Control */
+            //printf("%s: setting control of channel %d to 0x%08x (transfer size: %d)\n", __func__, i, value, value & 0xfff);
             s->chan[i].ctrl = value;
+            /* A fresh descriptor with real work clears any completed-pending
+               state (e.g. dmac_ch_run starting a new task). */
+            if (value & 0xfff) {
+                s->paced_pending &= ~(1u << i);
+            }
             break;
         case 4: /* Configuration */
+            //printf("%s: setting configuration of channel %d to 0x%08x\n", __func__, i, value);
+            if (!(value & PL080_CCONF_E)) {
+                /* Explicit disable/abort resolves the completed-pending state. */
+                s->paced_pending &= ~(1u << i);
+            }
             s->chan[i].conf = value;
+            if (pl080_trace_on() && (value & PL080_CCONF_E)) {
+                fprintf(stderr,
+                        "DMATRACE %s ch%d ENABLE conf=0x%08x flow=%d "
+                        "srcid=%d dstid=%d src=0x%08x dst=0x%08x lli=0x%08x "
+                        "xsize=%u\n",
+                        pl080_trace_tag(s), i, (uint32_t)value,
+                        (int)((value >> 11) & 7), (int)((value >> 1) & 0x1f),
+                        (int)((value >> 6) & 0x1f), s->chan[i].src,
+                        s->chan[i].dest, s->chan[i].lli,
+                        (unsigned)(s->chan[i].ctrl & 0xfff));
+            }
             pl080_run(s);
             break;
         }
@@ -366,6 +583,7 @@ static void pl080_reset(DeviceState *dev)
     s->req_single = 0;
     s->req_burst = 0;
     s->running = 0;
+    s->paced_pending = 0;
 
     for (i = 0; i < s->nchannels; i++) {
         s->chan[i].src = 0;
@@ -381,8 +599,10 @@ static void pl080_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     PL080State *s = PL080(obj);
 
-    memory_region_init_io(&s->iomem, OBJECT(s), &pl080_ops, s, "pl080", 0x1000);
-    sysbus_init_mmio(sbd, &s->iomem);
+    memory_region_init_io(&s->iomem1, OBJECT(s), &pl080_ops, s, "pl080", 0x1000);
+    sysbus_init_mmio(sbd, &s->iomem1);
+    memory_region_init_io(&s->iomem2, OBJECT(s), &pl080_ops, s, "pl080", 0x1000);
+    sysbus_init_mmio(sbd, &s->iomem2);
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->interr);
     sysbus_init_irq(sbd, &s->inttc);

@@ -1,3 +1,7 @@
+# Check every file out exactly as committed, whatever core.autocrlf says.
+# A Windows checkout with CRLF endings breaks configure and the meson scripts
+# when the tree is built under WSL.
+*               -text
 *.c.inc         diff=c
 *.h.inc         diff=c
 *.m             diff=objc
