@@ -576,6 +576,16 @@ static void ipod_classic_machine_init(MachineState *machine)
     ARMCPU *cpu;
     DeviceState *dev;
 
+    /*
+     * A zero point for boot-time measurements: the first display write prints
+     * its own clocks (ipod_classic_disp.c), and subtracting these gives the
+     * boot in wall and guest time without either side having to trust the
+     * other's log buffering.
+     */
+    fprintf(stderr, "s5l8702.machine: start rt_ns=%" PRId64 " vclock_ns=%" PRId64 "\n",
+            qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
     if (nms->semihosting) {
         qemu_semihosting_enable();
     }

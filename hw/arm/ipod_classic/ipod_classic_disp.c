@@ -28,10 +28,12 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/irq.h"
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
 #include "exec/address-spaces.h"
+#include "sysemu/cpu-timers.h"
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
 
 /*
@@ -178,10 +180,21 @@ static void ipod_classic_disp_write(void *opaque, hwaddr offset,
         disp_src_writes++;
         if (!announced) {
             announced = true;
+            /*
+             * The timestamps are for the browser port's measurements: the
+             * first display write is the earliest moment a script can call
+             * the screen up, and the wall clock, guest clock and instruction
+             * count together say how long the boot took in a way that can be
+             * compared across hosts (docs/proposals/browser-emulator.md).
+             */
             fprintf(stderr, "s5l8702.disp: SOURCE ADDRESS +0x%03" HWADDR_PRIx
                     " = 0x%08x  (pc~0x%08x) -- first time this block has been "
-                    "given something to read from\n",
-                    offset, (uint32_t)value, disp_trace_pc());
+                    "given something to read from (rt_ns=%" PRId64
+                    " vclock_ns=%" PRId64 " icount=%" PRId64 ")\n",
+                    offset, (uint32_t)value, disp_trace_pc(),
+                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                    icount_enabled() ? icount_get_raw() : -1);
         }
     }
 
