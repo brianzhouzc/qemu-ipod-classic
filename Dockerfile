@@ -34,7 +34,9 @@ RUN mkdir -p $TARGET
 FROM build-base AS zlib-emscripten-dev
 ARG ZLIB_VERSION
 RUN mkdir -p /zlib
-RUN curl -Ls https://zlib.net/zlib-$ZLIB_VERSION.tar.xz | tar xJC /zlib --strip-components=1
+# zlib.net no longer serves the release tarballs at the old URL (404 as of
+# 2026-10-25); the GitHub release is the same file.
+RUN curl -Ls https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.xz | tar xJC /zlib --strip-components=1
 WORKDIR /zlib
 RUN emconfigure ./configure --prefix=$TARGET --static
 RUN make install
@@ -56,20 +58,20 @@ ARG GLIB_VERSION
 ARG GLIB_MINOR_VERSION
 RUN mkdir -p /stub
 WORKDIR /stub
-RUN <<EOF
-cat <<'EOT' > res_query.c
-#include <netdb.h>
-int res_query(const char *name, int class, int type, unsigned char *dest, int len)
-{
-    h_errno = HOST_NOT_FOUND;
-    return -1;
-}
-EOT
-EOF
-RUN emcc ${CFLAGS} -c res_query.c -fPIC -o libresolv.o
-RUN ar rcs libresolv.a libresolv.o
-RUN mkdir -p $TARGET/lib/
-RUN cp libresolv.a $TARGET/lib/
+# Emscripten's libc has no res_query; glib only needs it to exist at link time.
+# Written with printf rather than a nested heredoc: the nested form was
+# silently producing no file under BuildKit's heredoc support.
+RUN printf '%s\n' \
+    '#include <netdb.h>' \
+    'int res_query(const char *name, int class, int type, unsigned char *dest, int len)' \
+    '{' \
+    '    h_errno = HOST_NOT_FOUND;' \
+    '    return -1;' \
+    '}' > /stub/res_query.c && \
+    emcc ${CFLAGS} -c /stub/res_query.c -fPIC -o /stub/libresolv.o && \
+    ar rcs /stub/libresolv.a /stub/libresolv.o && \
+    mkdir -p $TARGET/lib/ && \
+    cp /stub/libresolv.a $TARGET/lib/
 
 RUN mkdir -p /glib
 RUN curl -Lks https://download.gnome.org/sources/glib/${GLIB_MINOR_VERSION}/glib-$GLIB_VERSION.tar.xz | tar xJC /glib --strip-components=1
