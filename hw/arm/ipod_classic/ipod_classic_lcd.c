@@ -551,9 +551,13 @@ static const MemoryRegionOps ipod_classic_lcd_ops = {
 
 /* ---------------------------------------------------------------- console */
 
-static void ipod_classic_lcd_gfx_update(void *opaque)
+/*
+ * Compose the panel from the display pipe and the HLE overlay, and report
+ * whether a new frame is available.  Split out for the browser build, which
+ * composes on its own timer and has no console frontend to update.
+ */
+static bool ipod_classic_lcd_compose(IPodClassicLCDState *s)
 {
-    IPodClassicLCDState *s = opaque;
 
     /*
      * Ask the display pipe for a frame before showing anything.
@@ -598,13 +602,19 @@ static void ipod_classic_lcd_gfx_update(void *opaque)
     }
 
     if (!s->dirty) {
-        return;
+        return false;
     }
     s->dirty = false;
-#ifdef EMSCRIPTEN
-    s->wasm_seq++;
-#endif
-    dpy_gfx_update_full(s->con);
+    return true;
+}
+
+static void ipod_classic_lcd_gfx_update(void *opaque)
+{
+    IPodClassicLCDState *s = opaque;
+
+    if (ipod_classic_lcd_compose(s)) {
+        dpy_gfx_update_full(s->con);
+    }
 }
 
 static void ipod_classic_lcd_invalidate(void *opaque)
@@ -639,10 +649,17 @@ static void wasm_lcd_frame_tick(void *opaque)
 {
     IPodClassicLCDState *s = opaque;
 
+    /*
+     * 30 Hz is enough for a 320x240 panel and halves the time the compose
+     * spends holding the BQL against the vCPU; skipping dpy_gfx_update_full
+     * keeps the timer off the console, which has no frontend here anyway.
+     */
     s->dirty = true;
-    ipod_classic_lcd_gfx_update(s);
+    if (ipod_classic_lcd_compose(s)) {
+        s->wasm_seq++;
+    }
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                             NANOSECONDS_PER_SECOND / 60);
+                             NANOSECONDS_PER_SECOND / 30);
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_width(void)
