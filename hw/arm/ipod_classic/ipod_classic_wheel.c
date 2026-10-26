@@ -584,11 +584,34 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
 {
     qemu_mutex_lock_iothread();
     if (wasm_wheel_state) {
+        /*
+         * A wall-clock wait between two presses can be shorter than the
+         * previous press's guest-time hold, and a new deadline would
+         * overwrite the pending release and leave the button down. Release
+         * the previous key first, so every press has a down and an up.
+         */
+        if (wasm_wheel_state->wasm_release_at) {
+            wasm_wheel_state->wasm_release_at = 0;
+            wheel_key_event(wasm_wheel_state,
+                            wasm_wheel_state->wasm_keycode | 0x80);
+        }
         wheel_key_event(wasm_wheel_state, keycode);
         wasm_wheel_state->wasm_keycode = keycode;
         wasm_wheel_state->wasm_release_at =
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
             (int64_t)hold_ms * 1000000;
+
+        /*
+         * Keep the wheel ticking until the release deadline.  The tick only
+         * reschedules while there is something to send, so if its repeat
+         * window ends first the release never happens and the button stays
+         * down for the guest -- which drops every later press.
+         */
+        if (wasm_wheel_state->button_repeat_until <
+            wasm_wheel_state->wasm_release_at) {
+            wasm_wheel_state->button_repeat_until =
+                wasm_wheel_state->wasm_release_at;
+        }
     }
     qemu_mutex_unlock_iothread();
 }
