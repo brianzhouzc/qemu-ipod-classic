@@ -176,6 +176,16 @@ static uint32_t pl192_irq_ack(PL192State *s)
     int is_daisy = (s->current_highest == PL192_DAISY_IRQ);
     uint32_t res = s->address;
 
+    if (getenv("VICACK")) {
+        static int dbg_n;
+        if (dbg_n < 40 || (dbg_n % 20000) == 0) {
+            fprintf(stderr, "VICACK %s src=%u addr=0x%08x status=0x%08x "
+                    "prio=0x%x stack_i=%d\n", s->iomem.name,
+                    s->current_highest, res, s->irq_status, s->priority,
+                    s->stack_i);
+        }
+        dbg_n++;
+    }
     s->current = s->current_highest;
     pl192_mask_priority(s);
     if (is_daisy) {
