@@ -601,13 +601,16 @@ static const MemoryRegionOps ipod_classic_rng_ops = {
 
 static QEMUTimer *ipod_heartbeat_timer;
 static int ipod_heartbeat_ms;
+static ARMCPU *ipod_heartbeat_cpu;
 
 /*
  * IPOD_HEARTBEAT_MS=5000: say where the boot is, on the real-time clock.
  * The browser build can take minutes before the first display write, and
  * without this there is no way to tell a slow emulator from a stuck one.
  * It also gives the Wasm build's JIT count, the number of translation blocks
- * that have been compiled into Wasm modules.
+ * that have been compiled into Wasm modules, and (when it is enabled) the
+ * guest PC, which is what identifies a boot that is running but not getting
+ * anywhere.
  */
 static void ipod_heartbeat(void *opaque)
 {
@@ -617,10 +620,17 @@ static void ipod_heartbeat(void *opaque)
 #endif
     fprintf(stderr,
             "s5l8702.machine: heartbeat rt_ns=%" PRId64 " vclock_ns=%" PRId64
-            " icount=%" PRId64 " wasm_tb=%lu\n",
+            " icount=%" PRId64 " wasm_tb=%lu",
             qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
             icount_enabled() ? icount_get_raw() : -1, compiled);
+    if (ipod_heartbeat_cpu) {
+        fprintf(stderr, " pc=0x%08x psr=0x%08x halted=%d",
+                ipod_heartbeat_cpu->env.regs[15],
+                cpsr_read(&ipod_heartbeat_cpu->env),
+                CPU(ipod_heartbeat_cpu)->halted);
+    }
+    fprintf(stderr, "\n");
     timer_mod(ipod_heartbeat_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ipod_heartbeat_ms);
 }
@@ -771,6 +781,7 @@ static void ipod_classic_machine_init(MachineState *machine)
 
     ipod_classic_cpu_setup(machine, &sysmem, &cpu, &nsas);
     nms->cpu = cpu;
+    ipod_heartbeat_cpu = cpu;
     nms->nsas = nsas;
 
     nms->sysclk = clock_new(OBJECT(machine), "SYSCLK");
