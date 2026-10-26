@@ -1569,11 +1569,26 @@ static void tcg_wasm_out_extract(TCGContext *s, TCGReg dest, TCGReg arg1, int po
         tcg_wasm_out_op_i64_const(s, sl);
         tcg_wasm_out_op_i64_shl(s);
     }
+    if (type == TCG_TYPE_I32) {
+        /*
+         * The shifts run on i64 globals.  Without wrapping the value back to
+         * 32 bits, the bits shifted past bit 31 survive in the upper half and
+         * the logical right shift brings them back down: extracting bit 1 of
+         * 0xfffffffd gave 0x7fffffee instead of 0, which made the ARM carry
+         * flag for "lsls r2, r2, #31" wrong.
+         */
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+    }
     tcg_wasm_out_op_i64_const(s, rs);
     if (sign) {
         tcg_wasm_out_op_i64_shr_s(s);
     } else {
         tcg_wasm_out_op_i64_shr_u(s);
+        if (len < 64) {
+            tcg_wasm_out_op_i64_const(s, (1ULL << len) - 1);
+            tcg_wasm_out_op_i64_and(s);
+        }
     }
     tcg_wasm_out_op_global_set_r(s, dest);
 }
