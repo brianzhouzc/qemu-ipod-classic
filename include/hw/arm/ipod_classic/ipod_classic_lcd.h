@@ -119,6 +119,12 @@ struct IPodClassicLCDState {
     qemu_irq irq;
     QemuConsole *con;
 
+#ifdef EMSCRIPTEN
+    /* Browser build: periodic compose (no UI frontend) and frame counter. */
+    QEMUTimer *wasm_timer;
+    uint32_t wasm_seq;
+#endif
+
     uint32_t con_reg;
     uint32_t intcon;
     /*

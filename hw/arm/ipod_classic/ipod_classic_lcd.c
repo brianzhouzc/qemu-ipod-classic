@@ -601,6 +601,9 @@ static void ipod_classic_lcd_gfx_update(void *opaque)
         return;
     }
     s->dirty = false;
+#ifdef EMSCRIPTEN
+    s->wasm_seq++;
+#endif
     dpy_gfx_update_full(s->con);
 }
 
@@ -615,6 +618,58 @@ static const GraphicHwOps ipod_classic_lcd_gfx_ops = {
     .invalidate = ipod_classic_lcd_invalidate,
     .gfx_update = ipod_classic_lcd_gfx_update,
 };
+
+#ifdef EMSCRIPTEN
+#include <emscripten.h>
+
+/*
+ * The browser build runs with -display none, so no UI frontend drives the
+ * console's refresh and the composed frame would never be made (the panel's
+ * framebuffer is filled by ipod_classic_lcd_gfx_update, which the refresh
+ * loop calls).  Compose at 60 Hz from a real-time timer instead -- it runs
+ * with the BQL held, like the vCPU's device accesses -- and expose the
+ * 320x240 RGB565 framebuffer to the page, which polls the sequence number.
+ *
+ * This is display-only: the model's behaviour and the guest's view of the
+ * panel are unchanged.
+ */
+static IPodClassicLCDState *wasm_lcd_state;
+
+static void wasm_lcd_frame_tick(void *opaque)
+{
+    IPodClassicLCDState *s = opaque;
+
+    s->dirty = true;
+    ipod_classic_lcd_gfx_update(s);
+    timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                             NANOSECONDS_PER_SECOND / 60);
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_width(void)
+{
+    return S5L8702_PANEL_WIDTH;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_height(void)
+{
+    return S5L8702_PANEL_HEIGHT;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_stride(void)
+{
+    return S5L8702_PANEL_WIDTH * 2;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_seq(void)
+{
+    return wasm_lcd_state ? wasm_lcd_state->wasm_seq : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_ptr(void)
+{
+    return wasm_lcd_state ? (uint32_t)(uintptr_t)wasm_lcd_state->fb : 0;
+}
+#endif
 
 static void ipod_classic_lcd_reset(DeviceState *dev)
 {
@@ -679,6 +734,13 @@ static void ipod_classic_lcd_realize(DeviceState *dev, Error **errp)
                                               S5L8702_PANEL_WIDTH * 2,
                                               (uint8_t *)s->fb);
     dpy_gfx_replace_surface(s->con, surface);
+
+#ifdef EMSCRIPTEN
+    wasm_lcd_state = s;
+    s->wasm_timer = timer_new_ns(QEMU_CLOCK_REALTIME, wasm_lcd_frame_tick, s);
+    timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                             NANOSECONDS_PER_SECOND / 60);
+#endif
 }
 
 static const VMStateDescription vmstate_ipod_classic_lcd = {
