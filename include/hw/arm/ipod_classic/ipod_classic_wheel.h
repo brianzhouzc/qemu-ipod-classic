@@ -297,9 +297,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 
 struct IPodClassicWheelState {
 #ifdef EMSCRIPTEN
-    /* Browser input: releases a held key at a virtual deadline. */
+    /* Browser input: releases a held key at a virtual deadline, or as soon
+     * as the guest has consumed a packet carrying the button. */
     int wasm_keycode;
     int64_t wasm_release_at;
+    int64_t wasm_release_cap;
+    uint32_t wasm_press_mask;
+    int wasm_ack;
 #endif
     SysBusDevice parent_obj;
 

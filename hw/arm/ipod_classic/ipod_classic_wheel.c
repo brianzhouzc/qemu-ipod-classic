@@ -139,6 +139,12 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
     word = s->fifo[s->fifo_head];
     s->fifo_head = (s->fifo_head + 1) % S5L8702_WHEEL_FIFO_LEN;
     s->fifo_len--;
+#ifdef EMSCRIPTEN
+    if (s->wasm_release_at &&
+        ((word >> S5L8702_WHEEL_BTN_SHIFT) & s->wasm_press_mask)) {
+        s->wasm_ack = 1;
+    }
+#endif
     wheel_update_irq(s);
     return word;
 }
@@ -253,8 +259,10 @@ static void wheel_tick(void *opaque)
     bool busy;
 
 #ifdef EMSCRIPTEN
-    if (s->wasm_release_at && now >= s->wasm_release_at) {
+    if (s->wasm_release_at && now >= s->wasm_release_at &&
+        (s->wasm_ack || now >= s->wasm_release_cap)) {
         s->wasm_release_at = 0;
+        s->wasm_ack = 0;
         wheel_key_event(s, s->wasm_keycode | 0x80);
     }
 #endif
@@ -597,9 +605,13 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
         }
         wheel_key_event(wasm_wheel_state, keycode);
         wasm_wheel_state->wasm_keycode = keycode;
+        wasm_wheel_state->wasm_press_mask = wasm_wheel_state->buttons;
+        wasm_wheel_state->wasm_ack = 0;
         wasm_wheel_state->wasm_release_at =
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
             (int64_t)hold_ms * 1000000;
+        wasm_wheel_state->wasm_release_cap =
+            wasm_wheel_state->wasm_release_at + 1000 * 1000000;
 
         /*
          * Keep the wheel ticking until the release deadline.  The tick only
@@ -614,6 +626,11 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
         }
     }
     qemu_mutex_unlock_iothread();
+}
+
+EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
+{
+    return wasm_wheel_state ? wasm_wheel_state->wasm_ack : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
