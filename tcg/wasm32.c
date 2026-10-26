@@ -1344,6 +1344,23 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
     }
 }
 
+/*
+ * Run one instantiated translation block.
+ *
+ * Every entry into a Wasm module has to run its prologue: it installs the
+ * env/stack globals the first time (they are per module and start at zero) and
+ * resets the module's internal block_ptr so execution starts at the first
+ * block. The prologue is gated on ctx.do_init, and the module that ran before
+ * clears that flag, so a module entered here -- freshly instantiated, or
+ * reached through a TCI-executed block that does not set the flag -- used to
+ * run with a null env and a stale block_ptr. Set it for every entry.
+ */
+static inline uint32_t wasm_run_instance(int fidx)
+{
+    ctx.do_init = 1;
+    return ((wasm_func_ptr)(fidx))(&ctx);
+}
+
 uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
                                             const void *v_tb_ptr)
 {
@@ -1356,7 +1373,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
         uint32_t res;
         int fidx = get_instance_running_local(ctx.tb_ptr);
         if (fidx > 0) {
-            res = ((wasm_func_ptr)(fidx))(&ctx);
+            res = wasm_run_instance(fidx);
         } else if (*(int32_t*)tb_counter_ptr < instantiate_num) {
             *(int32_t*)tb_counter_ptr += 1;
             res = tcg_qemu_tb_exec_tci(env);
@@ -1368,7 +1385,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
             int fidx = instantiate_wasm();
             wasm_tb_compiled_count++;
             add_instance_running_local(fidx, ctx.tb_ptr);
-            res = ((wasm_func_ptr)(fidx))(&ctx);
+            res = wasm_run_instance(fidx);
         }
         if ((uint32_t)ctx.tb_ptr == 0) {
             return res;
