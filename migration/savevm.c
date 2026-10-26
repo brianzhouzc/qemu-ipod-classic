@@ -1760,6 +1760,61 @@ void qemu_savevm_live_state(QEMUFile *f)
     qemu_put_byte(f, QEMU_VM_EOF);
 }
 
+/*
+ * Snapshot to a plain file, synchronously. save_snapshot() writes into a
+ * block device and qmp_migrate() runs the asynchronous migration machinery;
+ * the browser build needs the whole VM state in one file in the Emscripten
+ * FS, written from the main loop with the VM stopped. The caller stops the
+ * VM first and restarts it afterwards.
+ */
+int qemu_savevm_state_to_file(const char *path, Error **errp)
+{
+    QIOChannelFile *ioc;
+    QEMUFile *f;
+    int ret;
+
+    ioc = qio_channel_file_new_path(path, O_WRONLY | O_CREAT | O_TRUNC,
+                                    0660, errp);
+    if (!ioc) {
+        return -1;
+    }
+    qio_channel_set_name(QIO_CHANNEL(ioc), "ipod-savevm");
+    f = qemu_file_new_output(QIO_CHANNEL(ioc));
+    object_unref(OBJECT(ioc));
+
+    ret = qemu_savevm_state(f, errp);
+
+    if (qemu_fclose(f) < 0 && ret >= 0) {
+        ret = -EIO;
+        error_setg(errp, "closing the VM state file failed");
+    }
+    return ret;
+}
+
+int qemu_loadvm_state_from_file(const char *path, Error **errp)
+{
+    QIOChannelFile *ioc;
+    QEMUFile *f;
+    int ret;
+
+    ioc = qio_channel_file_new_path(path, O_RDONLY | O_BINARY, 0, errp);
+    if (!ioc) {
+        return -1;
+    }
+    qio_channel_set_name(QIO_CHANNEL(ioc), "ipod-loadvm");
+    f = qemu_file_new_input(QIO_CHANNEL(ioc));
+    object_unref(OBJECT(ioc));
+
+    ret = qemu_loadvm_state(f);
+    qemu_fclose(f);
+    migration_incoming_state_destroy();
+
+    if (ret < 0) {
+        error_setg(errp, "loading the VM state failed: %d", ret);
+    }
+    return ret;
+}
+
 int qemu_save_device_state(QEMUFile *f)
 {
     SaveStateEntry *se;

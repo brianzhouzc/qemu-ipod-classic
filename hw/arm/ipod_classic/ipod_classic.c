@@ -38,8 +38,18 @@
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
+#include "migration/global_state.h"
+#include "migration/misc.h"
+#include "migration/savevm.h"
+#include "qapi/qapi-commands-migration.h"
+#include "sysemu/runstate.h"
 #include "semihosting/semihost.h"
 #include "sysemu/cpu-timers.h"
+
+#if defined(EMSCRIPTEN)
+#include <emscripten.h>
+#endif
 
 #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
 #include "tcg/wasm32.h"
@@ -626,6 +636,106 @@ static void ipod_heartbeat_start(int ms)
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ipod_heartbeat_ms);
 }
 
+#if defined(EMSCRIPTEN)
+/*
+ * Snapshots for the browser build.
+ *
+ * The page calls ipod_snapshot_request() from the browser thread; it only
+ * records what to do, schedules a bottom half and wakes the main loop. The
+ * bottom half runs on QEMU's main-loop thread with the BQL, stops the VM,
+ * writes or reads the whole VM state in one file in the Emscripten FS, and
+ * starts the VM again. ipod_snapshot_status() lets the page poll:
+ *   0 idle, 1 working, 2 finished, 3 failed.
+ */
+static QEMUBH *ipod_snapshot_bh;
+static QEMUTimer *ipod_snapshot_timer;
+static int64_t ipod_snapshot_deadline;
+static int ipod_snapshot_op;            /* 1 save, 2 load */
+static volatile int ipod_snapshot_state;
+static char ipod_snapshot_path[512];
+
+/*
+ * A load runs through the incoming migration machinery, which finishes
+ * asynchronously; poll migration_is_idle() from the main loop (BQL held).
+ */
+static void ipod_snapshot_poll(void *opaque)
+{
+    int64_t now;
+
+    if (ipod_snapshot_state != 1) {
+        return;
+    }
+    if (runstate_is_running()) {
+        ipod_snapshot_state = 2;
+        ipod_snapshot_op = 0;
+        return;
+    }
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (migration_is_idle() && now > ipod_snapshot_deadline) {
+        ipod_snapshot_state = 3;
+        ipod_snapshot_op = 0;
+        return;
+    }
+    timer_mod(ipod_snapshot_timer, now + 100);
+}
+
+static void ipod_snapshot_bh_fn(void *opaque)
+{
+    Error *err = NULL;
+    bool was_running;
+    int ret = 0;
+
+    if (!ipod_snapshot_op) {
+        return;
+    }
+    if (ipod_snapshot_op == 2) {
+        char uri[sizeof(ipod_snapshot_path) + 8];
+        snprintf(uri, sizeof(uri), "file:%s", ipod_snapshot_path);
+        qmp_migrate_incoming(uri, false, NULL, &err);
+        if (err) {
+            error_report_err(err);
+            ipod_snapshot_op = 0;
+            ipod_snapshot_state = 3;
+            return;
+        }
+        ipod_snapshot_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 8000;
+        timer_mod(ipod_snapshot_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
+        return;
+    }
+    was_running = runstate_is_running();
+    global_state_store();
+    vm_stop(RUN_STATE_SAVE_VM);
+    ret = qemu_savevm_state_to_file(ipod_snapshot_path, &err);
+    if (was_running) {
+        vm_start();
+    }
+    if (err) {
+        error_report_err(err);
+    }
+    ipod_snapshot_op = 0;
+    ipod_snapshot_state = ret == 0 ? 2 : 3;
+}
+
+EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)
+{
+    if (ipod_snapshot_state == 1) {
+        return;
+    }
+    snprintf(ipod_snapshot_path, sizeof(ipod_snapshot_path), "%s",
+             path ? path : "");
+    ipod_snapshot_op = op;
+    ipod_snapshot_state = 1;
+    qemu_bh_schedule(ipod_snapshot_bh);
+    qemu_notify_event();
+}
+
+EMSCRIPTEN_KEEPALIVE int ipod_snapshot_status(void)
+{
+    return ipod_snapshot_state;
+}
+#endif
+
 static void ipod_classic_machine_init(MachineState *machine)
 {
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(machine);
@@ -644,6 +754,11 @@ static void ipod_classic_machine_init(MachineState *machine)
             qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     ipod_heartbeat_start(nms->heartbeat_ms);
+#if defined(EMSCRIPTEN)
+    ipod_snapshot_bh = qemu_bh_new(ipod_snapshot_bh_fn, NULL);
+    ipod_snapshot_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                       ipod_snapshot_poll, NULL);
+#endif
 #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
     if (nms->wasm_instantiate > 0) {
         wasm_set_instantiate_num(nms->wasm_instantiate);
