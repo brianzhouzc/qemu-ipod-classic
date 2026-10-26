@@ -551,6 +551,25 @@ static int wheel_env_int(const char *name, int def, int lo, int hi)
     return n;
 }
 
+#ifdef EMSCRIPTEN
+#include <emscripten.h>
+
+/*
+ * Browser input: the page calls this with the PC scancodes the wheel's
+ * legacy handler already decodes (bit 7 set = key release).  Going straight
+ * to the handler keeps the wasm build independent of QEMU's input frontends,
+ * of which it has none.
+ */
+static IPodClassicWheelState *wasm_wheel_state;
+
+EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
+{
+    if (wasm_wheel_state) {
+        wheel_key_event(wasm_wheel_state, keycode);
+    }
+}
+#endif
+
 static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
 {
     IPodClassicWheelState *s = IPOD_CLASSIC_WHEEL(dev);
@@ -584,6 +603,9 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
 
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, wheel_tick, s);
     qemu_add_kbd_event_handler(wheel_key_event, s);
+#ifdef EMSCRIPTEN
+    wasm_wheel_state = s;
+#endif
 }
 
 /*
