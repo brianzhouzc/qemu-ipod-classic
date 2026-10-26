@@ -1387,39 +1387,47 @@ static void tcg_wasm_out_movcond_i64(TCGContext *s, TCGCond cond, TCGReg ret,
 static void tcg_wasm_out_add2(TCGContext *s, TCGReg retl, TCGReg reth,
                              TCGReg al, TCGReg ah, TCGReg bl, TCGReg bh)
 {
-    // add higer
+    /*
+     * add2_i32: (retl, reth) = (al, ah) + (bl, bh), with each half 32 bits
+     * wide.  The i32 values live in i64 globals and are not always clean, so
+     * mask every input and output: the previous version left the low sum
+     * untruncated (up to 33 bits), which made the ADCS carry -- and every
+     * flag derived from it -- wrong.
+     */
+    /* high sum: (ah & 0xffffffff) + (bh & 0xffffffff) */
     tcg_wasm_out_op_global_get_r(s, ah);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_global_get_r(s, bh);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_i64_add(s);
 
-    // add lower
+    /* low sum: (al & 0xffffffff) + (bl & 0xffffffff) */
     tcg_wasm_out_op_global_get_r(s, al);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_global_get_r(s, bl);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_i64_add(s);
 
-    // get carry
-    if ((al == retl) && (bl == retl)) {
-        tcg_wasm_out_op_local_set(s, TMP64_0_IDX);
-        tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
-        tcg_wasm_out_op_global_get_r(s, al);
-        tcg_wasm_out_op_i64_lt_u(s);
-        tcg_wasm_out_op_i64_extend_i32_s(s);
-        tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
-        tcg_wasm_out_op_global_set_r(s, retl);
-    } else {
-        tcg_wasm_out_op_global_set_r(s, retl);
-        tcg_wasm_out_op_global_get_r(s, retl);
-        if (al == retl) {
-            tcg_wasm_out_op_global_get_r(s, bl);
-        } else {
-            tcg_wasm_out_op_global_get_r(s, al);
-        }
-        tcg_wasm_out_op_i64_lt_u(s);
-        tcg_wasm_out_op_i64_extend_i32_s(s);
-    }
+    /* keep the low sum, store its low 32 bits */
+    tcg_wasm_out_op_local_set(s, TMP64_0_IDX);
+    tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
+    tcg_wasm_out_op_global_set_r(s, retl);
 
-    // add carry to higher
+    /* carry out of the low sum */
+    tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+    tcg_wasm_out_op_i64_const(s, 32);
+    tcg_wasm_out_op_i64_shr_u(s);
+
+    /* reth = (high sum + carry) & 0xffffffff */
     tcg_wasm_out_op_i64_add(s);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_global_set_r(s, reth);
 }
 
@@ -1582,6 +1590,14 @@ static void tcg_wasm_out_extract(TCGContext *s, TCGReg dest, TCGReg arg1, int po
     }
     tcg_wasm_out_op_i64_const(s, rs);
     if (sign) {
+        if (type == TCG_TYPE_I32) {
+            /*
+             * After the 32-bit wrap the field's sign bit is bit 31, not bit
+             * 63, so sign-extend it to 64 bits before the arithmetic shift;
+             * otherwise the result is zero-extended.
+             */
+            tcg_wasm_out_op_i64_extend_i32_s(s);
+        }
         tcg_wasm_out_op_i64_shr_s(s);
     } else {
         tcg_wasm_out_op_i64_shr_u(s);
