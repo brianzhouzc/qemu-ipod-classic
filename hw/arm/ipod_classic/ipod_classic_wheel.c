@@ -239,6 +239,8 @@ static void wheel_run_command(IPodClassicWheelState *s)
 /* Pacing                                                             */
 /* ------------------------------------------------------------------ */
 
+static void wheel_key_event(void *opaque, int keycode);
+
 static void wheel_kick(IPodClassicWheelState *s)
 {
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
@@ -249,6 +251,13 @@ static void wheel_tick(void *opaque)
     IPodClassicWheelState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool busy;
+
+#ifdef EMSCRIPTEN
+    if (s->wasm_release_at && now >= s->wasm_release_at) {
+        s->wasm_release_at = 0;
+        wheel_key_event(s, s->wasm_keycode | 0x80);
+    }
+#endif
 
     /*
      * If the guest has not drained what it already has, do not add to it.
@@ -553,6 +562,7 @@ static int wheel_env_int(const char *name, int def, int lo, int hi)
 
 #ifdef EMSCRIPTEN
 #include <emscripten.h>
+#include "qemu/main-loop.h"
 
 /*
  * Browser input: the page calls this with the PC scancodes the wheel's
@@ -562,11 +572,38 @@ static int wheel_env_int(const char *name, int def, int lo, int hi)
  */
 static IPodClassicWheelState *wasm_wheel_state;
 
+/*
+ * Press a key and release it after hold_ms of *guest* time.  A wall-clock
+ * hold is unreliable under -icount sleep=off: the virtual clock can outrun
+ * the host while the guest is idle, so a 150 ms wall hold may span almost no
+ * guest time and the guest never samples the button.  The release is done by
+ * the wheel's own tick timer, because the page thread must not create or
+ * arm QEMU timers (Emscripten pthread atomics trap there).
+ */
+EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
+{
+    qemu_mutex_lock_iothread();
+    if (wasm_wheel_state) {
+        wheel_key_event(wasm_wheel_state, keycode);
+        wasm_wheel_state->wasm_keycode = keycode;
+        wasm_wheel_state->wasm_release_at =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+            (int64_t)hold_ms * 1000000;
+    }
+    qemu_mutex_unlock_iothread();
+}
+
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
 {
+    /*
+     * Called from the page's main thread: the handler touches the FIFO and
+     * raises an IRQ, so it must hold the BQL like any main-loop input.
+     */
+    qemu_mutex_lock_iothread();
     if (wasm_wheel_state) {
         wheel_key_event(wasm_wheel_state, keycode);
     }
+    qemu_mutex_unlock_iothread();
 }
 #endif
 

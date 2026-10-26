@@ -296,6 +296,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_FIFO_LEN      16
 
 struct IPodClassicWheelState {
+#ifdef EMSCRIPTEN
+    /* Browser input: releases a held key at a virtual deadline. */
+    int wasm_keycode;
+    int64_t wasm_release_at;
+#endif
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
